@@ -1,0 +1,71 @@
+use anyhow::Result;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+
+use crate::db;
+use crate::registry::write::commit_version;
+use crate::vault::fs::Vault;
+
+pub fn run(vault_dir: &Path, paths: Vec<String>, depth: Option<u64>) -> Result<()> {
+    let vault = Vault::new(vault_dir.to_path_buf());
+    let conn = db::open_registry(vault_dir)?;
+
+    let files = resolve_paths(&paths, depth)?;
+
+    let mut wrote = 0u64;
+    let mut notes: Vec<serde_json::Value> = Vec::new();
+
+    for file in &files {
+        let content = std::fs::read_to_string(file)?;
+        let result = vault.ingest(&content, None)?;
+        commit_version(&conn, &result)?;
+
+        notes.push(serde_json::json!({
+            "id": result.note_id,
+            "title": result.frontmatter.title,
+            "file": file.display().to_string(),
+        }));
+        wrote += 1;
+    }
+
+    let summary = serde_json::json!({ "wrote": wrote, "notes": notes });
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+
+    Ok(())
+}
+
+fn resolve_paths(paths: &[String], depth: Option<u64>) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = Vec::new();
+
+    for path in paths {
+        if path == "-" {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            let tmp = std::env::temp_dir().join("nark_stdin.md");
+            std::fs::write(&tmp, &buf)?;
+            files.push(tmp);
+            continue;
+        }
+
+        let p = PathBuf::from(path);
+        if p.is_file() {
+            files.push(p);
+        } else if p.is_dir() {
+            let mut walker = WalkDir::new(&p);
+            if let Some(d) = depth {
+                walker = walker.max_depth(d as usize);
+            }
+            for entry in walker.into_iter().filter_map(|e| e.ok()) {
+                let ep = entry.path();
+                if ep.is_file() && ep.extension().is_some_and(|ext| ext == "md") {
+                    files.push(ep.to_path_buf());
+                }
+            }
+        } else {
+            anyhow::bail!("path not found: {}", path);
+        }
+    }
+
+    Ok(files)
+}

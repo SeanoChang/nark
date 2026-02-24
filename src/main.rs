@@ -25,12 +25,12 @@ fn main() -> Result<()> {
         Some(p) => std::path::PathBuf::from(p),
         None => dirs::home_dir()
             .expect("Could not find home directory")
-            .join(".ironvault"),
+            .join(".ark"),
     };
 
     match args.command {
         Init => run(&vault_dir),
-        Write { paths } => todo!(),
+        Write { paths, depth } => cli::write::run(&vault_dir, paths, depth),
         Peek { id, meta } => todo!(),
         Search { query, domain, limit } => todo!(),
         Ls { path } => todo!(),

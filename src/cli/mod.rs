@@ -9,7 +9,7 @@ pub mod about;
 pub mod update;
 
 #[derive(Parser)]
-#[command(name = "iv", about = "Iron Vault - agent memory CLI", version)]
+#[command(name = "nark", about = "Noah's Ark - agent memory CLI", version)]
 pub struct Cli {
     #[arg(long, global = true)]
     pub vault_dir: Option<String>,
@@ -30,6 +30,10 @@ pub enum Commands {
     Write {
         /// Files, directories, or "-" for stdin
         paths: Vec<String>,
+
+        /// Max directory recursion depth (unlimited if omitted)
+        #[arg(long)]
+        depth: Option<u64>,
     },
 
     /// Peek at a note (full body or just frontmatter)

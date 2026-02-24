@@ -88,11 +88,13 @@ CREATE TABLE tags (
 -- Identity + head pointer
 CREATE TABLE notes (
     note_id              TEXT PRIMARY KEY,
+    namespace            TEXT NOT NULL DEFAULT 'ark',
     head_version_id      TEXT NOT NULL,
     canonical_version_id TEXT,
     author_agent_id      TEXT REFERENCES agents(agent_id),
     created_at           TEXT NOT NULL
 );
+CREATE INDEX idx_notes_namespace ON notes(namespace);
 
 -- Append-only version history
 CREATE TABLE note_versions (
@@ -114,6 +116,7 @@ CREATE INDEX idx_versions_created ON note_versions(created_at);
 -- Materialized head view (hot path for browse + pack + search)
 CREATE TABLE current_notes (
     note_id              TEXT PRIMARY KEY,
+    namespace            TEXT NOT NULL DEFAULT 'ark',
     head_version_id      TEXT NOT NULL,
     canonical_version_id TEXT,
     author_agent_id      TEXT NOT NULL REFERENCES agents(agent_id),
@@ -139,6 +142,8 @@ CREATE TABLE current_notes (
 CREATE INDEX idx_cn_domain         ON current_notes(domain);
 CREATE INDEX idx_cn_domain_intent  ON current_notes(domain, intent);
 CREATE INDEX idx_cn_browse         ON current_notes(domain, intent, kind, status);
+CREATE INDEX idx_cn_namespace        ON current_notes(namespace);
+CREATE INDEX idx_cn_namespace_browse ON current_notes(namespace, domain, intent, kind, status);
 CREATE INDEX idx_cn_status         ON current_notes(status);
 CREATE INDEX idx_cn_updated        ON current_notes(updated_at);
 CREATE INDEX idx_cn_activation     ON current_notes(activation_score DESC);

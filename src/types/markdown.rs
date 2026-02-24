@@ -1,14 +1,13 @@
 use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frontmatter {
-    title: String,
-    author: String,
-    domain: String,
-    intent: String,
-    kind: String,
-    trust: String,
-    status: String,
-    tags: Vec<String>,
+    pub title: String,
+    pub author: String,
+    pub domain: String,
+    pub intent: String,
+    pub kind: String,
+    pub trust: String,
+    pub status: String,
+    pub tags: Vec<String>,
 }
-

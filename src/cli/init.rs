@@ -8,8 +8,7 @@ pub fn run(vault_dir: &Path) -> Result<()> {
     let vault = Vault::new(vault_dir.to_path_buf());
     vault.init_dirs()?;
 
-    let mut conn = db::open_registry(vault_dir)?;
-    db::migrate(&mut conn)?;
+    db::open_registry(vault_dir)?;
 
     println!("Initialized vault at {}", vault_dir.display());
     Ok(())
