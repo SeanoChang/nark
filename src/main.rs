@@ -37,6 +37,6 @@ fn main() -> Result<()> {
         Search { query, domain, limit } => cli::search::run(&vault_dir, &query, domain.as_deref(), limit),
         Ls { path } => cli::ls::run(&vault_dir, path.as_deref()),
         About { topic, limit } => cli::about::run(&vault_dir, &topic, limit),
-        Update => todo!(),
+        Update => cli::update::run(),
     }
 }
