@@ -34,7 +34,7 @@ fn main() -> Result<()> {
         Write { paths, depth } => cli::write::run(&vault_dir, paths, depth),
         Peek { id } => cli::peek::run(&vault_dir, &id),
         Read { id } => cli::read::run(&vault_dir, &id),
-        Search { query, domain, limit } => todo!(),
+        Search { query, domain, limit } => cli::search::run(&vault_dir, &query, domain.as_deref(), limit),
         Ls { path } => todo!(),
         About{ topic, limit } => todo!(),
         Update => todo!(),
