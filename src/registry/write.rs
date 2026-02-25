@@ -73,13 +73,14 @@ fn upsert_current_note(tx: &Connection, r: &IngestResult, fm: &Frontmatter, now:
 fn replace_note_text(tx: &Connection, r: &IngestResult, fm: &Frontmatter) -> Result<()> {
     let spine = format!("{}/{}/{}", fm.domain.to_string(), fm.intent.to_string(), fm.kind.to_string());
     let keywords = fm.tags.join(" ");
+    let aliases = fm.aliases.join(" ");
 
     tx.execute("DELETE FROM note_text WHERE note_id = ?1", [&r.note_id])?;
     tx.execute(
         "INSERT INTO note_text
             (note_id, title, body, spine, aliases, keywords)
-         VALUES (?1, ?2, ?3, ?4, '', ?5)",
-        rusqlite::params![r.note_id, fm.title, r.body, spine, keywords],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![r.note_id, fm.title, r.body, spine, aliases, keywords],
     )?;
     Ok(())
 }

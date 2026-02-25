@@ -133,4 +133,6 @@ pub struct Frontmatter {
     pub trust: Trust,
     pub status: Status,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
