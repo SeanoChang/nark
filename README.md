@@ -58,14 +58,19 @@ nark read <note-id>
 
 | Command | What it does | Cost |
 |---|---|---|
-| `nark search <query>` | FTS5 ranked search across all notes | Cheap — registry only |
-| `nark ls [path]` | Browse domain/intent/kind tree | Cheap — registry only |
+| `nark search <query> [--tag ...] [--domain ...]` | FTS5 ranked search, filterable by tags and domain | Cheap — registry only |
+| `nark ls [path] [--tags]` | Browse domain/intent/kind tree | Cheap — registry only |
 | `nark about <topic>` | Search + body previews in one call | Medium — registry + vault reads |
 | `nark peek <id>` | Note metadata (title, domain, tags, etc.) | Cheap — registry only |
 | `nark read <id>` | Full note content (frontmatter + body) | Heavy — vault CAS read |
 | `nark write <paths...>` | Ingest markdown notes | Write — vault + registry |
+| `nark delete <ids...> [-f] [-rf]` | Soft-delete (retract), hard-delete, or full purge | Write — registry (+ vault for -rf) |
+| `nark tag <id> +add -remove` | Add/remove tags without creating a new version | Write — registry only |
+| `nark tag --list` | List all tags with usage counts | Cheap — registry only |
+| `nark tag --find <tags...>` | Find notes by tag (AND logic) | Cheap — registry only |
+| `nark reset [--confirm]` | Destroy and recreate registry (vault objects kept) | Destructive |
 | `nark init` | Create vault dirs + registry database | One-time setup |
-| `nark update` | Pull latest code and rebuild | Maintenance |
+| `nark update` | Download latest release binary from GitHub | Maintenance |
 
 ### Agent workflow
 
@@ -98,13 +103,15 @@ Content goes here...
 
 ### Frontmatter fields
 
-| Field | Purpose | Examples |
+| Field | Purpose | Allowed values |
 |---|---|---|
 | `domain` | Knowledge area | systems, security, finance, ai_ml, data, programming, math, writing, product |
-| `intent` | Why it exists | build, decide, learn, operate, debug |
-| `kind` | What it is | spec, decision, note, runbook, reference |
-| `trust` | Confidence level | hypothesis, draft, verified, canonical |
-| `status` | Lifecycle state | draft, active, deprecated |
+| `intent` | Why it exists | build, debug, operate, design, research, evaluate, decide |
+| `kind` | What it is | spec, decision, runbook, report, reference, incident, experiment, dataset |
+| `trust` | Confidence level | hypothesis, reviewed, verified |
+| `status` | Lifecycle state | active, deprecated, retracted, draft |
+
+Intent, kind, trust, and status are enforced enums — invalid values are rejected at parse time.
 
 ## Architecture
 
