@@ -2,6 +2,20 @@ use std::fmt;
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Domain {
+    Systems,
+    Security,
+    Finance,
+    AiMl,
+    Data,
+    Programming,
+    Math,
+    Writing,
+    Product,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Intent {
     Build,
@@ -41,6 +55,22 @@ pub enum Status {
     Deprecated,
     Retracted,
     Draft,
+}
+
+impl fmt::Display for Domain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Domain::Systems => write!(f, "systems"),
+            Domain::Security => write!(f, "security"),
+            Domain::Finance => write!(f, "finance"),
+            Domain::AiMl => write!(f, "ai_ml"),
+            Domain::Data => write!(f, "data"),
+            Domain::Programming => write!(f, "programming"),
+            Domain::Math => write!(f, "math"),
+            Domain::Writing => write!(f, "writing"),
+            Domain::Product => write!(f, "product"),
+        }
+    }
 }
 
 impl fmt::Display for Intent {
@@ -97,7 +127,7 @@ impl fmt::Display for Status {
 pub struct Frontmatter {
     pub title: String,
     pub author: String,
-    pub domain: String,
+    pub domain: Domain,
     pub intent: Intent,
     pub kind: Kind,
     pub trust: Trust,

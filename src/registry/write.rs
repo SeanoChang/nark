@@ -63,7 +63,7 @@ fn upsert_current_note(tx: &Connection, r: &IngestResult, fm: &Frontmatter, now:
              updated_at = excluded.updated_at",
         rusqlite::params![
             r.note_id, NAMESPACE, r.version_id, DEFAULT_AGENT_ID,
-            fm.title, fm.domain, fm.intent.to_string(), fm.kind.to_string(),
+            fm.title, fm.domain.to_string(), fm.intent.to_string(), fm.kind.to_string(),
             fm.trust.to_string(), fm.status.to_string(), now,
         ],
     )?;
@@ -71,7 +71,7 @@ fn upsert_current_note(tx: &Connection, r: &IngestResult, fm: &Frontmatter, now:
 }
 
 fn replace_note_text(tx: &Connection, r: &IngestResult, fm: &Frontmatter) -> Result<()> {
-    let spine = format!("{}/{}/{}", fm.domain, fm.intent.to_string(), fm.kind.to_string());
+    let spine = format!("{}/{}/{}", fm.domain.to_string(), fm.intent.to_string(), fm.kind.to_string());
     let keywords = fm.tags.join(" ");
 
     tx.execute("DELETE FROM note_text WHERE note_id = ?1", [&r.note_id])?;
