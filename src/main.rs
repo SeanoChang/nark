@@ -17,6 +17,7 @@ use crate::cli::Commands::{
     About,
     Delete,
     Tag,
+    Stats,
     Reset,
     Update
 };
@@ -42,6 +43,7 @@ fn main() -> Result<()> {
         About { topic, limit } => cli::about::run(&vault_dir, &topic, limit),
         Delete { ids, force, recursive } => cli::delete::run(&vault_dir, ids, force, recursive),
         Tag { args, list, find } => cli::tag::run(&vault_dir, args, list, find),
+        Stats => cli::stats::run(&vault_dir),
         Reset { confirm } => cli::reset::run(&vault_dir, confirm),
         Update => cli::update::run(),
     }

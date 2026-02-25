@@ -10,6 +10,7 @@ pub mod about;
 pub mod update;
 pub mod delete;
 pub mod reset;
+pub mod stats;
 pub mod tag;
 
 #[derive(Parser)]
@@ -166,6 +167,9 @@ pub enum Commands {
         #[arg(long, num_args = 1..)]
         find: Vec<String>,
     },
+
+    /// Vault overview — note counts, distributions, recent activity
+    Stats,
 
     /// Reset the registry database
     ///
