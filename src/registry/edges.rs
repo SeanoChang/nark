@@ -6,6 +6,57 @@ use std::sync::LazyLock;
 
 use crate::types::markdown::FrontmatterLink;
 
+pub struct EdgeInfo {
+    pub note_id: String,
+    pub title: String,
+    pub edge_type: String,
+    pub weight: f64,
+    pub source_type: String,
+    pub context: Option<String>,
+}
+
+pub fn get_edges(conn: &Connection, note_id: &str) -> Result<(Vec<EdgeInfo>, Vec<EdgeInfo>)> {
+    let outgoing = {
+        let mut stmt = conn.prepare(
+            "SELECT e.dst_note_id, cn.title, e.edge_type, e.weight, e.source_type, e.context
+             FROM note_edges e
+             JOIN current_notes cn ON cn.note_id = e.dst_note_id
+             WHERE e.src_note_id = ?1"
+        )?;
+        stmt.query_map([note_id], |row| {
+            Ok(EdgeInfo {
+                note_id: row.get(0)?,
+                title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                edge_type: row.get(2)?,
+                weight: row.get(3)?,
+                source_type: row.get(4)?,
+                context: row.get(5)?,
+            })
+        })?.filter_map(|r| r.ok()).collect()
+    };
+
+    let incoming = {
+        let mut stmt = conn.prepare(
+            "SELECT e.src_note_id, cn.title, e.edge_type, e.weight, e.source_type, e.context
+             FROM note_edges e
+             JOIN current_notes cn ON cn.note_id = e.src_note_id
+             WHERE e.dst_note_id = ?1"
+        )?;
+        stmt.query_map([note_id], |row| {
+            Ok(EdgeInfo {
+                note_id: row.get(0)?,
+                title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                edge_type: row.get(2)?,
+                weight: row.get(3)?,
+                source_type: row.get(4)?,
+                context: row.get(5)?,
+            })
+        })?.filter_map(|r| r.ok()).collect()
+    };
+
+    Ok((outgoing, incoming))
+}
+
 static WIKILINK_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[\[([^\]]+)\]\]").unwrap());
 

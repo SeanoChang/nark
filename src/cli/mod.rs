@@ -12,6 +12,8 @@ pub mod delete;
 pub mod reset;
 pub mod stats;
 pub mod tag;
+pub mod link;
+pub mod links;
 
 #[derive(Parser)]
 #[command(
@@ -166,6 +168,30 @@ pub enum Commands {
         /// Find notes by tag (AND logic). Accepts multiple: --find cas vault
         #[arg(long, num_args = 1..)]
         find: Vec<String>,
+    },
+
+    /// Create typed links from one or more source notes to a single target
+    ///
+    /// Adds a frontmatter link entry and a [[wikilink]] in each source note body.
+    /// Idempotent — re-running with the same args is a no-op.
+    Link {
+        /// Source note IDs (one or more)
+        #[arg(required = true, num_args = 1..)]
+        sources: Vec<String>,
+
+        /// Target note ID
+        #[arg(long)]
+        target: String,
+
+        /// Relationship type (references, depends-on, supersedes, contradicts, extends, informed-by)
+        #[arg(long, default_value = "references")]
+        rel: String,
+    },
+
+    /// Show a note's link neighborhood (outgoing + incoming edges)
+    Links {
+        /// Note ID (UUID)
+        id: String,
     },
 
     /// Vault overview — note counts, distributions, recent activity
