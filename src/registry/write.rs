@@ -17,6 +17,7 @@ pub fn commit_version(conn: &Connection, r: &IngestResult) -> Result<()> {
     upsert_current_note(&tx, r, fm, &now)?;
     replace_note_text(&tx, r, fm)?;
     sync_tags(&tx, &r.note_id, &fm.tags)?;
+    super::edges::sync_edges(&tx, &r.note_id, &r.version_id, &r.body, &fm.links, &now)?;
 
     tx.commit()?;
     Ok(())

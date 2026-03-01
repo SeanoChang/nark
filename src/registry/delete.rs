@@ -62,6 +62,19 @@ pub fn hard_delete(conn: &Connection, notes: &[DeletedNote]) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
 
     for note in notes {
+        // Collect edge neighbors before deletion for link count fixup
+        let neighbors: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT dst_note_id FROM note_edges WHERE src_note_id = ?1
+                 UNION
+                 SELECT DISTINCT src_note_id FROM note_edges WHERE dst_note_id = ?1",
+            )?;
+            stmt.query_map([&note.note_id], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .filter(|id: &String| id != &note.note_id)
+                .collect()
+        };
+
         tx.execute("DELETE FROM note_text WHERE note_id = ?1", [&note.note_id])?;
         tx.execute("DELETE FROM note_tags WHERE note_id = ?1", [&note.note_id])?;
         tx.execute(
@@ -72,6 +85,22 @@ pub fn hard_delete(conn: &Connection, notes: &[DeletedNote]) -> Result<()> {
         tx.execute("DELETE FROM current_notes WHERE note_id = ?1", [&note.note_id])?;
         tx.execute("DELETE FROM note_versions WHERE note_id = ?1", [&note.note_id])?;
         tx.execute("DELETE FROM notes WHERE note_id = ?1", [&note.note_id])?;
+
+        // Recompute link counts on affected neighbors
+        for neighbor_id in &neighbors {
+            tx.execute(
+                "UPDATE current_notes SET links_out_count = (
+                    SELECT COUNT(*) FROM note_edges WHERE src_note_id = ?1
+                ) WHERE note_id = ?1",
+                [neighbor_id],
+            )?;
+            tx.execute(
+                "UPDATE current_notes SET links_in_count = (
+                    SELECT COUNT(*) FROM note_edges WHERE dst_note_id = ?1
+                ) WHERE note_id = ?1",
+                [neighbor_id],
+            )?;
+        }
 
         audit(&tx, "hard_delete", &note.note_id, &now)?;
     }

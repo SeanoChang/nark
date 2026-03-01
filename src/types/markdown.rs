@@ -124,6 +124,12 @@ impl fmt::Display for Status {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontmatterLink {
+    pub target: String,
+    pub rel: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frontmatter {
     pub title: String,
     pub author: String,
@@ -135,4 +141,6 @@ pub struct Frontmatter {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<FrontmatterLink>,
 }

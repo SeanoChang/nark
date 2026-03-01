@@ -5,3 +5,4 @@ pub mod browse;
 pub mod delete;
 pub mod tags;
 pub mod stats;
+pub mod edges;
