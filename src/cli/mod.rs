@@ -7,6 +7,7 @@ pub mod edit;
 pub mod embed;
 pub mod history;
 pub mod init;
+pub mod jot;
 pub mod link;
 pub mod links;
 pub mod ls;
@@ -47,6 +48,52 @@ pub struct Cli {
 pub enum Commands {
     /// Initialize vault directories and registry database
     Init,
+
+    /// Quick-capture a note with minimal ceremony
+    ///
+    /// Only author + domain required (or --from to inherit taxonomy).
+    /// Body comes from stdin or --body. Title inferred from first line if omitted.
+    Jot {
+        /// Note author (required)
+        #[arg(long)]
+        author: String,
+
+        /// Domain (required unless --from is provided)
+        #[arg(long)]
+        domain: Option<String>,
+
+        /// Intent (default: research)
+        #[arg(long)]
+        intent: Option<String>,
+
+        /// Kind (default: reference)
+        #[arg(long)]
+        kind: Option<String>,
+
+        /// Status (default: active)
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Importance 0-10 (default: 5)
+        #[arg(long)]
+        importance: Option<u8>,
+
+        /// Title (inferred from first body line if omitted)
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Tag (repeatable)
+        #[arg(long)]
+        tag: Vec<String>,
+
+        /// Inline body text (alternative to stdin)
+        #[arg(long)]
+        body: Option<String>,
+
+        /// Clone taxonomy from an existing note's head
+        #[arg(long)]
+        from: Option<String>,
+    },
 
     /// Ingest markdown notes into the vault
     ///

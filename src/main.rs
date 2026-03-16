@@ -11,6 +11,7 @@ mod vault;
 
 use crate::cli::Commands::{
     Init,
+    Jot,
     Write,
     Edit,
     Peek,
@@ -44,6 +45,7 @@ fn main() -> Result<()> {
 
     match args.command {
         Init => run(&vault_dir),
+        Jot { author, domain, intent, kind, status, importance, title, tag, body, from } => cli::jot::run(&vault_dir, title, &author, domain.as_deref(), kind.as_deref(), intent.as_deref(), status.as_deref(), importance, &tag, body.as_deref(), from.as_deref()),
         Write { paths, depth } => cli::write::run(&vault_dir, paths, depth),
         Edit { id, batch, args } => cli::edit::run(&vault_dir, &id, batch, args),
         Peek { id } => cli::peek::run(&vault_dir, &id),

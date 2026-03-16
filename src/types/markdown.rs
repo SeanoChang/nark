@@ -40,6 +40,7 @@ pub enum Kind {
     Dataset,
 }
 
+// TODO: remove Trust — provides no signal in practice. Hardcoded to `hypothesis` in jot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Trust {
