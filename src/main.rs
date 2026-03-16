@@ -30,6 +30,7 @@ use crate::cli::Commands::{
     Rollback,
     Stats,
     Reset,
+    Retract,
     Update
 };
 use cli::init::run;
@@ -56,7 +57,10 @@ fn main() -> Result<()> {
         About { topic, limit, since, before } => cli::about::run(&vault_dir, &topic, limit, since.as_deref(), before.as_deref()),
         Related { id, limit, link } => cli::related::run(&vault_dir, &id, limit, link),
         Delete { ids, force, recursive } => cli::delete::run(&vault_dir, ids, force, recursive),
-        Tag { args, list, find } => cli::tag::run(&vault_dir, args, list, find),
+        Tag { args, list, find, domain, kind, filter_tag, since, before, confirm } => {
+            let bulk = cli::tag::BulkTagOpts { domain, kind, filter_tag, since, before, confirm };
+            cli::tag::run(&vault_dir, args, list, find, bulk)
+        },
         Link { sources, target, rel } => cli::link::run(&vault_dir, sources, &target, &rel),
         Links { id } => cli::links::run(&vault_dir, &id),
         History { id } => cli::history::run(&vault_dir, &id),
@@ -69,6 +73,7 @@ fn main() -> Result<()> {
             cli::EmbedAction::Migrate => cli::embed::run_migrate(&vault_dir),
         },
         Reset { confirm } => cli::reset::run(&vault_dir, confirm),
+        Retract { ids, domain, kind, tag, since, before, confirm } => cli::retract::run(&vault_dir, ids, domain, kind, tag, since, before, confirm),
         Update => cli::update::run(),
     }
 }

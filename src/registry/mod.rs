@@ -1,5 +1,6 @@
 pub mod access;
 pub mod browse;
+pub mod bulk;
 pub mod delete;
 pub mod edges;
 pub mod embeddings;

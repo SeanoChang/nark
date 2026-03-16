@@ -1,10 +1,26 @@
 use anyhow::{bail, Result};
 use std::path::Path;
 
+use crate::cli::search::parse_temporal;
 use crate::db;
-use crate::registry::{resolve, tags};
+use crate::registry::{bulk::BulkFilter, resolve, tags};
 
-pub fn run(vault_dir: &Path, args: Vec<String>, list: bool, find: Vec<String>) -> Result<()> {
+pub struct BulkTagOpts {
+    pub domain: Option<String>,
+    pub kind: Option<String>,
+    pub filter_tag: Vec<String>,
+    pub since: Option<String>,
+    pub before: Option<String>,
+    pub confirm: bool,
+}
+
+pub fn run(
+    vault_dir: &Path,
+    args: Vec<String>,
+    list: bool,
+    find: Vec<String>,
+    bulk: BulkTagOpts,
+) -> Result<()> {
     let conn = db::open_registry(vault_dir)?;
 
     // Mode 1: --list
@@ -35,6 +51,58 @@ pub fn run(vault_dir: &Path, args: Vec<String>, list: bool, find: Vec<String>) -
 
     // Parse args into note IDs and +/-tag modifiers
     let (note_ids, add, remove) = parse_args(&args)?;
+
+    // Mode 5: bulk tag by filter
+    let filter = BulkFilter {
+        domain: bulk.domain,
+        kind: bulk.kind,
+        tags: bulk.filter_tag,
+        since: bulk.since.map(|s| parse_temporal(&s)).transpose()?,
+        before: bulk.before.map(|b| parse_temporal(&b)).transpose()?,
+    };
+
+    if filter.has_any() {
+        if add.is_empty() && remove.is_empty() {
+            bail!("bulk tag mode requires at least one +tag or -tag modifier");
+        }
+        if !note_ids.is_empty() {
+            bail!("cannot combine note IDs with filter flags for bulk operations");
+        }
+
+        let matched = crate::registry::bulk::find_matching_notes(&conn, &filter)?;
+
+        if !bulk.confirm {
+            let notes: Vec<serde_json::Value> = matched.iter().map(|(id, title)| {
+                serde_json::json!({ "id": id, "title": title })
+            }).collect();
+            let out = serde_json::json!({
+                "mode": "dry_run",
+                "matched": matched.len(),
+                "notes": notes,
+                "would_add": add,
+                "would_remove": remove,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            return Ok(());
+        }
+
+        let ids: Vec<String> = matched.iter().map(|(id, _)| id.clone()).collect();
+        if ids.is_empty() {
+            let out = serde_json::json!({ "tagged": 0, "notes": [], "added": add, "removed": remove });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            return Ok(());
+        }
+        tags::mutate_tags(&conn, &ids, &add, &remove)?;
+
+        let out = serde_json::json!({
+            "tagged": ids.len(),
+            "notes": ids,
+            "added": add,
+            "removed": remove,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
 
     if note_ids.is_empty() {
         bail!("no note IDs provided");

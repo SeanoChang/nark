@@ -15,6 +15,7 @@ pub mod peek;
 pub mod read;
 pub mod related;
 pub mod reset;
+pub mod retract;
 pub mod rollback;
 pub mod search;
 pub mod stats;
@@ -263,6 +264,7 @@ pub enum Commands {
     /// Add, remove, list, or find tags on notes
     ///
     /// Mutate: nark tag <id> [<id>...] +add -remove
+    /// Bulk:   nark tag --domain finance +stale (dry-run by default, add --confirm)
     /// Read:   nark tag <id> (no modifiers = show tags)
     /// List:   nark tag --list
     /// Find:   nark tag --find <tag> [--find <tag>...]
@@ -278,6 +280,30 @@ pub enum Commands {
         /// Find notes by tag (AND logic). Accepts multiple: --find cas vault
         #[arg(long, num_args = 1..)]
         find: Vec<String>,
+
+        /// Filter by domain (bulk mode)
+        #[arg(long)]
+        domain: Option<String>,
+
+        /// Filter by kind (bulk mode)
+        #[arg(long)]
+        kind: Option<String>,
+
+        /// Filter by tag for bulk matching (AND logic)
+        #[arg(long = "filter-tag", num_args = 1..)]
+        filter_tag: Vec<String>,
+
+        /// Filter to notes updated since (e.g. "1d", "7d", "1w", "1mo")
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter to notes updated before (e.g. "3d", "1w", "1mo")
+        #[arg(long)]
+        before: Option<String>,
+
+        /// Confirm bulk operation (dry-run without this)
+        #[arg(long)]
+        confirm: bool,
     },
 
     /// Create typed links from one or more source notes to a single target
@@ -380,6 +406,40 @@ pub enum Commands {
     Embed {
         #[command(subcommand)]
         action: EmbedAction,
+    },
+
+    /// Bulk soft-delete (retract) notes by filter or ID
+    ///
+    /// By filter: nark retract --domain finance --before 1mo (dry-run by default)
+    /// By ID:     nark retract <id> [<id>...] (immediate, no --confirm needed)
+    /// Add --confirm to execute bulk filter operations.
+    Retract {
+        /// Note IDs (optional — use filters for bulk)
+        ids: Vec<String>,
+
+        /// Filter by domain
+        #[arg(long)]
+        domain: Option<String>,
+
+        /// Filter by kind
+        #[arg(long)]
+        kind: Option<String>,
+
+        /// Filter by tag (AND logic)
+        #[arg(long, num_args = 1..)]
+        tag: Vec<String>,
+
+        /// Filter to notes updated since (e.g. "1d", "7d", "1w", "1mo")
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter to notes updated before (e.g. "3d", "1w", "1mo")
+        #[arg(long)]
+        before: Option<String>,
+
+        /// Confirm bulk operation (dry-run without this)
+        #[arg(long)]
+        confirm: bool,
     },
 
     /// Pull latest code and rebuild the binary
