@@ -24,7 +24,6 @@ pub fn run(vault_dir: &Path, path: Option<&str>, include_tags: bool) -> Result<(
                 let mut obj = serde_json::json!({
                     "id": n.note_id,
                     "title": n.title,
-                    "trust": n.trust,
                     "updated_at": n.updated_at,
                 });
                 if let Some(tags) = &n.tags {

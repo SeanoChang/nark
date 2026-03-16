@@ -6,12 +6,6 @@ use rusqlite::Connection;
 use crate::config::{EngagementConfig, SearchConfig};
 use crate::embed;
 
-const VALID_KINDS: &[&str] = &[
-    "spec", "decision", "runbook", "report", "reference", "incident", "experiment", "dataset",
-];
-const VALID_INTENTS: &[&str] = &[
-    "build", "debug", "operate", "design", "research", "evaluate", "decide",
-];
 
 #[derive(Debug)]
 pub struct SearchHit {
@@ -83,8 +77,6 @@ pub fn search(
     cosine_ctx: Option<&CosineContext>,
     mode: SearchMode,
 ) -> Result<Vec<SearchHit>> {
-    validate_filters(filters)?;
-
     let has_query = !query.is_empty();
     let has_filters = filters.domain.is_some()
         || filters.kind.is_some()
@@ -229,22 +221,6 @@ fn to_hits(candidates: Vec<Candidate>) -> Vec<SearchHit> {
         .collect()
 }
 
-// -- Validation --
-
-fn validate_filters(filters: &SearchFilters) -> Result<()> {
-    if let Some(k) = filters.kind {
-        if !VALID_KINDS.contains(&k) {
-            bail!("invalid kind \"{}\". Valid kinds: {}", k, VALID_KINDS.join(", "));
-        }
-    }
-    if let Some(i) = filters.intent {
-        if !VALID_INTENTS.contains(&i) {
-            bail!("invalid intent \"{}\". Valid intents: {}", i, VALID_INTENTS.join(", "));
-        }
-    }
-    Ok(())
-}
-
 // -- Candidate Fetching --
 
 fn fetch_fts_candidates(
@@ -265,8 +241,7 @@ fn fetch_fts_candidates(
             bm25(note_text, {}),
             cn.access_count,
             cn.last_accessed,
-            cn.updated_at,
-            cn.importance
+            cn.updated_at
          FROM note_text nt
          JOIN current_notes cn ON nt.note_id = cn.note_id
          WHERE note_text MATCH ?1
@@ -314,7 +289,7 @@ fn fetch_filter_candidates(
 ) -> Result<Vec<Candidate>> {
     let mut sql = String::from(
         "SELECT cn.note_id, cn.title, cn.domain, cn.kind, '' AS snippet, 0.0 AS rank,
-                cn.access_count, cn.last_accessed, cn.updated_at, cn.importance
+                cn.access_count, cn.last_accessed, cn.updated_at
          FROM current_notes cn
          WHERE cn.namespace = 'ark'
            AND cn.status != 'retracted'",
@@ -358,7 +333,6 @@ fn exec_candidate_query(
             let access_count: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
             let last_accessed: Option<String> = row.get(7)?;
             let updated_at: Option<String> = row.get(8)?;
-            let importance: i64 = row.get::<_, Option<i64>>(9)?.unwrap_or(5);
             Ok(Candidate {
                 note_id: row.get(0)?,
                 title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -370,7 +344,7 @@ fn exec_candidate_query(
                 graph_score: 0.0,
                 engagement: compute_engagement(
                     access_count, last_accessed.as_deref(), updated_at.as_deref(),
-                    importance, eng_config,
+                    eng_config,
                 ),
                 final_score: 0.0,
             })
@@ -381,12 +355,11 @@ fn exec_candidate_query(
     Ok(rows)
 }
 
-/// Compute engagement score from real signals: recency, popularity, importance.
+/// Compute engagement score from real signals: recency and popularity.
 fn compute_engagement(
     access_count: i64,
     last_accessed: Option<&str>,
     updated_at: Option<&str>,
-    importance: i64,
     config: &EngagementConfig,
 ) -> f64 {
     // Recency: exponential decay (true half-life) from the more recent of last_accessed and updated_at
@@ -402,12 +375,7 @@ fn compute_engagement(
     let popularity = ((1.0 + access_count as f64).ln() / (1.0 + config.saturation_reads).ln())
         .min(1.0);
 
-    // Importance: linear from [1, 10] to [0, 1], clamped
-    let importance_norm = ((importance as f64).clamp(1.0, 10.0) - 1.0) / 9.0;
-
-    config.weight_recency * recency
-        + config.weight_popularity * popularity
-        + config.weight_importance * importance_norm
+    config.weight_recency * recency + config.weight_popularity * popularity
 }
 
 fn most_recent_timestamp(a: Option<&str>, b: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -455,7 +423,7 @@ fn fetch_cosine_candidates(
     let placeholders: String = note_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
     let mut sql = format!(
         "SELECT cn.note_id, cn.title, cn.domain, cn.kind, '' AS snippet, 0.0 AS rank,
-                cn.access_count, cn.last_accessed, cn.updated_at, cn.importance
+                cn.access_count, cn.last_accessed, cn.updated_at
          FROM current_notes cn
          WHERE cn.note_id IN ({})
            AND cn.namespace = 'ark'
@@ -634,7 +602,7 @@ fn graph_expand(
         let placeholders: String = discovered.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let mut sql = format!(
             "SELECT cn.note_id, cn.title, cn.domain, cn.kind, '' AS snippet, 0.0 AS rank,
-                    cn.access_count, cn.last_accessed, cn.updated_at, cn.importance
+                    cn.access_count, cn.last_accessed, cn.updated_at
              FROM current_notes cn
              WHERE cn.note_id IN ({})
                AND cn.namespace = 'ark'
@@ -831,7 +799,6 @@ mod tests {
         domain: &str,
         kind: &str,
         body: &str,
-        importance: i64,
     ) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let version_id = format!("v-{}", note_id);
@@ -854,9 +821,9 @@ mod tests {
 
         // Insert into current_notes (materialized view)
         conn.execute(
-            "INSERT INTO current_notes (note_id, namespace, head_version_id, author_agent_id, title, domain, kind, status, importance, updated_at)
-             VALUES (?1, 'ark', ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8)",
-            rusqlite::params![note_id, version_id, db::DEFAULT_AGENT_ID, title, domain, kind, importance, now],
+            "INSERT INTO current_notes (note_id, namespace, head_version_id, author_agent_id, title, domain, kind, status, updated_at)
+             VALUES (?1, 'ark', ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
+            rusqlite::params![note_id, version_id, db::DEFAULT_AGENT_ID, title, domain, kind, now],
         )
         .unwrap();
 
@@ -915,23 +882,17 @@ mod tests {
 
         // Insert the 6 systems-domain notes (3 BM25 hits + 2 graph-discovered + 1 extra)
         insert_note(&conn, "note-a", "CAS content hash design", "systems", "spec",
-            "content_hash = BLAKE3(fm || md). The vault uses BLAKE3 hashing for all objects.",
-            5);
+            "content_hash = BLAKE3(fm || md). The vault uses BLAKE3 hashing for all objects.");
         insert_note(&conn, "note-b", "BLAKE3 benchmark results", "systems", "report",
-            "BLAKE3 benchmark: 2.1 GB/s on ARM. Fast hashing for content-addressed storage.",
-            5);
+            "BLAKE3 benchmark: 2.1 GB/s on ARM. Fast hashing for content-addressed storage.");
         insert_note(&conn, "note-c", "CAS design for vault", "systems", "spec",
-            "Content-addressed storage using BLAKE3 hashing function. Object store layout.",
-            5);
+            "Content-addressed storage using BLAKE3 hashing function. Object store layout.");
         insert_note(&conn, "note-d", "Vault ingest pipeline", "systems", "spec",
-            "The ingest pipeline reads markdown, parses frontmatter, and writes CAS objects.",
-            5);
+            "The ingest pipeline reads markdown, parses frontmatter, and writes CAS objects.");
         insert_note(&conn, "note-e", "Registry write.rs impl", "systems", "reference",
-            "Implementation of registry write module. Handles note creation and updates.",
-            5);
+            "Implementation of registry write module. Handles note creation and updates.");
         insert_note(&conn, "note-f", "Unrelated systems note", "systems", "report",
-            "Network latency measurements for cross-region replication.",
-            5);
+            "Network latency measurements for cross-region replication.");
 
         // Edges: A references D and E (weight 1.0)
         // Using references (weight=1.0) so graph boost is moderate relative to cosine signal
@@ -1033,11 +994,11 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "t1-a", "Rust error handling", "programming", "reference",
-            "Rust error handling with Result and Option types. Anyhow for applications.", 5);
+            "Rust error handling with Result and Option types. Anyhow for applications.");
         insert_note(&conn, "t1-b", "Go error handling", "programming", "reference",
-            "Go error handling patterns. Error wrapping with fmt.Errorf.", 5);
+            "Go error handling patterns. Error wrapping with fmt.Errorf.");
         insert_note(&conn, "t1-c", "Python testing", "programming", "runbook",
-            "Python pytest framework. Unit testing best practices.", 5);
+            "Python pytest framework. Unit testing best practices.");
 
         // No edges, no cosine context → pure BM25 + engagement
         let hits = search(&conn, "error handling", &default_filters(10), &config, None, SearchMode::Normal).unwrap();
@@ -1063,11 +1024,11 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "t2-a", "OAuth2 token flow", "security", "spec",
-            "OAuth2 authorization code flow. Token exchange and refresh.", 5);
+            "OAuth2 authorization code flow. Token exchange and refresh.");
         insert_note(&conn, "t2-b", "JWT validation", "security", "reference",
-            "JWT signature validation. Claims verification. Token expiry.", 5);
+            "JWT signature validation. Claims verification. Token expiry.");
         insert_note(&conn, "t2-c", "Auth middleware design", "security", "spec",
-            "Middleware for request authentication. Session management.", 5);
+            "Middleware for request authentication. Session management.");
 
         // Edge: A depends-on C (auth middleware)
         insert_edge(&conn, "t2-a", "t2-c", "depends-on", 2.0);
@@ -1093,11 +1054,11 @@ mod tests {
 
         // "new" supersedes "old"
         insert_note(&conn, "sup-old", "API v1 design", "systems", "spec",
-            "Original API design document. REST endpoints for v1.", 5);
+            "Original API design document. REST endpoints for v1.");
         insert_note(&conn, "sup-new", "API v2 design", "systems", "spec",
-            "Updated API design. GraphQL migration from REST.", 5);
+            "Updated API design. GraphQL migration from REST.");
         insert_note(&conn, "sup-other", "API client SDK", "systems", "reference",
-            "REST client library. Uses API v1 endpoints.", 5);
+            "REST client library. Uses API v1 endpoints.");
 
         // new supersedes old: src=new, dst=old
         insert_edge(&conn, "sup-new", "sup-old", "supersedes", 1.5);
@@ -1139,29 +1100,29 @@ mod tests {
     fn test_engagement_computation() {
         let config = EngagementConfig::default();
 
-        // Brand new note: just written, never read, default importance
-        let score_new = compute_engagement(0, None, Some(&chrono::Utc::now().to_rfc3339()), 5, &config);
-        // recency ~1.0, popularity 0.0, importance 0.44 → ~0.59
+        // Brand new note: just written, never read
+        let score_new = compute_engagement(0, None, Some(&chrono::Utc::now().to_rfc3339()), &config);
+        // recency ~1.0, popularity 0.0 → 0.60 * 1.0 + 0.40 * 0.0 = ~0.60
         assert!(score_new > 0.50 && score_new < 0.70,
-            "Brand new note engagement should be ~0.59, got {:.3}", score_new);
+            "Brand new note engagement should be ~0.60, got {:.3}", score_new);
 
-        // Well-read note: 20 reads, accessed recently, high importance
+        // Well-read note: 20 reads, accessed recently
         let recent = chrono::Utc::now().to_rfc3339();
-        let score_popular = compute_engagement(20, Some(&recent), Some(&recent), 9, &config);
-        // recency ~1.0, popularity ~1.0, importance ~0.89 → ~0.98
+        let score_popular = compute_engagement(20, Some(&recent), Some(&recent), &config);
+        // recency ~1.0, popularity ~1.0 → 0.60 + 0.40 = ~1.0
         assert!(score_popular > 0.85,
             "Popular recent note engagement should be >0.85, got {:.3}", score_popular);
 
-        // Stale note: 30 days old, never read, default importance
+        // Stale note: 30 days old, never read
         let stale = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
-        let score_stale = compute_engagement(0, None, Some(&stale), 5, &config);
-        // recency ~0.06, popularity 0.0, importance 0.44 → ~0.12
+        let score_stale = compute_engagement(0, None, Some(&stale), &config);
+        // recency ~0.06, popularity 0.0 → 0.60 * 0.06 = ~0.04
         assert!(score_stale < 0.20,
             "Stale unread note engagement should be <0.20, got {:.3}", score_stale);
 
         // No timestamps: should get 0.30 fallback recency
-        let score_no_ts = compute_engagement(0, None, None, 5, &config);
-        assert!(score_no_ts > 0.15 && score_no_ts < 0.30,
+        let score_no_ts = compute_engagement(0, None, None, &config);
+        assert!(score_no_ts > 0.10 && score_no_ts < 0.25,
             "No-timestamp note engagement should use fallback, got {:.3}", score_no_ts);
     }
 
@@ -1176,13 +1137,13 @@ mod tests {
 
         // Create a hub note linked to multiple seeds
         insert_note(&conn, "gn-a", "Seed note alpha", "systems", "spec",
-            "Graph normalization test seed alpha. Unique keyword graphnorm.", 5);
+            "Graph normalization test seed alpha. Unique keyword graphnorm.");
         insert_note(&conn, "gn-b", "Seed note beta", "systems", "spec",
-            "Graph normalization test seed beta. Unique keyword graphnorm.", 5);
+            "Graph normalization test seed beta. Unique keyword graphnorm.");
         insert_note(&conn, "gn-c", "Seed note gamma", "systems", "spec",
-            "Graph normalization test seed gamma. Unique keyword graphnorm.", 5);
+            "Graph normalization test seed gamma. Unique keyword graphnorm.");
         insert_note(&conn, "gn-hub", "Hub note", "systems", "reference",
-            "This hub connects to everything. No graphnorm keyword.", 5);
+            "This hub connects to everything. No graphnorm keyword.");
 
         // All seeds link to hub with high weights
         insert_edge(&conn, "gn-a", "gn-hub", "depends-on", 2.0);
@@ -1222,9 +1183,9 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "bd-a", "Primary search target", "systems", "spec",
-            "BM25 discard test. Primary target note.", 5);
+            "BM25 discard test. Primary target note.");
         insert_note(&conn, "bd-b", "Secondary search target", "systems", "spec",
-            "BM25 discard test. Secondary target note.", 5);
+            "BM25 discard test. Secondary target note.");
 
         let mut candidates = fetch_fts_candidates(
             &conn, "BM25 discard test", &default_filters(10), &config
@@ -1311,11 +1272,11 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "fo-a", "Finance report alpha", "finance", "report",
-            "Quarterly earnings analysis for Q4.", 5);
+            "Quarterly earnings analysis for Q4.");
         insert_note(&conn, "fo-b", "Finance report beta", "finance", "report",
-            "Annual revenue forecast model.", 5);
+            "Annual revenue forecast model.");
         insert_note(&conn, "fo-c", "Systems spec", "systems", "spec",
-            "Infrastructure scaling plan.", 5);
+            "Infrastructure scaling plan.");
 
         let filters = SearchFilters {
             domain: Some("finance"),
@@ -1375,9 +1336,9 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "bm-a", "BM25 mode target note", "systems", "spec",
-            "Testing BM25 only mode. This should be found.", 5);
+            "Testing BM25 only mode. This should be found.");
         insert_note(&conn, "bm-b", "BM25 mode neighbor", "systems", "spec",
-            "This neighbor note has different content.", 5);
+            "This neighbor note has different content.");
         insert_edge(&conn, "bm-a", "bm-b", "references", 1.0);
 
         let hits = search(
@@ -1401,7 +1362,7 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "sem-a", "Semantic test note", "systems", "spec",
-            "Testing semantic mode without embeddings.", 5);
+            "Testing semantic mode without embeddings.");
 
         let result = search(
             &conn, "semantic test", &default_filters(10), &config, None, SearchMode::Semantic
@@ -1422,11 +1383,11 @@ mod tests {
         let mut config = default_config();
 
         insert_note(&conn, "df-a", "Domain filter seed", "finance", "spec",
-            "Finance domain filter test. Unique keyword domfilter.", 5);
+            "Finance domain filter test. Unique keyword domfilter.");
         insert_note(&conn, "df-b", "Same domain neighbor", "finance", "reference",
-            "Finance reference note about quarterly earnings.", 5);
+            "Finance reference note about quarterly earnings.");
         insert_note(&conn, "df-c", "Cross domain neighbor", "systems", "reference",
-            "Systems reference note about infrastructure scaling.", 5);
+            "Systems reference note about infrastructure scaling.");
 
         insert_edge(&conn, "df-a", "df-b", "references", 1.0);
         insert_edge(&conn, "df-a", "df-c", "references", 1.0);
@@ -1524,7 +1485,6 @@ mod tests {
         domain: &str,
         kind: &str,
         body: &str,
-        importance: i64,
         updated_at: &str,
     ) {
         let version_id = format!("v-{}", note_id);
@@ -1543,9 +1503,9 @@ mod tests {
         ).unwrap();
 
         conn.execute(
-            "INSERT INTO current_notes (note_id, namespace, head_version_id, author_agent_id, title, domain, kind, status, importance, updated_at)
-             VALUES (?1, 'ark', ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8)",
-            rusqlite::params![note_id, version_id, db::DEFAULT_AGENT_ID, title, domain, kind, importance, updated_at],
+            "INSERT INTO current_notes (note_id, namespace, head_version_id, author_agent_id, title, domain, kind, status, updated_at)
+             VALUES (?1, 'ark', ?2, ?3, ?4, ?5, ?6, 'active', ?7)",
+            rusqlite::params![note_id, version_id, db::DEFAULT_AGENT_ID, title, domain, kind, updated_at],
         ).unwrap();
 
         conn.execute(
@@ -1566,9 +1526,9 @@ mod tests {
         let since_cutoff = (now - chrono::Duration::days(1)).to_rfc3339();
 
         insert_note_at(&conn, "tf-recent", "Recent BTC analysis", "finance", "report",
-            "Bitcoin price analysis from today.", 5, &recent);
+            "Bitcoin price analysis from today.", &recent);
         insert_note_at(&conn, "tf-old", "Old BTC report", "finance", "report",
-            "Bitcoin mining overview from last month.", 5, &old);
+            "Bitcoin mining overview from last month.", &old);
 
         // Without since filter: both notes should appear
         let filters_no_time = SearchFilters {
@@ -1613,9 +1573,9 @@ mod tests {
         let before_cutoff = (now - chrono::Duration::days(7)).to_rfc3339();
 
         insert_note_at(&conn, "bf-recent", "Recent FOMC note", "finance", "report",
-            "Federal reserve meeting notes from today.", 5, &recent);
+            "Federal reserve meeting notes from today.", &recent);
         insert_note_at(&conn, "bf-old", "Old FOMC note", "finance", "report",
-            "Federal reserve meeting notes from last month.", 5, &old);
+            "Federal reserve meeting notes from last month.", &old);
 
         // With before filter: only old note should appear
         let filters_before = SearchFilters {
@@ -1650,11 +1610,11 @@ mod tests {
         let before_cutoff = (now - chrono::Duration::days(2)).to_rfc3339();
 
         insert_note_at(&conn, "r-new", "New market data", "finance", "report",
-            "Latest market data analysis.", 5, &very_recent);
+            "Latest market data analysis.", &very_recent);
         insert_note_at(&conn, "r-mid", "Mid-range market data", "finance", "report",
-            "Market data from last week.", 5, &mid_range);
+            "Market data from last week.", &mid_range);
         insert_note_at(&conn, "r-old", "Old market data", "finance", "report",
-            "Ancient market data analysis.", 5, &very_old);
+            "Ancient market data analysis.", &very_old);
 
         // Range: 14 days ago to 2 days ago — should only match mid-range
         let filters = SearchFilters {
@@ -1739,13 +1699,13 @@ mod tests {
 
         // Note A: BM25 hit (contains "wyckoff spring")
         insert_note(&conn, "hf-a", "Wyckoff spring setup", "finance", "spec",
-            "Wyckoff spring entry criteria. Accumulation phase identification.", 5);
+            "Wyckoff spring entry criteria. Accumulation phase identification.");
         // Note B: BM25 hit (contains "spring")
         insert_note(&conn, "hf-b", "Spring cleaning runbook", "systems", "runbook",
-            "Spring cleaning procedures for vault maintenance.", 5);
+            "Spring cleaning procedures for vault maintenance.");
         // Note C: NOT a BM25 hit for "spring entry" — but semantically related
         insert_note(&conn, "hf-c", "Accumulation phase trading", "finance", "spec",
-            "How to identify accumulation phases in market structure.", 5);
+            "How to identify accumulation phases in market structure.");
 
         // Simulate embeddings: C is semantically close to query but has no keyword match.
         // All vectors must be L2-normalized since cosine_similarity is a bare dot product.

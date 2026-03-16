@@ -21,9 +21,6 @@ pub fn run(vault_dir: &Path) -> Result<()> {
         "by_kind": s.by_kind.iter().map(|f| {
             serde_json::json!({ "kind": f.label, "count": f.count })
         }).collect::<Vec<_>>(),
-        "by_trust": s.by_trust.iter().map(|f| {
-            serde_json::json!({ "trust": f.label, "count": f.count })
-        }).collect::<Vec<_>>(),
         "recent": s.recent.iter().map(|n| {
             serde_json::json!({
                 "id": n.note_id,
@@ -38,10 +35,6 @@ pub fn run(vault_dir: &Path) -> Result<()> {
             "total_reads": s.access.total_reads,
             "most_accessed": most_accessed,
             "never_read": s.access.never_read,
-        },
-        "importance": {
-            "explicit": s.importance.explicit_count,
-            "avg": (s.importance.avg * 10.0).round() / 10.0,
         },
     });
 

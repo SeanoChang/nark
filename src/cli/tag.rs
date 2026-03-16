@@ -26,7 +26,6 @@ pub fn run(vault_dir: &Path, args: Vec<String>, list: bool, find: Vec<String>) -
                 "title": n.title,
                 "domain": n.domain,
                 "kind": n.kind,
-                "trust": n.trust,
                 "tags": n.tags,
             })
         }).collect();

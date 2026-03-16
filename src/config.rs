@@ -2,10 +2,38 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::path::Path;
 
+pub const BUILTIN_KINDS: &[&str] = &[
+    "spec", "decision", "runbook", "report", "reference",
+    "incident", "experiment", "dataset", "skill", "memory", "note", "journal",
+];
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub search: SearchConfig,
+    pub taxonomy: TaxonomyConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TaxonomyConfig {
+    pub extra_kinds: Vec<String>,
+}
+
+impl Default for TaxonomyConfig {
+    fn default() -> Self {
+        Self {
+            extra_kinds: Vec::new(),
+        }
+    }
+}
+
+impl TaxonomyConfig {
+    pub fn valid_kinds(&self) -> Vec<&str> {
+        let mut kinds: Vec<&str> = BUILTIN_KINDS.to_vec();
+        kinds.extend(self.extra_kinds.iter().map(|s| s.as_str()));
+        kinds
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -46,7 +74,6 @@ pub struct EngagementConfig {
     pub saturation_reads: f64,
     pub weight_recency: f64,
     pub weight_popularity: f64,
-    pub weight_importance: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,9 +125,8 @@ impl Default for EngagementConfig {
         Self {
             half_life_hours: 168.0,
             saturation_reads: 20.0,
-            weight_recency: 0.50,
-            weight_popularity: 0.30,
-            weight_importance: 0.20,
+            weight_recency: 0.60,
+            weight_popularity: 0.40,
         }
     }
 }

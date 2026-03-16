@@ -44,7 +44,6 @@ pub struct NoteMeta {
     pub domain: String,
     pub intent: String,
     pub kind: String,
-    pub trust: String,
     pub status: String,
     pub tags: Vec<String>,
     pub updated_at: String,
@@ -58,7 +57,7 @@ pub struct NoteRef {
 pub fn get_meta(conn: &Connection, note_id: &str) -> Result<NoteMeta> {
     let note_id = resolve_id(conn, note_id)?;
     let mut stmt = conn.prepare(
-        "SELECT note_id, title, domain, intent, kind, trust, status, updated_at
+        "SELECT note_id, title, domain, intent, kind, status, updated_at
          FROM current_notes WHERE note_id = ?1"
     )?;
 
@@ -69,9 +68,8 @@ pub fn get_meta(conn: &Connection, note_id: &str) -> Result<NoteMeta> {
             domain: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
             intent: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
             kind: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-            trust: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-            status: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
-            updated_at: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            status: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+            updated_at: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
             tags: Vec::new(),
         })
     })?;

@@ -58,25 +58,21 @@ pub enum Commands {
         #[arg(long)]
         author: String,
 
-        /// Domain (required unless --from is provided)
+        /// Domain — free text (required unless --from is provided)
         #[arg(long)]
         domain: Option<String>,
 
-        /// Intent (default: research)
+        /// Intent — free text (default: research)
         #[arg(long)]
         intent: Option<String>,
 
-        /// Kind (default: reference)
+        /// Kind — built-in + config extras (default: reference)
         #[arg(long)]
         kind: Option<String>,
 
         /// Status (default: active)
         #[arg(long)]
         status: Option<String>,
-
-        /// Importance 0-10 (default: 5)
-        #[arg(long)]
-        importance: Option<u8>,
 
         /// Title (inferred from first body line if omitted)
         #[arg(long)]
@@ -99,7 +95,7 @@ pub enum Commands {
     ///
     /// Accepts files, directories (recursive *.md), or "-" for stdin.
     /// Each note must have YAML frontmatter with: title, author, domain,
-    /// intent, kind, trust, status, tags.
+    /// intent, kind, status, tags.
     Write {
         /// Paths to files or directories, or "-" for stdin
         paths: Vec<String>,
@@ -128,7 +124,7 @@ pub enum Commands {
 
     /// Show note metadata from the registry (cheap, no vault read)
     ///
-    /// Returns: id, title, domain, intent, kind, trust, status, tags, updated_at.
+    /// Returns: id, title, domain, intent, kind, status, tags, updated_at.
     /// Use this to inspect a note before committing to a full read.
     Peek {
         /// Note ID (UUID)
@@ -157,11 +153,11 @@ pub enum Commands {
         #[arg(long)]
         domain: Option<String>,
 
-        /// Filter by kind (spec, decision, runbook, report, reference, incident, experiment, dataset)
+        /// Filter by kind
         #[arg(long)]
         kind: Option<String>,
 
-        /// Filter by intent (build, debug, operate, design, research, evaluate, decide)
+        /// Filter by intent
         #[arg(long)]
         intent: Option<String>,
 

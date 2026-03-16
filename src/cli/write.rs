@@ -29,8 +29,8 @@ pub fn run(vault_dir: &Path, paths: Vec<String>, depth: Option<u64>) -> Result<(
         if let Some(ref mut eng) = engine {
             let fm = &result.frontmatter;
             let input = build_embed_input(
-                &fm.title, &fm.domain.to_string(), &fm.kind.to_string(),
-                &fm.intent.to_string(), &fm.tags, &fm.aliases, &result.body,
+                &fm.title, &fm.domain, &fm.kind,
+                &fm.intent, &fm.tags, &fm.aliases, &result.body,
             );
             if let Ok(embedding) = eng.embed_document(&input) {
                 let _ = embeddings::upsert_embedding(

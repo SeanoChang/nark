@@ -48,26 +48,23 @@ fn upsert_note(tx: &Connection, r: &IngestResult, now: &str) -> Result<()> {
 }
 
 fn upsert_current_note(tx: &Connection, r: &IngestResult, fm: &Frontmatter, now: &str) -> Result<()> {
-    let importance = fm.importance_clamped() as i64;
     tx.execute(
         "INSERT INTO current_notes
             (note_id, namespace, head_version_id, author_agent_id,
-             title, domain, intent, kind, trust, status, importance, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             title, domain, intent, kind, status, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(note_id) DO UPDATE SET
              head_version_id = excluded.head_version_id,
              title = excluded.title,
              domain = excluded.domain,
              intent = excluded.intent,
              kind = excluded.kind,
-             trust = excluded.trust,
              status = excluded.status,
-             importance = excluded.importance,
              updated_at = excluded.updated_at",
         rusqlite::params![
             r.note_id, NAMESPACE, r.version_id, DEFAULT_AGENT_ID,
-            fm.title, fm.domain.to_string(), fm.intent.to_string(), fm.kind.to_string(),
-            fm.trust.to_string(), fm.status.to_string(), importance, now,
+            fm.title, &fm.domain, &fm.intent, &fm.kind,
+            fm.status.to_string(), now,
         ],
     )?;
     Ok(())

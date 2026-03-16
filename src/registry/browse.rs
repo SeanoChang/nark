@@ -11,7 +11,6 @@ pub struct GroupRow {
 pub struct NoteRow {
     pub note_id: String,
     pub title: String,
-    pub trust: String,
     pub updated_at: String,
     pub tags: Option<Vec<String>>,
 }
@@ -86,7 +85,7 @@ fn list_kinds(conn: &Connection, domain: &str, intent: &str) -> Result<BrowseRes
 fn list_notes(conn: &Connection, domain: &str, intent: &str, kind: &str, include_tags: bool) -> Result<BrowseResult> {
     let sql = if include_tags {
         format!(
-            "SELECT cn.note_id, cn.title, cn.trust, cn.updated_at,
+            "SELECT cn.note_id, cn.title, cn.updated_at,
                     (SELECT GROUP_CONCAT(t.name, ', ')
                      FROM note_tags nt
                      JOIN tags t ON t.tag_id = nt.tag_id
@@ -101,7 +100,7 @@ fn list_notes(conn: &Connection, domain: &str, intent: &str, kind: &str, include
         )
     } else {
         format!(
-            "SELECT note_id, title, trust, updated_at FROM current_notes
+            "SELECT note_id, title, updated_at FROM current_notes
              WHERE {} AND domain = ?1 AND intent = ?2 AND kind = ?3
              ORDER BY updated_at DESC
              LIMIT 50",
@@ -112,7 +111,7 @@ fn list_notes(conn: &Connection, domain: &str, intent: &str, kind: &str, include
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![domain, intent, kind], |row| {
         let tags = if include_tags {
-            let tags_str: Option<String> = row.get(4)?;
+            let tags_str: Option<String> = row.get(3)?;
             tags_str.map(|s| s.split(", ").map(String::from).collect())
         } else {
             None
@@ -120,8 +119,7 @@ fn list_notes(conn: &Connection, domain: &str, intent: &str, kind: &str, include
         Ok(NoteRow {
             note_id: row.get(0)?,
             title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            trust: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            updated_at: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            updated_at: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
             tags,
         })
     })?;

@@ -13,7 +13,6 @@ pub struct TaggedNote {
     pub title: String,
     pub domain: String,
     pub kind: String,
-    pub trust: String,
     pub tags: Vec<String>,
 }
 
@@ -106,7 +105,7 @@ pub fn find_by_tags(conn: &Connection, tags: &[String]) -> Result<Vec<TaggedNote
     let tag_count = tags.len();
 
     let sql = format!(
-        "SELECT cn.note_id, cn.title, cn.domain, cn.kind, cn.trust
+        "SELECT cn.note_id, cn.title, cn.domain, cn.kind
          FROM current_notes cn
          JOIN note_tags nt ON nt.note_id = cn.note_id
          JOIN tags t ON t.tag_id = nt.tag_id
@@ -136,7 +135,6 @@ pub fn find_by_tags(conn: &Connection, tags: &[String]) -> Result<Vec<TaggedNote
                 title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                 domain: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 kind: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                trust: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
                 tags: Vec::new(),
             })
         })?

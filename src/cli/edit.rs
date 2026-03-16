@@ -246,8 +246,8 @@ pub fn run(vault_dir: &Path, id: &str, batch: bool, args: Vec<String>) -> Result
     if let Some(ref mut eng) = engine {
         let fm = &result.frontmatter;
         let input = build_embed_input(
-            &fm.title, &fm.domain.to_string(), &fm.kind.to_string(),
-            &fm.intent.to_string(), &fm.tags, &fm.aliases, &result.body,
+            &fm.title, &fm.domain, &fm.kind,
+            &fm.intent, &fm.tags, &fm.aliases, &result.body,
         );
         if let Ok(embedding) = eng.embed_document(&input) {
             let _ = embeddings::upsert_embedding(
@@ -280,7 +280,7 @@ mod tests {
     use super::*;
 
     fn sample_doc() -> String {
-        "---\ntitle: Test Note\nauthor: agent\ndomain: systems\nintent: build\nkind: spec\ntrust: hypothesis\nstatus: active\ntags:\n- test\n---\nThis is the body.\nIt has multiple lines.\nTODO: fix this.\nTODO: fix that.".to_string()
+        "---\ntitle: Test Note\nauthor: agent\ndomain: systems\nintent: build\nkind: spec\nstatus: active\ntags:\n- test\n---\nThis is the body.\nIt has multiple lines.\nTODO: fix this.\nTODO: fix that.".to_string()
     }
 
     fn split(doc: &str) -> (String, String) {
@@ -445,7 +445,7 @@ mod tests {
     fn test_set_replaces_entire_doc() {
         let doc = sample_doc();
         let (fm, body) = split(&doc);
-        let new_doc = "---\ntitle: Replaced\nauthor: agent\ndomain: systems\nintent: build\nkind: spec\ntrust: hypothesis\nstatus: active\ntags:\n- replaced\n---\nBrand new body.".to_string();
+        let new_doc = "---\ntitle: Replaced\nauthor: agent\ndomain: systems\nintent: build\nkind: spec\nstatus: active\ntags:\n- replaced\n---\nBrand new body.".to_string();
         let op = EditOp::Set { content: new_doc.clone() };
         let result = apply_operation(&doc, &fm, &body, &op).unwrap();
         assert_eq!(result, new_doc);

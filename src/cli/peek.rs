@@ -14,7 +14,6 @@ pub fn run(vault_dir: &Path, id: &str) -> Result<()> {
         "domain": meta.domain,
         "intent": meta.intent,
         "kind": meta.kind,
-        "trust": meta.trust,
         "status": meta.status,
         "tags": meta.tags,
         "updated_at": meta.updated_at,

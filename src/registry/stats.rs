@@ -28,20 +28,13 @@ pub struct AccessStats {
     pub never_read: i64,
 }
 
-pub struct ImportanceStats {
-    pub explicit_count: i64,
-    pub avg: f64,
-}
-
 pub struct VaultStats {
     pub total_notes: i64,
     pub total_versions: i64,
     pub by_domain: Vec<FacetCount>,
     pub by_kind: Vec<FacetCount>,
-    pub by_trust: Vec<FacetCount>,
     pub recent: Vec<RecentNote>,
     pub access: AccessStats,
-    pub importance: ImportanceStats,
 }
 
 pub fn overview(conn: &Connection) -> Result<VaultStats> {
@@ -56,20 +49,16 @@ pub fn overview(conn: &Connection) -> Result<VaultStats> {
 
     let by_domain = facet_query(conn, "domain")?;
     let by_kind = facet_query(conn, "kind")?;
-    let by_trust = facet_query(conn, "trust")?;
     let recent = recent_query(conn)?;
     let access = access_stats(conn)?;
-    let importance = importance_stats(conn)?;
 
     Ok(VaultStats {
         total_notes,
         total_versions,
         by_domain,
         by_kind,
-        by_trust,
         recent,
         access,
-        importance,
     })
 }
 
@@ -151,19 +140,3 @@ fn access_stats(conn: &Connection) -> Result<AccessStats> {
     })
 }
 
-fn importance_stats(conn: &Connection) -> Result<ImportanceStats> {
-    let explicit_count: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM current_notes WHERE {} AND importance != 5", FILTER),
-        [], |r| r.get(0),
-    )?;
-
-    let avg: f64 = conn.query_row(
-        &format!("SELECT COALESCE(AVG(importance), 5.0) FROM current_notes WHERE {}", FILTER),
-        [], |r| r.get(0),
-    )?;
-
-    Ok(ImportanceStats {
-        explicit_count,
-        avg,
-    })
-}
