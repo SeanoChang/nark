@@ -72,7 +72,7 @@ pub fn run(
     // Build cosine context if embeddings are available and there's a query.
     // Skip for BM25-only mode (doesn't use cosine).
     let cosine_ctx = if mode != SearchMode::Bm25Only && !query.is_empty() && embeddings::has_embeddings(&conn) {
-        build_cosine_context(vault_dir, &conn, query)
+        build_cosine_context(vault_dir, &cfg, &conn, query)
     } else {
         None
     };
@@ -108,12 +108,26 @@ pub fn run(
 
 fn build_cosine_context(
     vault_dir: &Path,
+    cfg: &config::Config,
     conn: &rusqlite::Connection,
     query: &str,
 ) -> Option<CosineContext> {
-    let mut engine = embed::init_embedding(vault_dir)?;
-    let query_embedding = engine.embed_query(query).ok()?;
+    let mut provider = embed::init_provider(vault_dir, &cfg.embedding)?;
+    let query_embedding = provider.embed_query(query).ok()?;
     let all = embeddings::get_all_embeddings(conn).ok()?;
+
+    // Guard: skip cosine if stored embeddings have different dimensions than the query
+    // (e.g. provider changed from local/768 to openai/1536 without re-embedding)
+    if let Some((_, first_vec)) = all.first() {
+        if first_vec.len() != query_embedding.len() {
+            eprintln!(
+                "Warning: embedding dimension mismatch (query={}, stored={}). Run `nark embed build` to re-embed.",
+                query_embedding.len(), first_vec.len()
+            );
+            return None;
+        }
+    }
+
     let note_embeddings = all.into_iter().collect();
     Some(CosineContext { query_embedding, note_embeddings })
 }

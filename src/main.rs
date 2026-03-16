@@ -64,6 +64,7 @@ fn main() -> Result<()> {
         Embed { action } => match action {
             cli::EmbedAction::Init => cli::embed::run_init(&vault_dir),
             cli::EmbedAction::Build => cli::embed::run_build(&vault_dir),
+            cli::EmbedAction::Migrate => cli::embed::run_migrate(&vault_dir),
         },
         Reset { confirm } => cli::reset::run(&vault_dir, confirm),
         Update => cli::update::run(),

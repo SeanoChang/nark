@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::config;
 use crate::db;
 use crate::embed::{self, build_embed_input};
 use crate::registry::{embeddings, write::commit_version};
@@ -14,8 +15,9 @@ pub fn run(vault_dir: &Path, paths: Vec<String>, depth: Option<u64>) -> Result<(
 
     let files = resolve_paths(&paths, depth)?;
 
-    // Try to load embedding engine (None if not initialized — skip silently)
-    let mut engine = embed::init_embedding(vault_dir);
+    // Try to load embedding provider (None if not initialized — skip silently)
+    let cfg = config::load(vault_dir)?;
+    let mut provider = embed::init_provider(vault_dir, &cfg.embedding);
 
     let mut wrote = 0u64;
     let mut notes: Vec<serde_json::Value> = Vec::new();
@@ -25,16 +27,16 @@ pub fn run(vault_dir: &Path, paths: Vec<String>, depth: Option<u64>) -> Result<(
         let result = vault.ingest(&content, None)?;
         commit_version(&conn, &result)?;
 
-        // Auto-embed if engine available
-        if let Some(ref mut eng) = engine {
+        // Auto-embed if provider available
+        if let Some(ref mut prov) = provider {
             let fm = &result.frontmatter;
             let input = build_embed_input(
                 &fm.title, &fm.domain, &fm.kind,
                 &fm.intent, &fm.tags, &fm.aliases, &result.body,
             );
-            if let Ok(embedding) = eng.embed_document(&input) {
+            if let Ok(embedding) = prov.embed_document(&input) {
                 let _ = embeddings::upsert_embedding(
-                    &conn, &result.note_id, &embedding, "bge-base-en-v1.5",
+                    &conn, &result.note_id, &embedding, prov.model_name(),
                 );
             }
         }

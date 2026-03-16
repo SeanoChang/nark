@@ -121,16 +121,16 @@ pub fn run(
     let result = vault.ingest(&note, None)?;
     commit_version(&conn, &result)?;
 
-    // Auto-embed if engine available
-    if let Some(ref mut eng) = embed::init_embedding(vault_dir) {
+    // Auto-embed if provider available
+    if let Some(ref mut prov) = embed::init_provider(vault_dir, &cfg.embedding) {
         let fm = &result.frontmatter;
         let input = build_embed_input(
             &fm.title, &fm.domain, &fm.kind,
             &fm.intent, &fm.tags, &fm.aliases, &result.body,
         );
-        if let Ok(embedding) = eng.embed_document(&input) {
+        if let Ok(embedding) = prov.embed_document(&input) {
             let _ = embeddings::upsert_embedding(
-                &conn, &result.note_id, &embedding, "bge-base-en-v1.5",
+                &conn, &result.note_id, &embedding, prov.model_name(),
             );
         }
     }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::Path;
 
+use crate::config;
 use crate::db;
 use crate::embed::{self, build_embed_input};
 use crate::registry::{embeddings, resolve, write::commit_version};
@@ -34,17 +35,18 @@ pub fn run(vault_dir: &Path, id: &str, version_id: &str) -> Result<()> {
     let result = vault.ingest(&full_doc, Some(&meta.note_id))?;
     commit_version(&conn, &result)?;
 
-    // Auto-embed if engine available
-    let mut engine = embed::init_embedding(vault_dir);
-    if let Some(ref mut eng) = engine {
+    // Auto-embed if provider available
+    let cfg = config::load(vault_dir)?;
+    let mut provider = embed::init_provider(vault_dir, &cfg.embedding);
+    if let Some(ref mut prov) = provider {
         let fm = &result.frontmatter;
         let input = build_embed_input(
             &fm.title, &fm.domain, &fm.kind,
             &fm.intent, &fm.tags, &fm.aliases, &result.body,
         );
-        if let Ok(embedding) = eng.embed_document(&input) {
+        if let Ok(embedding) = prov.embed_document(&input) {
             let _ = embeddings::upsert_embedding(
-                &conn, &result.note_id, &embedding, "bge-base-en-v1.5",
+                &conn, &result.note_id, &embedding, prov.model_name(),
             );
         }
     }

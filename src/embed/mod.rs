@@ -1,3 +1,4 @@
+pub mod api;
 pub mod download;
 
 use std::path::Path;
@@ -7,17 +8,27 @@ use ort::session::Session;
 use ort::value::TensorRef;
 use tokenizers::Tokenizer;
 
-const MODEL_NAME: &str = "bge-base-en-v1.5";
-const EMBED_DIM: usize = 768;
-const MAX_TOKENS: usize = 512;
+use crate::config::EmbeddingConfig;
 
-pub struct EmbeddingEngine {
+pub const MODEL_NAME: &str = "nomic-embed-text-v1.5";
+const EMBED_DIM: usize = 768;
+const MAX_TOKENS: usize = 8192;
+
+/// Trait for embedding providers. Implementations produce vectors for documents and queries.
+pub trait EmbeddingProvider {
+    fn embed_document(&mut self, text: &str) -> Result<Vec<f32>>;
+    fn embed_query(&mut self, query: &str) -> Result<Vec<f32>>;
+    fn model_name(&self) -> &str;
+    fn dimensions(&self) -> usize;
+}
+
+pub struct OnnxProvider {
     session: Session,
     tokenizer: Tokenizer,
 }
 
-/// Try to load the embedding engine. Returns None if dylib or model files are missing.
-pub fn init_embedding(vault_dir: &Path) -> Option<EmbeddingEngine> {
+/// Try to load the ONNX embedding engine. Returns None if dylib or model files are missing.
+pub fn init_embedding(vault_dir: &Path) -> Option<OnnxProvider> {
     let dylib = vault_dir.join("lib").join(onnx_dylib_name());
     let model = vault_dir.join("models").join(MODEL_NAME).join("model.onnx");
     let tok_path = vault_dir.join("models").join(MODEL_NAME).join("tokenizer.json");
@@ -42,21 +53,45 @@ pub fn init_embedding(vault_dir: &Path) -> Option<EmbeddingEngine> {
     })).ok()?;
     tokenizer.with_padding(None);
 
-    Some(EmbeddingEngine { session, tokenizer })
+    Some(OnnxProvider { session, tokenizer })
 }
 
-impl EmbeddingEngine {
-    /// Embed a document (note content). No query prefix.
-    pub fn embed_document(&mut self, text: &str) -> Result<Vec<f32>> {
-        self.run_inference(text)
+/// Resolve the configured embedding provider. Returns None if unavailable.
+pub fn init_provider(vault_dir: &Path, cfg: &EmbeddingConfig) -> Option<Box<dyn EmbeddingProvider>> {
+    match cfg.provider.as_str() {
+        "openai" => {
+            let provider = api::ApiProvider::from_env(cfg.api_model.as_deref())?;
+            Some(Box::new(provider))
+        }
+        _ => {
+            // Default: local ONNX
+            let engine = init_embedding(vault_dir)?;
+            Some(Box::new(engine))
+        }
     }
+}
 
-    /// Embed a search query with BGE query prefix.
-    pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
-        let prefixed = format!("Represent this sentence for searching relevant passages: {query}");
+impl EmbeddingProvider for OnnxProvider {
+    fn embed_document(&mut self, text: &str) -> Result<Vec<f32>> {
+        let prefixed = format!("search_document: {text}");
         self.run_inference(&prefixed)
     }
 
+    fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
+        let prefixed = format!("search_query: {query}");
+        self.run_inference(&prefixed)
+    }
+
+    fn model_name(&self) -> &str {
+        MODEL_NAME
+    }
+
+    fn dimensions(&self) -> usize {
+        EMBED_DIM
+    }
+}
+
+impl OnnxProvider {
     fn run_inference(&mut self, text: &str) -> Result<Vec<f32>> {
         let encoding = self.tokenizer.encode(text, true)
             .map_err(|e| anyhow::anyhow!("tokenizer error: {e}"))?;
@@ -93,7 +128,7 @@ impl EmbeddingEngine {
 }
 
 /// Build the text input for document embedding.
-/// Prefixes with bracketed taxonomy context to help bge-base distinguish domains.
+/// Prefixes with bracketed taxonomy context to help distinguish domains.
 pub fn build_embed_input(
     title: &str,
     domain: &str,
@@ -112,7 +147,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-fn l2_normalize(v: &[f32]) -> Vec<f32> {
+pub fn l2_normalize(v: &[f32]) -> Vec<f32> {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
         v.iter().map(|x| x / norm).collect()

@@ -8,8 +8,9 @@ use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use tar::Archive;
 
+use super::MODEL_NAME;
+
 const ORT_VERSION: &str = "1.24.2";
-const MODEL_NAME: &str = "bge-base-en-v1.5";
 
 // ONNX Runtime download URLs by platform
 struct PlatformAsset {
@@ -48,17 +49,17 @@ struct ModelFile {
 
 const MODEL_FILES: &[ModelFile] = &[
     ModelFile {
-        url: "https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main/onnx/model.onnx",
+        url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/onnx/model.onnx",
         dest: "model.onnx",
-        sha256: None, // ~440MB — hash populated on first verified download
+        sha256: None, // ~137MB — hash populated on first verified download
     },
     ModelFile {
-        url: "https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main/tokenizer.json",
+        url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/tokenizer.json",
         dest: "tokenizer.json",
         sha256: None,
     },
     ModelFile {
-        url: "https://huggingface.co/BAAI/bge-base-en-v1.5/resolve/main/config.json",
+        url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5/resolve/main/config.json",
         dest: "config.json",
         sha256: None,
     },

@@ -73,8 +73,9 @@ nark read <note-id>
 | `nark tag --find <tags...>` | Find notes by tag (AND logic) | Cheap — registry only |
 | `nark link <sources...> --target <id> [--rel <type>]` | Create typed links between notes | Write — vault + registry |
 | `nark links <id>` | Show a note's link neighborhood | Cheap — registry only |
-| `nark embed init` | Download ONNX Runtime + bge-base-en-v1.5 model | Setup |
+| `nark embed init` | Download ONNX Runtime + nomic-embed-text-v1.5 model | Setup |
 | `nark embed build` | Backfill embeddings for all notes | Write — registry only |
+| `nark embed migrate` | Upgrade from bge to nomic (download + cleanup + re-embed) | Setup + Write |
 | `nark reset [--confirm]` | Destroy and recreate registry (vault objects kept) | Destructive |
 | `nark init` | Create vault dirs + registry database | One-time setup |
 | `nark update` | Download latest release binary from GitHub | Maintenance |
@@ -138,7 +139,7 @@ Domain, intent, kind, trust, and status are enforced enums — invalid values ar
 │       └── versions/    # Version history (.ref + .json)
 ├── onnxruntime/         # ONNX Runtime dylib (nark embed init)
 ├── models/
-│   └── bge-base-en-v1.5/  # Embedding model (nark embed init)
+│   └── nomic-embed-text-v1.5/  # Embedding model (nark embed init)
 └── tmp/                 # Atomic write staging
 ```
 
@@ -209,20 +210,35 @@ Edges are created via frontmatter `links:` fields or the `nark link` command. Gr
 Embeddings are optional but unlock cosine-ranked search and semantic mode.
 
 ```bash
-# Download ONNX Runtime + bge-base-en-v1.5 model
+# Download ONNX Runtime + nomic-embed-text-v1.5 model
 nark embed init
 
 # Backfill embeddings for all notes
 nark embed build
+
+# Upgrading from bge-base-en-v1.5? One command handles everything:
+nark embed migrate
 ```
 
-Embeddings are stored in the registry and computed locally (no API calls). Without embeddings, search falls back to BM25 + activation scoring.
+By default, embeddings are computed locally via ONNX (no API calls). Optionally, configure OpenAI as the embedding provider in `config.toml`:
+
+```toml
+[embedding]
+provider = "openai"                    # default: "local"
+api_model = "text-embedding-3-small"   # optional override
+```
+
+Requires `OPENAI_API_KEY` in the environment. Without embeddings, search falls back to BM25 + activation scoring.
 
 ## Configuration
 
 Place a `config.toml` in your vault directory (`~/.ark/config.toml`). All fields are optional — missing values use defaults.
 
 ```toml
+[embedding]
+provider = "local"    # "local" (ONNX) or "openai"
+# api_model = "text-embedding-3-small"  # only used when provider = "openai"
+
 [search]
 threshold = 0.10      # minimum score to return a result
 top_n = 20            # max results

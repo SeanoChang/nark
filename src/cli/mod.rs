@@ -337,7 +337,7 @@ pub enum Commands {
         confirm: bool,
     },
 
-    /// Manage local embeddings (ONNX + bge-base-en-v1.5)
+    /// Manage embeddings (ONNX + nomic-embed-text-v1.5, or OpenAI API)
     ///
     /// Subcommands: init (download runtime + model), build (backfill embeddings).
     /// Embedding is optional — search falls back to BM25 if not initialized.
@@ -352,8 +352,13 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum EmbedAction {
-    /// Download ONNX Runtime and bge-base-en-v1.5 model
+    /// Download ONNX Runtime and nomic-embed-text-v1.5 model
     Init,
     /// Backfill embeddings for all notes that don't have one
     Build,
+    /// Migrate from bge-base-en-v1.5 to nomic-embed-text-v1.5
+    ///
+    /// Downloads the new model, removes old bge model files (~440MB freed),
+    /// and re-embeds all notes. Safe to run if already migrated (no-op).
+    Migrate,
 }

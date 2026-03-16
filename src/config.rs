@@ -12,6 +12,23 @@ pub const BUILTIN_KINDS: &[&str] = &[
 pub struct Config {
     pub search: SearchConfig,
     pub taxonomy: TaxonomyConfig,
+    pub embedding: EmbeddingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    pub provider: String,           // "local" | "openai"
+    pub api_model: Option<String>,  // override default API model
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: "local".to_string(),
+            api_model: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
