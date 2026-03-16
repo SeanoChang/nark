@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::config;
 use crate::db;
 use crate::embed::{self, build_embed_input};
-use crate::registry::{embeddings, resolve, write::commit_version};
+use crate::registry::{embeddings, resolve, similarity, write::commit_version};
 use crate::vault::fs::Vault;
 
 #[derive(Debug)]
@@ -193,7 +193,7 @@ fn apply_operation(full_doc: &str, fm_raw: &str, body: &str, op: &EditOp) -> Res
     }
 }
 
-pub fn run(vault_dir: &Path, id: &str, batch: bool, args: Vec<String>) -> Result<()> {
+pub fn run(vault_dir: &Path, id: &str, batch: bool, auto_link: bool, args: Vec<String>) -> Result<()> {
     let conn = db::open_registry(vault_dir)?;
     let vault = Vault::new(vault_dir.to_path_buf());
 
@@ -242,30 +242,34 @@ pub fn run(vault_dir: &Path, id: &str, batch: bool, args: Vec<String>) -> Result
     let result = vault.ingest(&full_doc, Some(&meta.note_id))?;
     commit_version(&conn, &result)?;
 
-    // Auto-embed if provider available
     let cfg = config::load(vault_dir)?;
     let mut provider = embed::init_provider(vault_dir, &cfg.embedding);
-    if let Some(ref mut prov) = provider {
+    let last_embedding = if let Some(ref mut prov) = provider {
         let fm = &result.frontmatter;
         let input = build_embed_input(
             &fm.title, &fm.domain, &fm.kind,
             &fm.intent, &fm.tags, &fm.aliases, &result.body,
         );
-        if let Ok(embedding) = prov.embed_document(&input) {
-            let _ = embeddings::upsert_embedding(
-                &conn, &result.note_id, &embedding, prov.model_name(),
-            );
+        match prov.embed_document(&input) {
+            Ok(embedding) => {
+                let _ = embeddings::upsert_embedding(
+                    &conn, &result.note_id, &embedding, prov.model_name(),
+                );
+                Some(embedding)
+            }
+            Err(_) => None,
         }
-    }
+    } else {
+        None
+    };
 
-    // Output
     let operation = if ops.len() == 1 {
         serde_json::Value::String(op_names[0].clone())
     } else {
         serde_json::Value::Array(op_names.into_iter().map(serde_json::Value::String).collect())
     };
 
-    let out = serde_json::json!({
+    let mut out = serde_json::json!({
         "note_id": result.note_id,
         "version_id": result.version_id,
         "prev_version_id": result.prev_version_id,
@@ -273,6 +277,21 @@ pub fn run(vault_dir: &Path, id: &str, batch: bool, args: Vec<String>) -> Result
         "operation": operation,
         "batch": batch,
     });
+
+    if let Some(ref embedding) = last_embedding {
+        if embeddings::has_embeddings(&conn) {
+            let all = embeddings::get_all_embeddings(&conn).unwrap_or_default();
+            if let Some(sim_result) = similarity::compute_suggestions(
+                &conn, &result.note_id, embedding, &all,
+                cfg.embedding.similarity_threshold as f32,
+                cfg.embedding.auto_link_threshold as f32,
+                cfg.embedding.max_suggestions, auto_link,
+            ) {
+                similarity::append_to_json(&sim_result, &mut out);
+            }
+        }
+    }
+
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
 }

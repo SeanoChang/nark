@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::config;
 use crate::db;
 use crate::embed::{self, build_embed_input};
-use crate::registry::{embeddings, resolve, write::commit_version};
+use crate::registry::{embeddings, resolve, similarity, write::commit_version};
 use crate::vault::fs::Vault;
 
 pub fn run(
@@ -19,6 +19,7 @@ pub fn run(
     tags: &[String],
     body_inline: Option<&str>,
     from: Option<&str>,
+    auto_link: bool,
 ) -> Result<()> {
     let conn = db::open_registry(vault_dir)?;
     let cfg = config::load(vault_dir)?;
@@ -121,24 +122,44 @@ pub fn run(
     let result = vault.ingest(&note, None)?;
     commit_version(&conn, &result)?;
 
-    // Auto-embed if provider available
-    if let Some(ref mut prov) = embed::init_provider(vault_dir, &cfg.embedding) {
+    let last_embedding = if let Some(ref mut prov) = embed::init_provider(vault_dir, &cfg.embedding) {
         let fm = &result.frontmatter;
         let input = build_embed_input(
             &fm.title, &fm.domain, &fm.kind,
             &fm.intent, &fm.tags, &fm.aliases, &result.body,
         );
-        if let Ok(embedding) = prov.embed_document(&input) {
-            let _ = embeddings::upsert_embedding(
-                &conn, &result.note_id, &embedding, prov.model_name(),
-            );
+        match prov.embed_document(&input) {
+            Ok(embedding) => {
+                let _ = embeddings::upsert_embedding(
+                    &conn, &result.note_id, &embedding, prov.model_name(),
+                );
+                Some(embedding)
+            }
+            Err(_) => None,
         }
-    }
+    } else {
+        None
+    };
 
-    let output = serde_json::json!({
+    let mut output = serde_json::json!({
         "id": result.note_id,
         "title": result.frontmatter.title,
     });
+
+    if let Some(ref embedding) = last_embedding {
+        if embeddings::has_embeddings(&conn) {
+            let all = embeddings::get_all_embeddings(&conn).unwrap_or_default();
+            if let Some(sim_result) = similarity::compute_suggestions(
+                &conn, &result.note_id, embedding, &all,
+                cfg.embedding.similarity_threshold as f32,
+                cfg.embedding.auto_link_threshold as f32,
+                cfg.embedding.max_suggestions, auto_link,
+            ) {
+                similarity::append_to_json(&sim_result, &mut output);
+            }
+        }
+    }
+
     println!("{}", serde_json::to_string_pretty(&output)?);
 
     Ok(())

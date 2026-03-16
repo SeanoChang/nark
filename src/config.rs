@@ -20,6 +20,9 @@ pub struct Config {
 pub struct EmbeddingConfig {
     pub provider: String,           // "local" | "openai"
     pub api_model: Option<String>,  // override default API model
+    pub similarity_threshold: f64,  // min cosine similarity to suggest (default 0.7)
+    pub auto_link_threshold: f64,   // min cosine similarity for auto-edge creation (default 0.8)
+    pub max_suggestions: usize,     // max similar notes to return (default 5)
 }
 
 impl Default for EmbeddingConfig {
@@ -27,6 +30,9 @@ impl Default for EmbeddingConfig {
         Self {
             provider: "local".to_string(),
             api_model: None,
+            similarity_threshold: 0.7,
+            auto_link_threshold: 0.8,
+            max_suggestions: 5,
         }
     }
 }

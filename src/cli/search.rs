@@ -87,6 +87,8 @@ pub fn run(
             "kind": h.kind,
             "snippet": h.snippet,
             "rank": h.rank,
+            "links_in": h.links_in,
+            "links_out": h.links_out,
         })
     }).collect();
 

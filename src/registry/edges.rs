@@ -145,7 +145,7 @@ fn resolve_target(tx: &Connection, target: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn update_link_count(tx: &Connection, note_id: &str) -> Result<()> {
+pub(crate) fn update_link_count(tx: &Connection, note_id: &str) -> Result<()> {
     tx.execute(
         "UPDATE current_notes SET links_out_count = (
             SELECT COUNT(*) FROM note_edges WHERE src_note_id = ?1
@@ -170,19 +170,19 @@ pub fn sync_edges(
     links: &[FrontmatterLink],
     now: &str,
 ) -> Result<()> {
-    // 1. Collect old destination IDs for link count fixup
+    // 1. Collect old body/frontmatter destination IDs for link count fixup
     let old_dsts: Vec<String> = {
         let mut stmt = tx.prepare_cached(
-            "SELECT DISTINCT dst_note_id FROM note_edges WHERE src_note_id = ?1",
+            "SELECT DISTINCT dst_note_id FROM note_edges WHERE src_note_id = ?1 AND source_type IN ('body', 'frontmatter')",
         )?;
         stmt.query_map([note_id], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect()
     };
 
-    // 2. Delete existing edges from this source
+    // 2. Delete existing body/frontmatter edges (preserve auto-edges)
     tx.execute(
-        "DELETE FROM note_edges WHERE src_note_id = ?1",
+        "DELETE FROM note_edges WHERE src_note_id = ?1 AND source_type IN ('body', 'frontmatter')",
         [note_id],
     )?;
 

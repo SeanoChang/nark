@@ -38,6 +38,8 @@ pub fn run(vault_dir: &Path, topic: &str, limit: usize, since: Option<&str>, bef
             "domain": hit.domain,
             "kind": hit.kind,
             "body_preview": preview,
+            "links_in": hit.links_in,
+            "links_out": hit.links_out,
         }));
 
         // Bump access — agent read this note's full content

@@ -13,6 +13,7 @@ pub mod links;
 pub mod ls;
 pub mod peek;
 pub mod read;
+pub mod related;
 pub mod reset;
 pub mod rollback;
 pub mod search;
@@ -53,6 +54,8 @@ pub enum Commands {
     ///
     /// Only author + domain required (or --from to inherit taxonomy).
     /// Body comes from stdin or --body. Title inferred from first line if omitted.
+    /// If embeddings are available, shows similar notes in output.
+    /// Use --auto-link to automatically create reference edges to similar notes.
     Jot {
         /// Note author (required)
         #[arg(long)]
@@ -89,6 +92,10 @@ pub enum Commands {
         /// Clone taxonomy from an existing note's head
         #[arg(long)]
         from: Option<String>,
+
+        /// Auto-create reference edges to similar notes (requires embeddings)
+        #[arg(long)]
+        auto_link: bool,
     },
 
     /// Ingest markdown notes into the vault
@@ -96,6 +103,8 @@ pub enum Commands {
     /// Accepts files, directories (recursive *.md), or "-" for stdin.
     /// Each note must have YAML frontmatter with: title, author, domain,
     /// intent, kind, status, tags.
+    /// If embeddings are available, shows similar notes in output.
+    /// Use --auto-link to automatically create reference edges to similar notes.
     Write {
         /// Paths to files or directories, or "-" for stdin
         paths: Vec<String>,
@@ -103,12 +112,18 @@ pub enum Commands {
         /// Max directory recursion depth (unlimited if omitted)
         #[arg(long)]
         depth: Option<u64>,
+
+        /// Auto-create reference edges to similar notes (requires embeddings)
+        #[arg(long)]
+        auto_link: bool,
     },
 
     /// Edit an existing note (replace, append, prepend, set)
     ///
     /// Creates a new MVCC version for each edit. Supports surgical find/replace,
     /// body append/prepend, and full document replacement.
+    /// If embeddings are available, shows similar notes in output.
+    /// Use --auto-link to automatically create reference edges to similar notes.
     Edit {
         /// Note ID (UUID)
         id: String,
@@ -116,6 +131,10 @@ pub enum Commands {
         /// Run multiple operations as one atomic version
         #[arg(long)]
         batch: bool,
+
+        /// Auto-create reference edges to similar notes (requires embeddings)
+        #[arg(long)]
+        auto_link: bool,
 
         /// Edit operations and arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -335,6 +354,23 @@ pub enum Commands {
         /// Actually perform the reset (without this, shows a dry-run summary)
         #[arg(long)]
         confirm: bool,
+    },
+
+    /// Find notes similar to a given note by embedding similarity
+    ///
+    /// Requires embeddings (nark embed init + build).
+    /// Use --link to auto-create reference edges for top matches.
+    Related {
+        /// Note ID (UUID or prefix)
+        id: String,
+
+        /// Max results
+        #[arg(long, default_value = "5")]
+        limit: usize,
+
+        /// Auto-create reference edges for top matches
+        #[arg(long)]
+        link: bool,
     },
 
     /// Manage embeddings (ONNX + nomic-embed-text-v1.5, or OpenAI API)

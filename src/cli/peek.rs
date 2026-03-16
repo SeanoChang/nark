@@ -17,6 +17,8 @@ pub fn run(vault_dir: &Path, id: &str) -> Result<()> {
         "status": meta.status,
         "tags": meta.tags,
         "updated_at": meta.updated_at,
+        "links_in": meta.links_in,
+        "links_out": meta.links_out,
     });
 
     println!("{}", serde_json::to_string_pretty(&out)?);

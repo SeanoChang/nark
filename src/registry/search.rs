@@ -15,6 +15,8 @@ pub struct SearchHit {
     pub kind: String,
     pub snippet: String,
     pub rank: f64,
+    pub links_in: i64,
+    pub links_out: i64,
 }
 
 pub struct SearchFilters<'a> {
@@ -58,6 +60,8 @@ struct Candidate {
     graph_score: f64,
     engagement: f64,
     final_score: f64,
+    links_in: i64,
+    links_out: i64,
 }
 
 struct RawEdge {
@@ -217,6 +221,8 @@ fn to_hits(candidates: Vec<Candidate>) -> Vec<SearchHit> {
             kind: c.kind,
             snippet: c.snippet,
             rank: c.final_score,
+            links_in: c.links_in,
+            links_out: c.links_out,
         })
         .collect()
 }
@@ -241,7 +247,9 @@ fn fetch_fts_candidates(
             bm25(note_text, {}),
             cn.access_count,
             cn.last_accessed,
-            cn.updated_at
+            cn.updated_at,
+            cn.links_in_count,
+            cn.links_out_count
          FROM note_text nt
          JOIN current_notes cn ON nt.note_id = cn.note_id
          WHERE note_text MATCH ?1
@@ -289,7 +297,8 @@ fn fetch_filter_candidates(
 ) -> Result<Vec<Candidate>> {
     let mut sql = String::from(
         "SELECT cn.note_id, cn.title, cn.domain, cn.kind, '' AS snippet, 0.0 AS rank,
-                cn.access_count, cn.last_accessed, cn.updated_at
+                cn.access_count, cn.last_accessed, cn.updated_at,
+                cn.links_in_count, cn.links_out_count
          FROM current_notes cn
          WHERE cn.namespace = 'ark'
            AND cn.status != 'retracted'",
@@ -347,6 +356,8 @@ fn exec_candidate_query(
                     eng_config,
                 ),
                 final_score: 0.0,
+                links_in: row.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                links_out: row.get::<_, Option<i64>>(10)?.unwrap_or(0),
             })
         })?
         .filter_map(|r| r.ok())
@@ -423,7 +434,8 @@ fn fetch_cosine_candidates(
     let placeholders: String = note_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
     let mut sql = format!(
         "SELECT cn.note_id, cn.title, cn.domain, cn.kind, '' AS snippet, 0.0 AS rank,
-                cn.access_count, cn.last_accessed, cn.updated_at
+                cn.access_count, cn.last_accessed, cn.updated_at,
+                cn.links_in_count, cn.links_out_count
          FROM current_notes cn
          WHERE cn.note_id IN ({})
            AND cn.namespace = 'ark'
@@ -602,7 +614,8 @@ fn graph_expand(
         let placeholders: String = discovered.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let mut sql = format!(
             "SELECT cn.note_id, cn.title, cn.domain, cn.kind, '' AS snippet, 0.0 AS rank,
-                    cn.access_count, cn.last_accessed, cn.updated_at
+                    cn.access_count, cn.last_accessed, cn.updated_at,
+                    cn.links_in_count, cn.links_out_count
              FROM current_notes cn
              WHERE cn.note_id IN ({})
                AND cn.namespace = 'ark'
@@ -1232,6 +1245,8 @@ mod tests {
                 graph_score: 0.0,
                 engagement: 0.85,
                 final_score: 0.0,
+                links_in: 0,
+                links_out: 0,
             },
             Candidate {
                 note_id: "bf-d".into(),
@@ -1244,6 +1259,8 @@ mod tests {
                 graph_score: 0.40,
                 engagement: 0.70,
                 final_score: 0.0,
+                links_in: 0,
+                links_out: 0,
             },
         ];
 
@@ -1305,18 +1322,21 @@ mod tests {
                 kind: "".into(), snippet: "".into(),
                 bm25_rank: None, cosine_score: 0.0, graph_score: 0.0,
                 engagement: 0.0, final_score: 0.50,
+                links_in: 0, links_out: 0,
             },
             Candidate {
                 note_id: "th-b".into(), title: "b".into(), domain: "".into(),
                 kind: "".into(), snippet: "".into(),
                 bm25_rank: None, cosine_score: 0.0, graph_score: 0.0,
                 engagement: 0.0, final_score: 0.05, // below default threshold 0.10
+                links_in: 0, links_out: 0,
             },
             Candidate {
                 note_id: "th-c".into(), title: "c".into(), domain: "".into(),
                 kind: "".into(), snippet: "".into(),
                 bm25_rank: None, cosine_score: 0.0, graph_score: 0.0,
                 engagement: 0.0, final_score: 0.10, // exactly at threshold
+                links_in: 0, links_out: 0,
             },
         ];
 
@@ -1432,6 +1452,8 @@ mod tests {
                 graph_score: 0.10,
                 engagement: 0.50,
                 final_score: 0.0,
+                links_in: 0,
+                links_out: 0,
             },
         ];
 
@@ -1643,12 +1665,14 @@ mod tests {
                 kind: "".into(), snippet: "".into(),
                 bm25_rank: Some(0), cosine_score: 0.0, graph_score: 0.0,
                 engagement: 0.50, final_score: 0.0,
+                links_in: 0, links_out: 0,
             },
             Candidate {
                 note_id: "mc-b".into(), title: "b".into(), domain: "".into(),
                 kind: "".into(), snippet: "".into(),
                 bm25_rank: Some(1), cosine_score: 0.0, graph_score: 0.0,
                 engagement: 0.50, final_score: 0.0,
+                links_in: 0, links_out: 0,
             },
         ];
 
@@ -1659,6 +1683,7 @@ mod tests {
                 kind: "".into(), snippet: "".into(),
                 bm25_rank: None, cosine_score: 0.85, graph_score: 0.0,
                 engagement: 0.50, final_score: 0.0,
+                links_in: 0, links_out: 0,
             },
             // New: mc-c only in cosine pool
             Candidate {
@@ -1666,6 +1691,7 @@ mod tests {
                 kind: "".into(), snippet: "".into(),
                 bm25_rank: None, cosine_score: 0.72, graph_score: 0.0,
                 engagement: 0.50, final_score: 0.0,
+                links_in: 0, links_out: 0,
             },
         ];
 

@@ -5,6 +5,7 @@ pub mod edges;
 pub mod embeddings;
 pub mod resolve;
 pub mod search;
+pub mod similarity;
 pub mod stats;
 pub mod tags;
 pub mod write;
