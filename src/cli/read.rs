@@ -10,7 +10,7 @@ pub fn run(vault_dir: &Path, id: &str) -> Result<()> {
     let vault = Vault::new(vault_dir.to_path_buf());
 
     let meta = resolve::get_meta(&conn, id)?;
-    let refs = resolve::get_ref(&conn, id)?;
+    let refs = resolve::get_ref(&conn, &meta.note_id)?;
 
     let fm_raw = vault.read_object("objects/fm", &refs.fm_hash, "yaml")?;
     let body = vault.read_object("objects/md", &refs.md_hash, "md")?;

@@ -41,11 +41,12 @@ pub fn run(vault_dir: &Path, args: Vec<String>, list: bool, find: Vec<String>) -
         bail!("no note IDs provided");
     }
 
-    // Validate all IDs exist
-    for id in &note_ids {
-        resolve::get_meta(&conn, id)
+    // Validate all IDs exist and resolve prefixes
+    let note_ids: Vec<String> = note_ids.iter().map(|id| {
+        let meta = resolve::get_meta(&conn, id)
             .map_err(|_| anyhow::anyhow!("note not found: {}", id))?;
-    }
+        Ok(meta.note_id)
+    }).collect::<Result<Vec<String>>>()?;
 
     // Mode 3: read-only (no modifiers)
     if add.is_empty() && remove.is_empty() {

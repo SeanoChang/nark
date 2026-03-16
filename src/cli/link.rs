@@ -79,37 +79,39 @@ pub fn run(vault_dir: &Path, sources: Vec<String>, target: &str, rel: &str) -> R
     let conn = db::open_registry(vault_dir)?;
     let vault = Vault::new(vault_dir.to_path_buf());
 
-    // Validate target exists
+    // Validate target exists and resolve prefix
     let target_meta = resolve::get_meta(&conn, target)
         .map_err(|_| anyhow::anyhow!("target note not found: {}", target))?;
+    let target_id = &target_meta.note_id;
 
     let mut results: Vec<serde_json::Value> = Vec::new();
 
     for source in &sources {
-        // Validate source exists
+        // Validate source exists and resolve prefix
         let source_meta = resolve::get_meta(&conn, source)
             .map_err(|_| anyhow::anyhow!("source note not found: {}", source))?;
+        let source_id = &source_meta.note_id;
 
         // Reject self-links
-        if source_meta.note_id == target_meta.note_id {
-            bail!("cannot link a note to itself: {}", source);
+        if source_id == target_id {
+            bail!("cannot link a note to itself: {}", source_id);
         }
 
         // Read current source note content
-        let refs = resolve::get_ref(&conn, source)?;
+        let refs = resolve::get_ref(&conn, source_id)?;
         let fm_raw = vault.read_object("objects/fm", &refs.fm_hash, "yaml")?;
         let body = vault.read_object("objects/md", &refs.md_hash, "md")?;
 
         let mut fm: Frontmatter = serde_yaml::from_str(&fm_raw)?;
 
         // Check idempotency — both frontmatter and body already have the link
-        let has_fm_link = fm.links.iter().any(|l| l.target == target && l.rel == rel);
-        let wikilink_bare = format!("[[{}]]", target);
+        let has_fm_link = fm.links.iter().any(|l| l.target == *target_id && l.rel == rel);
+        let wikilink_bare = format!("[[{}]]", target_id);
         let has_body_link = body.contains(&wikilink_bare);
 
         if has_fm_link && has_body_link {
             results.push(serde_json::json!({
-                "source": source,
+                "source": source_id,
                 "source_title": source_meta.title,
                 "status": "no-op",
             }));
@@ -119,7 +121,7 @@ pub fn run(vault_dir: &Path, sources: Vec<String>, target: &str, rel: &str) -> R
         // Mutate frontmatter
         if !has_fm_link {
             fm.links.push(FrontmatterLink {
-                target: target.to_string(),
+                target: target_id.to_string(),
                 rel: rel.to_string(),
             });
         }
@@ -128,23 +130,23 @@ pub fn run(vault_dir: &Path, sources: Vec<String>, target: &str, rel: &str) -> R
         let (new_body, _) = if has_body_link {
             (body, false)
         } else {
-            insert_body_link(&body, target, rel)
+            insert_body_link(&body, target_id, rel)
         };
 
         // Reassemble and re-ingest
         let full_note = format!("---\n{}---\n{}", serde_yaml::to_string(&fm)?, new_body);
-        let result = vault.ingest(&full_note, Some(source))?;
+        let result = vault.ingest(&full_note, Some(source_id))?;
         commit_version(&conn, &result)?;
 
         results.push(serde_json::json!({
-            "source": source,
+            "source": source_id,
             "source_title": source_meta.title,
             "status": "linked",
         }));
     }
 
     let out = serde_json::json!({
-        "target": target,
+        "target": target_id,
         "target_title": target_meta.title,
         "rel": rel,
         "linked": results.iter().filter(|r| r["status"] == "linked").count(),

@@ -7,8 +7,8 @@ use crate::registry::resolve;
 pub fn run(vault_dir: &Path, id: &str) -> Result<()> {
     let conn = db::open_registry(vault_dir)?;
 
-    // Validate note exists
-    let _meta = resolve::get_meta(&conn, id)
+    // Validate note exists and resolve prefix
+    let meta = resolve::get_meta(&conn, id)
         .map_err(|_| anyhow::anyhow!("note not found: {}", id))?;
 
     let mut stmt = conn.prepare(
@@ -24,7 +24,7 @@ pub fn run(vault_dir: &Path, id: &str) -> Result<()> {
     )?;
 
     let rows: Vec<Result<serde_json::Value, rusqlite::Error>> = stmt
-        .query_map([id], |row| {
+        .query_map([&meta.note_id], |row| {
             Ok(serde_json::json!({
                 "version_id": row.get::<_, String>(0)?,
                 "prev_version_id": row.get::<_, Option<String>>(1)?,
@@ -40,7 +40,7 @@ pub fn run(vault_dir: &Path, id: &str) -> Result<()> {
     }
 
     let out = serde_json::json!({
-        "note_id": id,
+        "note_id": meta.note_id,
         "version_count": versions.len(),
         "versions": versions,
     });

@@ -10,7 +10,7 @@ pub fn run(vault_dir: &Path, id: &str) -> Result<()> {
     let meta = resolve::get_meta(&conn, id)
         .map_err(|_| anyhow::anyhow!("note not found: {}", id))?;
 
-    let (outgoing, incoming) = edges::get_edges(&conn, id)?;
+    let (outgoing, incoming) = edges::get_edges(&conn, &meta.note_id)?;
 
     let out_json: Vec<serde_json::Value> = outgoing.iter().map(|e| {
         let mut v = serde_json::json!({

@@ -196,15 +196,15 @@ pub fn run(vault_dir: &Path, id: &str, batch: bool, args: Vec<String>) -> Result
     let conn = db::open_registry(vault_dir)?;
     let vault = Vault::new(vault_dir.to_path_buf());
 
-    // Validate note exists
-    let _meta = resolve::get_meta(&conn, id)
+    // Validate note exists and resolve prefix
+    let meta = resolve::get_meta(&conn, id)
         .map_err(|_| anyhow::anyhow!("note not found: {}", id))?;
 
     // Parse operations (reads stdin eagerly if any arg is "-")
     let ops = parse_operations(&args, batch)?;
 
     // Read current content
-    let refs = resolve::get_ref(&conn, id)?;
+    let refs = resolve::get_ref(&conn, &meta.note_id)?;
     let fm_raw = vault.read_object("objects/fm", &refs.fm_hash, "yaml")?;
     let body = vault.read_object("objects/md", &refs.md_hash, "md")?;
 
@@ -238,7 +238,7 @@ pub fn run(vault_dir: &Path, id: &str, batch: bool, args: Vec<String>) -> Result
         .map_err(|e| anyhow::anyhow!("edit produced invalid frontmatter: {}", e))?;
 
     // Re-ingest as new version
-    let result = vault.ingest(&full_doc, Some(id))?;
+    let result = vault.ingest(&full_doc, Some(&meta.note_id))?;
     commit_version(&conn, &result)?;
 
     // Auto-embed if engine available

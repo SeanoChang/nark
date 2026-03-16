@@ -19,7 +19,7 @@ pub fn validate_ids(conn: &Connection, ids: &[String]) -> Result<Vec<DeletedNote
     for id in ids {
         match resolve::get_meta(conn, id) {
             Ok(meta) => {
-                let refs = resolve::get_ref(conn, id)?;
+                let refs = resolve::get_ref(conn, &meta.note_id)?;
                 notes.push(DeletedNote {
                     note_id: meta.note_id,
                     title: meta.title,

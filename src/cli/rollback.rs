@@ -10,8 +10,8 @@ pub fn run(vault_dir: &Path, id: &str, version_id: &str) -> Result<()> {
     let conn = db::open_registry(vault_dir)?;
     let vault = Vault::new(vault_dir.to_path_buf());
 
-    // Validate note exists
-    let _meta = resolve::get_meta(&conn, id)
+    // Validate note exists and resolve prefix
+    let meta = resolve::get_meta(&conn, id)
         .map_err(|_| anyhow::anyhow!("note not found: {}", id))?;
 
     // Validate version belongs to this note
@@ -20,10 +20,10 @@ pub fn run(vault_dir: &Path, id: &str, version_id: &str) -> Result<()> {
     )?;
 
     let (fm_hash, md_hash): (String, String) = stmt
-        .query_row(rusqlite::params![id, version_id], |row| {
+        .query_row(rusqlite::params![&meta.note_id, version_id], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })
-        .map_err(|_| anyhow::anyhow!("version '{}' not found for note '{}'", version_id, id))?;
+        .map_err(|_| anyhow::anyhow!("version '{}' not found for note '{}'", version_id, &meta.note_id))?;
 
     // Read the old version's content
     let fm_raw = vault.read_object("objects/fm", &fm_hash, "yaml")?;
@@ -31,7 +31,7 @@ pub fn run(vault_dir: &Path, id: &str, version_id: &str) -> Result<()> {
     let full_doc = format!("---\n{}---\n{}", fm_raw, body);
 
     // Re-ingest as new version (append-only — not destructive)
-    let result = vault.ingest(&full_doc, Some(id))?;
+    let result = vault.ingest(&full_doc, Some(&meta.note_id))?;
     commit_version(&conn, &result)?;
 
     // Auto-embed if engine available

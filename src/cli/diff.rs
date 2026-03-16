@@ -56,11 +56,11 @@ pub fn run(vault_dir: &Path, id: &str, from: Option<&str>, to: Option<&str>) -> 
     let conn = db::open_registry(vault_dir)?;
     let vault = Vault::new(vault_dir.to_path_buf());
 
-    // Validate note exists
-    let _meta = resolve::get_meta(&conn, id)
+    // Validate note exists and resolve prefix
+    let meta = resolve::get_meta(&conn, id)
         .map_err(|_| anyhow::anyhow!("note not found: {}", id))?;
 
-    let (head_id, head_prev_id) = get_head_info(&conn, id)?;
+    let (head_id, head_prev_id) = get_head_info(&conn, &meta.note_id)?;
 
     // Resolve "from" version
     let from_id = match from {
@@ -77,8 +77,8 @@ pub fn run(vault_dir: &Path, id: &str, from: Option<&str>, to: Option<&str>) -> 
         None => head_id,
     };
 
-    let from_ref = get_version_ref(&conn, id, &from_id)?;
-    let to_ref = get_version_ref(&conn, id, &to_id)?;
+    let from_ref = get_version_ref(&conn, &meta.note_id, &from_id)?;
+    let to_ref = get_version_ref(&conn, &meta.note_id, &to_id)?;
 
     let from_content = read_version_content(&vault, &from_ref)?;
     let to_content = read_version_content(&vault, &to_ref)?;
@@ -108,7 +108,7 @@ pub fn run(vault_dir: &Path, id: &str, from: Option<&str>, to: Option<&str>) -> 
     }
 
     let out = serde_json::json!({
-        "note_id": id,
+        "note_id": meta.note_id,
         "from_version": from_ref.version_id,
         "to_version": to_ref.version_id,
         "additions": additions,
