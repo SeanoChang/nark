@@ -95,7 +95,7 @@ fn list_notes(conn: &Connection, domain: &str, intent: &str, kind: &str, include
                     ) AS tags
              FROM current_notes cn
              WHERE {} AND cn.domain = ?1 AND cn.intent = ?2 AND cn.kind = ?3
-             ORDER BY cn.activation_score DESC, cn.updated_at DESC
+             ORDER BY cn.updated_at DESC
              LIMIT 50",
             FILTER.replace("namespace", "cn.namespace").replace("status", "cn.status")
         )
@@ -103,7 +103,7 @@ fn list_notes(conn: &Connection, domain: &str, intent: &str, kind: &str, include
         format!(
             "SELECT note_id, title, trust, updated_at FROM current_notes
              WHERE {} AND domain = ?1 AND intent = ?2 AND kind = ?3
-             ORDER BY activation_score DESC, updated_at DESC
+             ORDER BY updated_at DESC
              LIMIT 50",
             FILTER
         )

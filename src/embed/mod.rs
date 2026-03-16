@@ -93,18 +93,18 @@ impl EmbeddingEngine {
 }
 
 /// Build the text input for document embedding.
+/// Prefixes with bracketed taxonomy context to help bge-base distinguish domains.
 pub fn build_embed_input(
     title: &str,
     domain: &str,
     kind: &str,
     intent: &str,
     tags: &[String],
-    aliases: &[String],
+    _aliases: &[String],
     body: &str,
 ) -> String {
-    let tags_str = tags.join(" ");
-    let aliases_str = aliases.join(" ");
-    format!("{title}\n{domain} {kind} {intent}\n{tags_str}\n{aliases_str}\n{body}")
+    let tags_str = tags.join(", ");
+    format!("[{domain} {kind} — {intent}] [{tags_str}] {title}\n\n{body}")
 }
 
 /// Cosine similarity between two L2-normalized vectors.

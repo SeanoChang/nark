@@ -16,6 +16,7 @@ pub struct SearchConfig {
     pub bm25: Bm25Config,
     pub weights: BlendWeights,
     pub graph: GraphConfig,
+    pub engagement: EngagementConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,7 +35,18 @@ pub struct Bm25Config {
 pub struct BlendWeights {
     pub cosine: f64,
     pub graph: f64,
-    pub activation: f64,
+    #[serde(alias = "activation")]
+    pub engagement: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EngagementConfig {
+    pub half_life_hours: f64,
+    pub saturation_reads: f64,
+    pub weight_recency: f64,
+    pub weight_popularity: f64,
+    pub weight_importance: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -53,6 +65,7 @@ impl Default for SearchConfig {
             bm25: Bm25Config::default(),
             weights: BlendWeights::default(),
             graph: GraphConfig::default(),
+            engagement: EngagementConfig::default(),
         }
     }
 }
@@ -75,7 +88,19 @@ impl Default for BlendWeights {
         Self {
             cosine: 0.50,
             graph: 0.25,
-            activation: 0.25,
+            engagement: 0.25,
+        }
+    }
+}
+
+impl Default for EngagementConfig {
+    fn default() -> Self {
+        Self {
+            half_life_hours: 168.0,
+            saturation_reads: 20.0,
+            weight_recency: 0.50,
+            weight_popularity: 0.30,
+            weight_importance: 0.20,
         }
     }
 }

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{bail, Result};
 use rusqlite::Connection;
 
-use crate::config::SearchConfig;
+use crate::config::{EngagementConfig, SearchConfig};
 use crate::embed;
 
 const VALID_KINDS: &[&str] = &[
@@ -62,7 +62,7 @@ struct Candidate {
     bm25_rank: Option<usize>,
     cosine_score: f64,
     graph_score: f64,
-    activation: f64,
+    engagement: f64,
     final_score: f64,
 }
 
@@ -102,7 +102,7 @@ pub fn search(
     }
 }
 
-/// Full pipeline: BM25 filter → graph expand → cosine rank → blend
+/// Full pipeline: BM25 + cosine dual-recall → graph expand → blend
 fn search_normal(
     conn: &Connection,
     query: &str,
@@ -112,12 +112,20 @@ fn search_normal(
 ) -> Result<Vec<SearchHit>> {
     let has_query = !query.is_empty();
 
-    // Step 1+2: BM25 recall or filter-only candidates
+    // Step 1: BM25 recall or filter-only candidates
     let mut candidates = if has_query {
         fetch_fts_candidates(conn, query, filters, config)?
     } else {
         fetch_filter_candidates(conn, filters, config)?
     };
+
+    // Step 2: Cosine recall (only if embeddings available and there's a query)
+    if has_query {
+        if let Some(ctx) = cosine_ctx {
+            let cosine_candidates = fetch_cosine_candidates(ctx, conn, filters, config)?;
+            merge_candidates(&mut candidates, cosine_candidates);
+        }
+    }
 
     // Step 3: Graph expansion
     candidates = graph_expand(conn, candidates, config, filters.domain)?;
@@ -150,15 +158,15 @@ fn search_bm25_only(
         fetch_filter_candidates(conn, filters, config)?
     };
 
-    // Score using BM25 rank position + activation only (no graph, no cosine)
+    // Score using BM25 rank position + engagement only (no graph, no cosine)
     let pool_size = candidates.iter().filter(|c| c.bm25_rank.is_some()).count() as f64;
     for c in &mut candidates {
         let primary = match c.bm25_rank {
             Some(rank) if pool_size > 0.0 => 1.0 - (rank as f64 / pool_size),
             _ => 0.0,
         };
-        // Simple score: BM25 rank normalized + activation tiebreaker
-        c.final_score = primary * 0.75 + c.activation * 0.25;
+        // Simple score: BM25 rank normalized + engagement tiebreaker
+        c.final_score = primary * 0.75 + c.engagement * 0.25;
     }
 
     let results = threshold_and_sort(candidates, config.threshold, filters.limit);
@@ -255,7 +263,10 @@ fn fetch_fts_candidates(
             cn.kind,
             snippet(note_text, 2, '[', ']', '...', 32),
             bm25(note_text, {}),
-            cn.activation_score
+            cn.access_count,
+            cn.last_accessed,
+            cn.updated_at,
+            cn.importance
          FROM note_text nt
          JOIN current_notes cn ON nt.note_id = cn.note_id
          WHERE note_text MATCH ?1
@@ -286,7 +297,7 @@ fn fetch_fts_candidates(
     ));
     params.push(Box::new(config.bm25.top_k as i64));
 
-    let mut candidates = exec_candidate_query(conn, &sql, &params)?;
+    let mut candidates = exec_candidate_query(conn, &sql, &params, &config.engagement)?;
 
     // Assign BM25 rank positions
     for (i, c) in candidates.iter_mut().enumerate() {
@@ -303,7 +314,7 @@ fn fetch_filter_candidates(
 ) -> Result<Vec<Candidate>> {
     let mut sql = String::from(
         "SELECT cn.note_id, cn.title, cn.domain, cn.kind, '' AS snippet, 0.0 AS rank,
-                cn.activation_score
+                cn.access_count, cn.last_accessed, cn.updated_at, cn.importance
          FROM current_notes cn
          WHERE cn.namespace = 'ark'
            AND cn.status != 'retracted'",
@@ -325,25 +336,29 @@ fn fetch_filter_candidates(
     }
 
     sql.push_str(&format!(
-        "\n         ORDER BY cn.activation_score DESC, cn.updated_at DESC\n         LIMIT ?{}",
+        "\n         ORDER BY cn.updated_at DESC\n         LIMIT ?{}",
         pi
     ));
     params.push(Box::new(config.bm25.top_k as i64));
 
-    exec_candidate_query(conn, &sql, &params)
+    exec_candidate_query(conn, &sql, &params, &config.engagement)
 }
 
 fn exec_candidate_query(
     conn: &Connection,
     sql: &str,
     params: &[Box<dyn rusqlite::types::ToSql>],
+    eng_config: &EngagementConfig,
 ) -> Result<Vec<Candidate>> {
     let mut stmt = conn.prepare(sql)?;
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
     let rows: Vec<Candidate> = stmt
         .query_map(param_refs.as_slice(), |row| {
-            let raw_activation: f64 = row.get::<_, Option<f64>>(6)?.unwrap_or(0.0);
+            let access_count: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
+            let last_accessed: Option<String> = row.get(7)?;
+            let updated_at: Option<String> = row.get(8)?;
+            let importance: i64 = row.get::<_, Option<i64>>(9)?.unwrap_or(5);
             Ok(Candidate {
                 note_id: row.get(0)?,
                 title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -353,7 +368,10 @@ fn exec_candidate_query(
                 bm25_rank: None,
                 cosine_score: 0.0,
                 graph_score: 0.0,
-                activation: if raw_activation == 0.0 { 0.50 } else { raw_activation },
+                engagement: compute_engagement(
+                    access_count, last_accessed.as_deref(), updated_at.as_deref(),
+                    importance, eng_config,
+                ),
                 final_score: 0.0,
             })
         })?
@@ -361,6 +379,141 @@ fn exec_candidate_query(
         .collect();
 
     Ok(rows)
+}
+
+/// Compute engagement score from real signals: recency, popularity, importance.
+fn compute_engagement(
+    access_count: i64,
+    last_accessed: Option<&str>,
+    updated_at: Option<&str>,
+    importance: i64,
+    config: &EngagementConfig,
+) -> f64 {
+    // Recency: exponential decay (true half-life) from the more recent of last_accessed and updated_at
+    let recency = match most_recent_timestamp(last_accessed, updated_at) {
+        Some(ts) => {
+            let age_hours = hours_since(&ts).max(0.0);
+            (-age_hours * 2.0_f64.ln() / config.half_life_hours).exp()
+        }
+        None => 0.30, // no timestamps fallback
+    };
+
+    // Popularity: log-saturating read count, clamped to [0, 1]
+    let popularity = ((1.0 + access_count as f64).ln() / (1.0 + config.saturation_reads).ln())
+        .min(1.0);
+
+    // Importance: linear from [1, 10] to [0, 1], clamped
+    let importance_norm = ((importance as f64).clamp(1.0, 10.0) - 1.0) / 9.0;
+
+    config.weight_recency * recency
+        + config.weight_popularity * popularity
+        + config.weight_importance * importance_norm
+}
+
+fn most_recent_timestamp(a: Option<&str>, b: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.with_timezone(&chrono::Utc));
+    match (a.and_then(parse), b.and_then(parse)) {
+        (Some(ta), Some(tb)) => Some(ta.max(tb)),
+        (Some(t), None) | (None, Some(t)) => Some(t),
+        (None, None) => None,
+    }
+}
+
+fn hours_since(ts: &chrono::DateTime<chrono::Utc>) -> f64 {
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(*ts);
+    duration.num_seconds() as f64 / 3600.0
+}
+
+// -- Cosine Recall (dual-recall fusion) --
+
+/// Fetch top-k candidates by cosine similarity from the embedding table.
+/// Applies the same pre-filters as BM25 candidates.
+fn fetch_cosine_candidates(
+    ctx: &CosineContext,
+    conn: &Connection,
+    filters: &SearchFilters,
+    config: &SearchConfig,
+) -> Result<Vec<Candidate>> {
+    // Score all embedded notes by cosine similarity
+    let mut scored: Vec<(&String, f32)> = ctx
+        .note_embeddings
+        .iter()
+        .map(|(id, emb)| (id, embed::cosine_similarity(&ctx.query_embedding, emb)))
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(config.bm25.top_k);
+
+    if scored.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Fetch metadata for the top-k cosine hits
+    let note_ids: Vec<&String> = scored.iter().map(|(id, _)| *id).collect();
+    let cosine_map: HashMap<&str, f32> = scored.iter().map(|(id, s)| (id.as_str(), *s)).collect();
+
+    let placeholders: String = note_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let mut sql = format!(
+        "SELECT cn.note_id, cn.title, cn.domain, cn.kind, '' AS snippet, 0.0 AS rank,
+                cn.access_count, cn.last_accessed, cn.updated_at, cn.importance
+         FROM current_notes cn
+         WHERE cn.note_id IN ({})
+           AND cn.namespace = 'ark'
+           AND cn.status != 'retracted'",
+        placeholders
+    );
+
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+        note_ids.iter().map(|id| Box::new((*id).clone()) as Box<dyn rusqlite::types::ToSql>).collect();
+    let mut pi = note_ids.len() + 1;
+
+    append_column_filters(&mut sql, &mut params, &mut pi, filters);
+
+    if !filters.tags.is_empty() {
+        let (subquery, new_pi) = tag_subquery(filters.tags, pi);
+        sql.push_str(&format!("\n           AND cn.note_id IN ({})", subquery));
+        for tag in filters.tags {
+            params.push(Box::new(tag.clone()));
+        }
+        params.push(Box::new(filters.tags.len() as i64));
+        pi = new_pi;
+    }
+    let _ = pi; // suppress unused warning
+
+    let mut candidates = exec_candidate_query(conn, &sql, &params, &config.engagement)?;
+
+    // Pre-fill cosine scores from the embedding scan
+    for c in &mut candidates {
+        if let Some(&score) = cosine_map.get(c.note_id.as_str()) {
+            c.cosine_score = score as f64;
+        }
+    }
+
+    Ok(candidates)
+}
+
+/// Merge cosine-recall candidates into the existing BM25 candidate pool.
+/// Deduplicates by note_id. If a note appears in both, keeps BM25 candidate
+/// but copies the cosine_score from the cosine candidate.
+fn merge_candidates(bm25_pool: &mut Vec<Candidate>, cosine_pool: Vec<Candidate>) {
+    let mut index: HashMap<String, usize> = bm25_pool
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.note_id.clone(), i))
+        .collect();
+
+    for cosine_c in cosine_pool {
+        if let Some(&idx) = index.get(&cosine_c.note_id) {
+            // Note in both pools: copy cosine score to BM25 candidate
+            if cosine_c.cosine_score > bm25_pool[idx].cosine_score {
+                bm25_pool[idx].cosine_score = cosine_c.cosine_score;
+            }
+        } else {
+            // Only in cosine pool: add to candidates
+            index.insert(cosine_c.note_id.clone(), bm25_pool.len());
+            bm25_pool.push(cosine_c);
+        }
+    }
 }
 
 // -- Graph Expansion --
@@ -481,7 +634,7 @@ fn graph_expand(
         let placeholders: String = discovered.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
         let mut sql = format!(
             "SELECT cn.note_id, cn.title, cn.domain, cn.kind, '' AS snippet, 0.0 AS rank,
-                    cn.activation_score
+                    cn.access_count, cn.last_accessed, cn.updated_at, cn.importance
              FROM current_notes cn
              WHERE cn.note_id IN ({})
                AND cn.namespace = 'ark'
@@ -500,27 +653,7 @@ fn graph_expand(
             }
         }
 
-        let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let new_candidates: Vec<Candidate> = stmt
-            .query_map(param_refs.as_slice(), |row| {
-                let raw_activation: f64 = row.get::<_, Option<f64>>(6)?.unwrap_or(0.0);
-                let note_id: String = row.get(0)?;
-                Ok(Candidate {
-                    note_id,
-                    title: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    domain: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    kind: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    snippet: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    bm25_rank: None,
-                    cosine_score: 0.0,
-                    graph_score: 0.0,
-                    activation: if raw_activation == 0.0 { 0.50 } else { raw_activation },
-                    final_score: 0.0,
-                })
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+        let new_candidates = exec_candidate_query(conn, &sql, &params, &config.engagement)?;
 
         for mut nc in new_candidates {
             if let Some(&gs) = neighbor_scores.get(&nc.note_id) {
@@ -592,7 +725,7 @@ fn blend_scores(candidates: &mut [Candidate], config: &SearchConfig, has_embeddi
             0.0
         };
 
-        c.final_score = primary * w.cosine + c.graph_score * w.graph + c.activation * w.activation;
+        c.final_score = primary * w.cosine + c.graph_score * w.graph + c.engagement * w.engagement;
     }
 }
 
@@ -698,7 +831,7 @@ mod tests {
         domain: &str,
         kind: &str,
         body: &str,
-        activation_score: f64,
+        importance: i64,
     ) -> String {
         let now = chrono::Utc::now().to_rfc3339();
         let version_id = format!("v-{}", note_id);
@@ -721,9 +854,9 @@ mod tests {
 
         // Insert into current_notes (materialized view)
         conn.execute(
-            "INSERT INTO current_notes (note_id, namespace, head_version_id, author_agent_id, title, domain, kind, status, activation_score, updated_at)
+            "INSERT INTO current_notes (note_id, namespace, head_version_id, author_agent_id, title, domain, kind, status, importance, updated_at)
              VALUES (?1, 'ark', ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8)",
-            rusqlite::params![note_id, version_id, db::DEFAULT_AGENT_ID, title, domain, kind, activation_score, now],
+            rusqlite::params![note_id, version_id, db::DEFAULT_AGENT_ID, title, domain, kind, importance, now],
         )
         .unwrap();
 
@@ -783,22 +916,22 @@ mod tests {
         // Insert the 6 systems-domain notes (3 BM25 hits + 2 graph-discovered + 1 extra)
         insert_note(&conn, "note-a", "CAS content hash design", "systems", "spec",
             "content_hash = BLAKE3(fm || md). The vault uses BLAKE3 hashing for all objects.",
-            0.85);
+            5);
         insert_note(&conn, "note-b", "BLAKE3 benchmark results", "systems", "report",
             "BLAKE3 benchmark: 2.1 GB/s on ARM. Fast hashing for content-addressed storage.",
-            0.55);
+            5);
         insert_note(&conn, "note-c", "CAS design for vault", "systems", "spec",
             "Content-addressed storage using BLAKE3 hashing function. Object store layout.",
-            0.40);
+            5);
         insert_note(&conn, "note-d", "Vault ingest pipeline", "systems", "spec",
             "The ingest pipeline reads markdown, parses frontmatter, and writes CAS objects.",
-            0.70);
+            5);
         insert_note(&conn, "note-e", "Registry write.rs impl", "systems", "reference",
             "Implementation of registry write module. Handles note creation and updates.",
-            0.45);
+            5);
         insert_note(&conn, "note-f", "Unrelated systems note", "systems", "report",
             "Network latency measurements for cross-region replication.",
-            0.30);
+            5);
 
         // Edges: A references D and E (weight 1.0)
         // Using references (weight=1.0) so graph boost is moderate relative to cosine signal
@@ -865,7 +998,7 @@ mod tests {
         let order: Vec<&str> = results.iter().map(|c| c.note_id.as_str()).collect();
 
         // Key invariant: D (graph-discovered, no keyword match) outranks B (direct BM25 hit)
-        // because D is confirmed relevant by cosine AND boosted by graph + high activation
+        // because D is confirmed relevant by cosine AND boosted by graph score
         let d_score = results.iter().find(|c| c.note_id == "note-d").unwrap().final_score;
         let b_score = results.iter().find(|c| c.note_id == "note-b").unwrap().final_score;
         assert!(d_score > b_score,
@@ -900,13 +1033,13 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "t1-a", "Rust error handling", "programming", "reference",
-            "Rust error handling with Result and Option types. Anyhow for applications.", 0.0);
+            "Rust error handling with Result and Option types. Anyhow for applications.", 5);
         insert_note(&conn, "t1-b", "Go error handling", "programming", "reference",
-            "Go error handling patterns. Error wrapping with fmt.Errorf.", 0.0);
+            "Go error handling patterns. Error wrapping with fmt.Errorf.", 5);
         insert_note(&conn, "t1-c", "Python testing", "programming", "runbook",
-            "Python pytest framework. Unit testing best practices.", 0.0);
+            "Python pytest framework. Unit testing best practices.", 5);
 
-        // No edges, no cosine context → pure BM25 + activation (0.50 fallback)
+        // No edges, no cosine context → pure BM25 + engagement
         let hits = search(&conn, "error handling", &default_filters(10), &config, None, SearchMode::Normal).unwrap();
 
         assert!(hits.len() >= 2, "Should find at least 2 error handling notes");
@@ -914,7 +1047,7 @@ mod tests {
         let ids: Vec<&str> = hits.iter().map(|h| h.note_id.as_str()).collect();
         assert!(ids.contains(&"t1-a"));
         assert!(ids.contains(&"t1-b"));
-        // All scores should be > 0 (BM25 rank normalized + activation fallback)
+        // All scores should be > 0 (BM25 rank normalized + engagement)
         for h in &hits {
             assert!(h.rank > 0.0, "Score should be > 0 for {}", h.note_id);
         }
@@ -930,11 +1063,11 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "t2-a", "OAuth2 token flow", "security", "spec",
-            "OAuth2 authorization code flow. Token exchange and refresh.", 0.60);
+            "OAuth2 authorization code flow. Token exchange and refresh.", 5);
         insert_note(&conn, "t2-b", "JWT validation", "security", "reference",
-            "JWT signature validation. Claims verification. Token expiry.", 0.40);
+            "JWT signature validation. Claims verification. Token expiry.", 5);
         insert_note(&conn, "t2-c", "Auth middleware design", "security", "spec",
-            "Middleware for request authentication. Session management.", 0.70);
+            "Middleware for request authentication. Session management.", 5);
 
         // Edge: A depends-on C (auth middleware)
         insert_edge(&conn, "t2-a", "t2-c", "depends-on", 2.0);
@@ -960,11 +1093,11 @@ mod tests {
 
         // "new" supersedes "old"
         insert_note(&conn, "sup-old", "API v1 design", "systems", "spec",
-            "Original API design document. REST endpoints for v1.", 0.30);
+            "Original API design document. REST endpoints for v1.", 5);
         insert_note(&conn, "sup-new", "API v2 design", "systems", "spec",
-            "Updated API design. GraphQL migration from REST.", 0.80);
+            "Updated API design. GraphQL migration from REST.", 5);
         insert_note(&conn, "sup-other", "API client SDK", "systems", "reference",
-            "REST client library. Uses API v1 endpoints.", 0.50);
+            "REST client library. Uses API v1 endpoints.", 5);
 
         // new supersedes old: src=new, dst=old
         insert_edge(&conn, "sup-new", "sup-old", "supersedes", 1.5);
@@ -999,35 +1132,37 @@ mod tests {
     }
 
     // ================================================================
-    // Test 5: NULL/zero activation falls back to 0.50
+    // Test 5: Engagement score computed from real signals
     // ================================================================
 
     #[test]
-    fn test_activation_fallback() {
-        let conn = setup_db();
-        let config = default_config();
+    fn test_engagement_computation() {
+        let config = EngagementConfig::default();
 
-        // activation_score = 0.0 (orient hasn't run)
-        insert_note(&conn, "act-a", "Zero activation note", "systems", "spec",
-            "This note has zero activation score. Testing fallback.", 0.0);
-        // activation_score = 0.75 (orient has run)
-        insert_note(&conn, "act-b", "Normal activation note", "systems", "spec",
-            "This note has normal activation score. Testing fallback.", 0.75);
+        // Brand new note: just written, never read, default importance
+        let score_new = compute_engagement(0, None, Some(&chrono::Utc::now().to_rfc3339()), 5, &config);
+        // recency ~1.0, popularity 0.0, importance 0.44 → ~0.59
+        assert!(score_new > 0.50 && score_new < 0.70,
+            "Brand new note engagement should be ~0.59, got {:.3}", score_new);
 
-        let candidates = fetch_fts_candidates(
-            &conn, "activation score fallback", &default_filters(10), &config
-        ).unwrap();
+        // Well-read note: 20 reads, accessed recently, high importance
+        let recent = chrono::Utc::now().to_rfc3339();
+        let score_popular = compute_engagement(20, Some(&recent), Some(&recent), 9, &config);
+        // recency ~1.0, popularity ~1.0, importance ~0.89 → ~0.98
+        assert!(score_popular > 0.85,
+            "Popular recent note engagement should be >0.85, got {:.3}", score_popular);
 
-        for c in &candidates {
-            if c.note_id == "act-a" {
-                assert!((c.activation - 0.50).abs() < 0.001,
-                    "Zero activation should fall back to 0.50, got {}", c.activation);
-            }
-            if c.note_id == "act-b" {
-                assert!((c.activation - 0.75).abs() < 0.001,
-                    "Non-zero activation should be preserved, got {}", c.activation);
-            }
-        }
+        // Stale note: 30 days old, never read, default importance
+        let stale = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let score_stale = compute_engagement(0, None, Some(&stale), 5, &config);
+        // recency ~0.06, popularity 0.0, importance 0.44 → ~0.12
+        assert!(score_stale < 0.20,
+            "Stale unread note engagement should be <0.20, got {:.3}", score_stale);
+
+        // No timestamps: should get 0.30 fallback recency
+        let score_no_ts = compute_engagement(0, None, None, 5, &config);
+        assert!(score_no_ts > 0.15 && score_no_ts < 0.30,
+            "No-timestamp note engagement should use fallback, got {:.3}", score_no_ts);
     }
 
     // ================================================================
@@ -1041,13 +1176,13 @@ mod tests {
 
         // Create a hub note linked to multiple seeds
         insert_note(&conn, "gn-a", "Seed note alpha", "systems", "spec",
-            "Graph normalization test seed alpha. Unique keyword graphnorm.", 0.50);
+            "Graph normalization test seed alpha. Unique keyword graphnorm.", 5);
         insert_note(&conn, "gn-b", "Seed note beta", "systems", "spec",
-            "Graph normalization test seed beta. Unique keyword graphnorm.", 0.50);
+            "Graph normalization test seed beta. Unique keyword graphnorm.", 5);
         insert_note(&conn, "gn-c", "Seed note gamma", "systems", "spec",
-            "Graph normalization test seed gamma. Unique keyword graphnorm.", 0.50);
+            "Graph normalization test seed gamma. Unique keyword graphnorm.", 5);
         insert_note(&conn, "gn-hub", "Hub note", "systems", "reference",
-            "This hub connects to everything. No graphnorm keyword.", 0.50);
+            "This hub connects to everything. No graphnorm keyword.", 5);
 
         // All seeds link to hub with high weights
         insert_edge(&conn, "gn-a", "gn-hub", "depends-on", 2.0);
@@ -1087,9 +1222,9 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "bd-a", "Primary search target", "systems", "spec",
-            "BM25 discard test. Primary target note.", 0.50);
+            "BM25 discard test. Primary target note.", 5);
         insert_note(&conn, "bd-b", "Secondary search target", "systems", "spec",
-            "BM25 discard test. Secondary target note.", 0.50);
+            "BM25 discard test. Secondary target note.", 5);
 
         let mut candidates = fetch_fts_candidates(
             &conn, "BM25 discard test", &default_filters(10), &config
@@ -1111,7 +1246,7 @@ mod tests {
         // With embeddings: cosine should be primary, BM25 rank ignored
         blend_scores(&mut candidates, &config, true);
         // Both should have the same final score since cosine is the same
-        // and they have same activation + graph (both 0)
+        // and they have same engagement + graph (both 0)
         let scores_with_embed: Vec<f64> = candidates.iter().map(|c| c.final_score).collect();
         assert!((scores_with_embed[0] - scores_with_embed[1]).abs() < 0.001,
             "With embeddings and same cosine, BM25 rank shouldn't affect scores");
@@ -1134,7 +1269,7 @@ mod tests {
                 bm25_rank: Some(0),
                 cosine_score: 0.92,
                 graph_score: 0.0,
-                activation: 0.85,
+                engagement: 0.85,
                 final_score: 0.0,
             },
             Candidate {
@@ -1146,7 +1281,7 @@ mod tests {
                 bm25_rank: None,
                 cosine_score: 0.71,
                 graph_score: 0.40,
-                activation: 0.70,
+                engagement: 0.70,
                 final_score: 0.0,
             },
         ];
@@ -1176,11 +1311,11 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "fo-a", "Finance report alpha", "finance", "report",
-            "Quarterly earnings analysis for Q4.", 0.90);
+            "Quarterly earnings analysis for Q4.", 5);
         insert_note(&conn, "fo-b", "Finance report beta", "finance", "report",
-            "Annual revenue forecast model.", 0.60);
+            "Annual revenue forecast model.", 5);
         insert_note(&conn, "fo-c", "Systems spec", "systems", "spec",
-            "Infrastructure scaling plan.", 0.80);
+            "Infrastructure scaling plan.", 5);
 
         let filters = SearchFilters {
             domain: Some("finance"),
@@ -1195,8 +1330,6 @@ mod tests {
         let hits = search(&conn, "", &filters, &config, None, SearchMode::Normal).unwrap();
 
         assert_eq!(hits.len(), 2, "Should find exactly 2 finance reports");
-        // Higher activation should rank first
-        assert_eq!(hits[0].note_id, "fo-a", "Higher activation note should rank first");
     }
 
     // ================================================================
@@ -1210,19 +1343,19 @@ mod tests {
                 note_id: "th-a".into(), title: "a".into(), domain: "".into(),
                 kind: "".into(), snippet: "".into(),
                 bm25_rank: None, cosine_score: 0.0, graph_score: 0.0,
-                activation: 0.0, final_score: 0.50,
+                engagement: 0.0, final_score: 0.50,
             },
             Candidate {
                 note_id: "th-b".into(), title: "b".into(), domain: "".into(),
                 kind: "".into(), snippet: "".into(),
                 bm25_rank: None, cosine_score: 0.0, graph_score: 0.0,
-                activation: 0.0, final_score: 0.05, // below default threshold 0.10
+                engagement: 0.0, final_score: 0.05, // below default threshold 0.10
             },
             Candidate {
                 note_id: "th-c".into(), title: "c".into(), domain: "".into(),
                 kind: "".into(), snippet: "".into(),
                 bm25_rank: None, cosine_score: 0.0, graph_score: 0.0,
-                activation: 0.0, final_score: 0.10, // exactly at threshold
+                engagement: 0.0, final_score: 0.10, // exactly at threshold
             },
         ];
 
@@ -1242,9 +1375,9 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "bm-a", "BM25 mode target note", "systems", "spec",
-            "Testing BM25 only mode. This should be found.", 0.80);
+            "Testing BM25 only mode. This should be found.", 5);
         insert_note(&conn, "bm-b", "BM25 mode neighbor", "systems", "spec",
-            "This neighbor note has different content.", 0.60);
+            "This neighbor note has different content.", 5);
         insert_edge(&conn, "bm-a", "bm-b", "references", 1.0);
 
         let hits = search(
@@ -1268,7 +1401,7 @@ mod tests {
         let config = default_config();
 
         insert_note(&conn, "sem-a", "Semantic test note", "systems", "spec",
-            "Testing semantic mode without embeddings.", 0.50);
+            "Testing semantic mode without embeddings.", 5);
 
         let result = search(
             &conn, "semantic test", &default_filters(10), &config, None, SearchMode::Semantic
@@ -1289,11 +1422,11 @@ mod tests {
         let mut config = default_config();
 
         insert_note(&conn, "df-a", "Domain filter seed", "finance", "spec",
-            "Finance domain filter test. Unique keyword domfilter.", 0.50);
+            "Finance domain filter test. Unique keyword domfilter.", 5);
         insert_note(&conn, "df-b", "Same domain neighbor", "finance", "reference",
-            "Finance reference note about quarterly earnings.", 0.50);
+            "Finance reference note about quarterly earnings.", 5);
         insert_note(&conn, "df-c", "Cross domain neighbor", "systems", "reference",
-            "Systems reference note about infrastructure scaling.", 0.50);
+            "Systems reference note about infrastructure scaling.", 5);
 
         insert_edge(&conn, "df-a", "df-b", "references", 1.0);
         insert_edge(&conn, "df-a", "df-c", "references", 1.0);
@@ -1336,12 +1469,12 @@ mod tests {
                 bm25_rank: Some(0),
                 cosine_score: 0.90,
                 graph_score: 0.10,
-                activation: 0.50,
+                engagement: 0.50,
                 final_score: 0.0,
             },
         ];
 
-        // Default weights: cosine=0.50, graph=0.25, activation=0.25
+        // Default weights: cosine=0.50, graph=0.25, engagement=0.25
         blend_scores(&mut candidates, &config, true);
         let score_default = candidates[0].final_score;
 
@@ -1391,7 +1524,7 @@ mod tests {
         domain: &str,
         kind: &str,
         body: &str,
-        activation_score: f64,
+        importance: i64,
         updated_at: &str,
     ) {
         let version_id = format!("v-{}", note_id);
@@ -1410,9 +1543,9 @@ mod tests {
         ).unwrap();
 
         conn.execute(
-            "INSERT INTO current_notes (note_id, namespace, head_version_id, author_agent_id, title, domain, kind, status, activation_score, updated_at)
+            "INSERT INTO current_notes (note_id, namespace, head_version_id, author_agent_id, title, domain, kind, status, importance, updated_at)
              VALUES (?1, 'ark', ?2, ?3, ?4, ?5, ?6, 'active', ?7, ?8)",
-            rusqlite::params![note_id, version_id, db::DEFAULT_AGENT_ID, title, domain, kind, activation_score, updated_at],
+            rusqlite::params![note_id, version_id, db::DEFAULT_AGENT_ID, title, domain, kind, importance, updated_at],
         ).unwrap();
 
         conn.execute(
@@ -1433,9 +1566,9 @@ mod tests {
         let since_cutoff = (now - chrono::Duration::days(1)).to_rfc3339();
 
         insert_note_at(&conn, "tf-recent", "Recent BTC analysis", "finance", "report",
-            "Bitcoin price analysis from today.", 0.80, &recent);
+            "Bitcoin price analysis from today.", 5, &recent);
         insert_note_at(&conn, "tf-old", "Old BTC report", "finance", "report",
-            "Bitcoin mining overview from last month.", 0.80, &old);
+            "Bitcoin mining overview from last month.", 5, &old);
 
         // Without since filter: both notes should appear
         let filters_no_time = SearchFilters {
@@ -1480,9 +1613,9 @@ mod tests {
         let before_cutoff = (now - chrono::Duration::days(7)).to_rfc3339();
 
         insert_note_at(&conn, "bf-recent", "Recent FOMC note", "finance", "report",
-            "Federal reserve meeting notes from today.", 0.80, &recent);
+            "Federal reserve meeting notes from today.", 5, &recent);
         insert_note_at(&conn, "bf-old", "Old FOMC note", "finance", "report",
-            "Federal reserve meeting notes from last month.", 0.80, &old);
+            "Federal reserve meeting notes from last month.", 5, &old);
 
         // With before filter: only old note should appear
         let filters_before = SearchFilters {
@@ -1517,11 +1650,11 @@ mod tests {
         let before_cutoff = (now - chrono::Duration::days(2)).to_rfc3339();
 
         insert_note_at(&conn, "r-new", "New market data", "finance", "report",
-            "Latest market data analysis.", 0.80, &very_recent);
+            "Latest market data analysis.", 5, &very_recent);
         insert_note_at(&conn, "r-mid", "Mid-range market data", "finance", "report",
-            "Market data from last week.", 0.80, &mid_range);
+            "Market data from last week.", 5, &mid_range);
         insert_note_at(&conn, "r-old", "Old market data", "finance", "report",
-            "Ancient market data analysis.", 0.80, &very_old);
+            "Ancient market data analysis.", 5, &very_old);
 
         // Range: 14 days ago to 2 days ago — should only match mid-range
         let filters = SearchFilters {
@@ -1536,5 +1669,127 @@ mod tests {
         let hits = search(&conn, "market data", &filters, &config, None, SearchMode::Bm25Only).unwrap();
         assert_eq!(hits.len(), 1, "Date range should only include mid-range note");
         assert_eq!(hits[0].note_id, "r-mid");
+    }
+
+    // ================================================================
+    // Test 19: merge_candidates deduplication
+    // ================================================================
+
+    #[test]
+    fn test_merge_candidates_dedup() {
+        let mut bm25_pool = vec![
+            Candidate {
+                note_id: "mc-a".into(), title: "a".into(), domain: "".into(),
+                kind: "".into(), snippet: "".into(),
+                bm25_rank: Some(0), cosine_score: 0.0, graph_score: 0.0,
+                engagement: 0.50, final_score: 0.0,
+            },
+            Candidate {
+                note_id: "mc-b".into(), title: "b".into(), domain: "".into(),
+                kind: "".into(), snippet: "".into(),
+                bm25_rank: Some(1), cosine_score: 0.0, graph_score: 0.0,
+                engagement: 0.50, final_score: 0.0,
+            },
+        ];
+
+        let cosine_pool = vec![
+            // Duplicate: mc-a appears in both pools with cosine score
+            Candidate {
+                note_id: "mc-a".into(), title: "a".into(), domain: "".into(),
+                kind: "".into(), snippet: "".into(),
+                bm25_rank: None, cosine_score: 0.85, graph_score: 0.0,
+                engagement: 0.50, final_score: 0.0,
+            },
+            // New: mc-c only in cosine pool
+            Candidate {
+                note_id: "mc-c".into(), title: "c".into(), domain: "".into(),
+                kind: "".into(), snippet: "".into(),
+                bm25_rank: None, cosine_score: 0.72, graph_score: 0.0,
+                engagement: 0.50, final_score: 0.0,
+            },
+        ];
+
+        merge_candidates(&mut bm25_pool, cosine_pool);
+
+        assert_eq!(bm25_pool.len(), 3, "Should have 3 unique candidates");
+
+        // mc-a: BM25 candidate kept, but cosine score copied
+        let a = bm25_pool.iter().find(|c| c.note_id == "mc-a").unwrap();
+        assert_eq!(a.bm25_rank, Some(0), "BM25 rank should be preserved");
+        assert!((a.cosine_score - 0.85).abs() < 0.001, "Cosine score should be copied");
+
+        // mc-b: unchanged
+        let b = bm25_pool.iter().find(|c| c.note_id == "mc-b").unwrap();
+        assert_eq!(b.bm25_rank, Some(1));
+
+        // mc-c: from cosine pool, no BM25 rank
+        let c = bm25_pool.iter().find(|c| c.note_id == "mc-c").unwrap();
+        assert_eq!(c.bm25_rank, None, "Cosine-only candidate should have no BM25 rank");
+        assert!((c.cosine_score - 0.72).abs() < 0.001);
+    }
+
+    // ================================================================
+    // Test 20: Hybrid fusion — Normal mode with cosine context
+    // ================================================================
+
+    #[test]
+    fn test_hybrid_fusion_normal_mode() {
+        let conn = setup_db();
+        let config = default_config();
+
+        // Note A: BM25 hit (contains "wyckoff spring")
+        insert_note(&conn, "hf-a", "Wyckoff spring setup", "finance", "spec",
+            "Wyckoff spring entry criteria. Accumulation phase identification.", 5);
+        // Note B: BM25 hit (contains "spring")
+        insert_note(&conn, "hf-b", "Spring cleaning runbook", "systems", "runbook",
+            "Spring cleaning procedures for vault maintenance.", 5);
+        // Note C: NOT a BM25 hit for "spring entry" — but semantically related
+        insert_note(&conn, "hf-c", "Accumulation phase trading", "finance", "spec",
+            "How to identify accumulation phases in market structure.", 5);
+
+        // Simulate embeddings: C is semantically close to query but has no keyword match.
+        // All vectors must be L2-normalized since cosine_similarity is a bare dot product.
+        let dim = 768;
+        let unit = |fill: f32| -> Vec<f32> {
+            let norm = (dim as f32 * fill * fill).sqrt();
+            vec![fill / norm; dim]
+        };
+
+        let query_emb = unit(1.0); // unit vector
+        let mut note_embeddings = HashMap::new();
+        // A: high cosine ~1.0 (keyword + semantic match)
+        note_embeddings.insert("hf-a".to_string(), unit(1.0));
+        // B: low cosine ~0.3 (wrong domain) — use a mostly-orthogonal vector
+        let mut b_vec = vec![0.0_f32; dim];
+        for i in 0..dim { b_vec[i] = if i < dim / 3 { 1.0 } else { 0.0 }; }
+        let b_norm: f32 = b_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in &mut b_vec { *x /= b_norm; }
+        note_embeddings.insert("hf-b".to_string(), b_vec);
+        // C: high cosine ~0.9 (semantic match, no keyword)
+        let mut c_vec = unit(1.0);
+        // Perturb slightly to get cosine < 1.0 but still high
+        for i in 0..(dim / 10) { c_vec[i] = 0.0; }
+        let c_norm: f32 = c_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in &mut c_vec { *x /= c_norm; }
+        note_embeddings.insert("hf-c".to_string(), c_vec);
+
+        let cosine_ctx = CosineContext {
+            query_embedding: query_emb,
+            note_embeddings,
+        };
+
+        let hits = search(
+            &conn, "spring entry", &default_filters(10), &config,
+            Some(&cosine_ctx), SearchMode::Normal
+        ).unwrap();
+
+        let ids: Vec<&str> = hits.iter().map(|h| h.note_id.as_str()).collect();
+
+        // Key assertion: C should appear (found via cosine recall, not BM25)
+        assert!(ids.contains(&"hf-c"),
+            "Cosine-recall should surface semantically related note C. Got: {:?}", ids);
+        // A should also appear (found by both BM25 and cosine)
+        assert!(ids.contains(&"hf-a"),
+            "Note A should appear via BM25 + cosine. Got: {:?}", ids);
     }
 }
