@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 pub mod about;
+pub mod append;
 pub mod delete;
 pub mod diff;
 pub mod edit;
@@ -140,6 +141,22 @@ pub enum Commands {
         /// Edit operations and arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+
+    /// Append content to an existing note
+    ///
+    /// Shortcut for `nark edit <id> append`. Preserves frontmatter, appends to body,
+    /// creates a new MVCC version. Content from argument or stdin.
+    Append {
+        /// Note ID (UUID or prefix)
+        id: String,
+
+        /// Content to append (reads from stdin if omitted)
+        body: Option<String>,
+
+        /// Auto-create reference edges to similar notes (requires embeddings)
+        #[arg(long)]
+        auto_link: bool,
     },
 
     /// Show note metadata from the registry (cheap, no vault read)
