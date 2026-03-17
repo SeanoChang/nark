@@ -12,6 +12,7 @@ pub mod jot;
 pub mod link;
 pub mod links;
 pub mod ls;
+pub mod orient;
 pub mod peek;
 pub mod read;
 pub mod related;
@@ -248,6 +249,40 @@ pub enum Commands {
 
         /// Number of notes to return
         #[arg(long, default_value = "3")]
+        limit: usize,
+
+        /// Filter to notes updated since (e.g. "1d", "7d", "24h", "1w", "1mo")
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter to notes updated before (e.g. "3d", "1w", "1mo")
+        #[arg(long)]
+        before: Option<String>,
+    },
+
+    /// Pre-session vault briefing — markdown output for agent context injection
+    ///
+    /// Searches the vault and formats results as a markdown briefing designed
+    /// to be pasted directly into system prompts or CONSTRAINTS.md.
+    /// This is the only nark command that outputs markdown instead of JSON.
+    Orient {
+        /// Topic to orient on
+        query: Option<String>,
+
+        /// Filter by domain
+        #[arg(long)]
+        domain: Option<String>,
+
+        /// Filter by kind
+        #[arg(long)]
+        kind: Option<String>,
+
+        /// Filter by tag (AND logic)
+        #[arg(long, num_args = 1..)]
+        tag: Vec<String>,
+
+        /// Number of notes to include
+        #[arg(long, default_value = "5")]
         limit: usize,
 
         /// Filter to notes updated since (e.g. "1d", "7d", "24h", "1w", "1mo")

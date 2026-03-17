@@ -20,6 +20,7 @@ use crate::cli::Commands::{
     Search,
     Ls,
     About,
+    Orient,
     Delete,
     Related,
     Embed,
@@ -57,6 +58,7 @@ fn main() -> Result<()> {
         Search { query, domain, kind, intent, tag, limit, bm25, semantic, since, before } => cli::search::run(&vault_dir, query.as_deref().unwrap_or(""), domain.as_deref(), kind.as_deref(), intent.as_deref(), &tag, limit, bm25, semantic, since.as_deref(), before.as_deref()),
         Ls { path, tags } => cli::ls::run(&vault_dir, path.as_deref(), tags),
         About { topic, limit, since, before } => cli::about::run(&vault_dir, &topic, limit, since.as_deref(), before.as_deref()),
+        Orient { query, domain, kind, tag, limit, since, before } => cli::orient::run(&vault_dir, query.as_deref(), domain.as_deref(), kind.as_deref(), &tag, limit, since.as_deref(), before.as_deref()),
         Related { id, limit, link } => cli::related::run(&vault_dir, &id, limit, link),
         Delete { ids, force, recursive } => cli::delete::run(&vault_dir, ids, force, recursive),
         Tag { args, list, find, domain, kind, filter_tag, since, before, confirm } => {
