@@ -31,14 +31,18 @@ ln -sf "$(pwd)/target/release/nark" ~/.local/bin/nark
 # Initialize the vault
 nark init
 
-# Write a note
+# Write a note (full frontmatter)
 nark write path/to/note.md
 
-# Write all markdown files in a directory (recursive)
-nark write path/to/notes/
+# Quick-capture a note (minimal ceremony)
+nark jot --author noah --domain systems --body "CAS deduplication is automatic"
+
+# Pre-session vault briefing (markdown output for agent context)
+nark orient "systems architecture" --limit 5
 
 # Search for notes
 nark search "capability tokens"
+nark search --domain finance --since 7d
 
 # Browse the knowledge tree
 nark ls
@@ -52,42 +56,88 @@ nark peek <note-id>
 
 # Read full note content
 nark read <note-id>
+
+# Edit an existing note
+nark edit <note-id> append --body "New section content"
+nark append <note-id> "Quick append shortcut"
 ```
 
 ## Commands
 
+### Orientation & Search
+
 | Command | What it does | Cost |
 |---|---|---|
-| `nark search <query> [--domain] [--kind] [--intent] [--tag]` | Ranked search (BM25 + cosine + graph) | Cheap — registry only |
+| `nark orient <query> [--domain] [--kind] [--tag] [--since] [--before] [--limit]` | Pre-session vault briefing — outputs **markdown** for agent context injection | Medium — registry + vault reads |
+| `nark search <query> [--domain] [--kind] [--intent] [--tag] [--since] [--before]` | Ranked search (BM25 + cosine + graph) | Cheap — registry only |
 | `nark search <query> --bm25` | BM25-only mode — skip cosine and graph | Cheap — registry only |
 | `nark search <query> --semantic` | Semantic mode — bypass BM25, cosine against all notes | Medium — needs embeddings |
+| `nark about <topic> [--since] [--before] [--limit]` | Search + body previews in one call | Medium — registry + vault reads |
+| `nark related <id> [--limit] [--link]` | Find similar notes by embedding similarity | Medium — needs embeddings |
 | `nark stats` | Vault overview — counts, distributions, recent notes | Cheap — registry only |
 | `nark ls [path] [--tags]` | Browse domain/intent/kind tree | Cheap — registry only |
-| `nark about <topic>` | Search + body previews in one call | Medium — registry + vault reads |
+
+### Reading
+
+| Command | What it does | Cost |
+|---|---|---|
 | `nark peek <id>` | Note metadata (title, domain, tags, etc.) | Cheap — registry only |
 | `nark read <id>` | Full note content (frontmatter + body) | Heavy — vault CAS read |
-| `nark write <paths...>` | Ingest markdown notes | Write — vault + registry |
-| `nark delete <ids...> [-f] [-rf]` | Soft-delete (retract), hard-delete, or full purge | Write — registry (+ vault for -rf) |
+
+### Writing
+
+| Command | What it does | Cost |
+|---|---|---|
+| `nark jot --author <author> [--domain] [--body] [--from <id>]` | Quick-capture a note with minimal ceremony | Write — vault + registry |
+| `nark write <paths...> [--auto-link]` | Ingest markdown notes from files/directories/stdin | Write — vault + registry |
+| `nark edit <id> <operations...> [--auto-link]` | Surgical edits (replace, append, prepend, set) — creates MVCC version | Write — vault + registry |
+| `nark append <id> [body]` | Append content to a note (shortcut for edit append) | Write — vault + registry |
+
+### Organization
+
+| Command | What it does | Cost |
+|---|---|---|
 | `nark tag <id> +add -remove` | Add/remove tags without creating a new version | Write — registry only |
+| `nark tag --domain <d> +tag [--confirm]` | Bulk tag by filter (dry-run by default) | Write — registry only |
 | `nark tag --list` | List all tags with usage counts | Cheap — registry only |
 | `nark tag --find <tags...>` | Find notes by tag (AND logic) | Cheap — registry only |
 | `nark link <sources...> --target <id> [--rel <type>]` | Create typed links between notes | Write — vault + registry |
 | `nark links <id>` | Show a note's link neighborhood | Cheap — registry only |
+
+### History
+
+| Command | What it does | Cost |
+|---|---|---|
+| `nark history <id>` | List version chain for a note | Cheap — registry only |
+| `nark diff <id> [--from <ver>] [--to <ver>]` | Compare two versions (unified diff) | Medium — vault reads |
+| `nark rollback <id> <version-id>` | Restore an old version as new head | Write — vault + registry |
+
+### Lifecycle
+
+| Command | What it does | Cost |
+|---|---|---|
+| `nark delete <ids...> [-f] [-rf]` | Soft-delete (retract), hard-delete, or full purge | Write — registry (+ vault for -rf) |
+| `nark retract [ids...] [--domain] [--kind] [--tag] [--since] [--before] [--confirm]` | Bulk soft-delete by filter or ID | Write — registry only |
+
+### Setup & Maintenance
+
+| Command | What it does | Cost |
+|---|---|---|
+| `nark init` | Create vault dirs + registry database | One-time setup |
 | `nark embed init` | Download ONNX Runtime + nomic-embed-text-v1.5 model | Setup |
 | `nark embed build` | Backfill embeddings for all notes | Write — registry only |
 | `nark embed migrate` | Upgrade from bge to nomic (download + cleanup + re-embed) | Setup + Write |
 | `nark reset [--confirm]` | Destroy and recreate registry (vault objects kept) | Destructive |
-| `nark init` | Create vault dirs + registry database | One-time setup |
 | `nark update` | Download latest release binary from GitHub | Maintenance |
 
 ### Agent workflow
 
 ```
-search/ls → peek → read → write
-  cheap      cheap   heavy   write
+orient → search/ls → peek → read → write/jot
+  brief     cheap      cheap   heavy   write
 ```
 
-Start broad, narrow down, commit to reading only what matters.
+Start with a briefing, search to narrow down, commit to reading only what matters.
 
 ## Note format
 
@@ -112,17 +162,17 @@ Content goes here...
 
 ### Frontmatter fields
 
-| Field | Purpose | Allowed values |
+| Field | Purpose | Values |
 |---|---|---|
-| `domain` | Knowledge area | systems, security, finance, ai_ml, data, programming, math, writing, product |
-| `intent` | Why it exists | build, debug, operate, design, research, evaluate, decide |
-| `kind` | What it is | spec, decision, runbook, report, reference, incident, experiment, dataset |
+| `domain` | Knowledge area | Free text (e.g. systems, security, finance, ai_ml) |
+| `intent` | Why it exists | Free text (e.g. build, debug, operate, research) |
+| `kind` | What it is | Built-in (spec, decision, runbook, report, reference, incident, experiment, dataset) + config extras |
 | `trust` | Confidence level | hypothesis, reviewed, verified |
 | `status` | Lifecycle state | active, deprecated, retracted, draft |
 | `tags` | Free-form labels | Any lowercase alphanumeric + hyphens |
 | `aliases` | Search synonyms (3x FTS5 weight) | Free-form strings, optional |
 
-Domain, intent, kind, trust, and status are enforced enums — invalid values are rejected at parse time. Tags and aliases are optional (default to `[]`).
+Domain and intent are free text. Kind accepts built-in values plus any extras defined in `config.toml`. Trust and status are enforced enums. Tags and aliases are optional (default to `[]`).
 
 ## Architecture
 

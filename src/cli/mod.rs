@@ -32,8 +32,9 @@ pub mod write;
     long_about = "Noah's Ark (nark) is a local-first knowledge vault for AI agents.\n\n\
         Notes are markdown files with YAML frontmatter, stored as content-addressed\n\
         objects and indexed in a SQLite registry for fast search and browsing.\n\n\
-        Agent workflow: search/ls → peek → read → write\n\n\
-        All output is JSON on stdout — designed to be consumed by agents directly.",
+        Agent workflow: orient → search/ls → peek → read → write/jot\n\n\
+        All output is JSON on stdout (except `orient`, which outputs markdown for\n\
+        direct injection into agent context).",
     version
 )]
 pub struct Cli {
