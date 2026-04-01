@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use crate::cli::search::parse_temporal;
+use crate::cli::util::truncate_at_word;
 use crate::config;
 use crate::db;
 use crate::registry::{access, resolve, search, tags};
@@ -124,18 +125,3 @@ pub fn run(
     Ok(())
 }
 
-fn truncate_at_word(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    // Find the largest char boundary <= max to avoid panicking on multi-byte UTF-8
-    let boundary = s.char_indices()
-        .take_while(|(i, _)| *i < max)
-        .last()
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(0);
-    match s[..boundary].rfind(' ') {
-        Some(i) => &s[..i],
-        None => &s[..boundary],
-    }
-}

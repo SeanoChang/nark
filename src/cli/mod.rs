@@ -23,6 +23,7 @@ pub mod search;
 pub mod stats;
 pub mod tag;
 pub mod update;
+pub mod util;
 pub mod write;
 
 #[derive(Parser)]

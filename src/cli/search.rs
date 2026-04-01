@@ -3,10 +3,12 @@ use chrono::Utc;
 use regex::Regex;
 use std::path::Path;
 
+use crate::cli::util::truncate_at_word;
 use crate::config;
 use crate::db;
 use crate::embed;
-use crate::registry::{embeddings, search::{self, CosineContext, SearchFilters, SearchMode}};
+use crate::registry::{embeddings, resolve, search::{self, CosineContext, SearchFilters, SearchMode}};
+use crate::vault::fs::Vault;
 
 /// Parse a relative temporal shorthand (e.g. "1d", "7d", "24h", "1w", "1mo")
 /// into an ISO 8601 timestamp string.
@@ -77,7 +79,10 @@ pub fn run(
         None
     };
 
-    let hits = search::search(&conn, query, &filters, &cfg.search, cosine_ctx.as_ref(), mode)?;
+    let mut hits = search::search(&conn, query, &filters, &cfg.search, cosine_ctx.as_ref(), mode)?;
+
+    let vault = Vault::new(vault_dir.to_path_buf());
+    fill_missing_snippets(&conn, &vault, query, &mut hits);
 
     let results: Vec<serde_json::Value> = hits.iter().map(|h| {
         serde_json::json!({
@@ -132,6 +137,54 @@ fn build_cosine_context(
 
     let note_embeddings = all.into_iter().collect();
     Some(CosineContext { query_embedding, note_embeddings })
+}
+
+/// For search hits with empty snippets, try FTS5 snippet with the original query,
+/// then fall back to first 150 chars of note body from vault.
+fn fill_missing_snippets(
+    conn: &rusqlite::Connection,
+    vault: &Vault,
+    query: &str,
+    hits: &mut [search::SearchHit],
+) {
+    for hit in hits.iter_mut() {
+        if !hit.snippet.is_empty() {
+            continue;
+        }
+
+        // Try FTS5 snippet if we have a query
+        if !query.is_empty() {
+            if let Ok(snippet) = try_fts_snippet(conn, query, &hit.note_id) {
+                hit.snippet = snippet;
+                continue;
+            }
+        }
+
+        // Fallback: first 150 chars of body from vault
+        match read_body_preview(conn, vault, &hit.note_id) {
+            Ok(body) => hit.snippet = body,
+            Err(e) => eprintln!("Warning: failed to read body preview for {}: {}", hit.note_id, e),
+        }
+    }
+}
+
+fn try_fts_snippet(conn: &rusqlite::Connection, query: &str, note_id: &str) -> anyhow::Result<String> {
+    let mut stmt = conn.prepare(
+        "SELECT snippet(note_text, 2, '[', ']', '...', 32)
+         FROM note_text
+         WHERE note_text MATCH ?1 AND note_id = ?2"
+    )?;
+    let snippet: String = stmt.query_row(rusqlite::params![query, note_id], |row| row.get(0))?;
+    if snippet.is_empty() {
+        anyhow::bail!("empty snippet");
+    }
+    Ok(snippet)
+}
+
+fn read_body_preview(conn: &rusqlite::Connection, vault: &Vault, note_id: &str) -> anyhow::Result<String> {
+    let refs = resolve::get_ref(conn, note_id)?;
+    let body = vault.read_object("objects/md", &refs.md_hash, "md")?;
+    Ok(truncate_at_word(&body, 150).trim().to_string())
 }
 
 #[cfg(test)]
