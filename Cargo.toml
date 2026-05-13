@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "bench"]
+resolver = "2"
+
 [package]
 name = "nark"
 version = "0.13.0"
