@@ -1,0 +1,44 @@
+name: bench-pr
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'bench/**'
+      - 'Cargo.toml'
+      - '.github/workflows/bench-pr.yml'
+
+jobs:
+  bench-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-pr
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Build nark
+        run: cargo build -p nark --release
+      - name: Build nark-bench
+        run: cargo build -p nark-bench --release
+      - name: Run smoke integration test
+        run: cargo test -p nark-bench --release --test smoke
+      - name: Run benchmark for regression baseline comparison
+        run: |
+          mkdir -p /tmp/bench-pr-out
+          cargo run -p nark-bench --release -- run \
+            --task ir \
+            --systems fts5,nark \
+            --corpus synthetic-tiny \
+            --output /tmp/bench-pr-out
+      - name: Regression check
+        run: bench/scripts/regression-check.sh /tmp/bench-pr-out
+      - name: Upload result artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: /tmp/bench-pr-out

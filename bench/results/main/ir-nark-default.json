@@ -1,0 +1,59 @@
+{
+  "schema_version": "1",
+  "task": "ir",
+  "system": "nark",
+  "config": "default",
+  "system_version": "nark 0.1.0",
+  "bench_version": "0.1.0",
+  "run_started_at": "2026-05-14T22:22:15.568601+00:00",
+  "corpus": "synthetic-tiny",
+  "ir": {
+    "recall_at_1": 0.1,
+    "recall_at_5": 0.1,
+    "recall_at_10": 0.1,
+    "mrr": 0.1,
+    "ndcg_at_10": 0.1,
+    "queries": 10
+  },
+  "ir_per_class": {
+    "synonym": {
+      "recall_at_1": 0.25,
+      "recall_at_5": 0.25,
+      "recall_at_10": 0.25,
+      "mrr": 0.25,
+      "ndcg_at_10": 0.25,
+      "queries": 4
+    },
+    "single_hop": {
+      "recall_at_1": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "mrr": 0.0,
+      "ndcg_at_10": -0.0,
+      "queries": 4
+    },
+    "multi_hop": {
+      "recall_at_1": 0.0,
+      "recall_at_5": 0.0,
+      "recall_at_10": 0.0,
+      "mrr": 0.0,
+      "ndcg_at_10": -0.0,
+      "queries": 2
+    }
+  },
+  "perf": {
+    "write": {
+      "latency_p50_ms": 16,
+      "latency_p99_ms": 67,
+      "llm_tokens_in_total": 0,
+      "llm_tokens_out_total": 0
+    },
+    "search": {
+      "latency_p50_ms": 5,
+      "latency_p99_ms": 7,
+      "llm_tokens_in_total": 0,
+      "llm_tokens_out_total": 0
+    }
+  },
+  "errors": []
+}

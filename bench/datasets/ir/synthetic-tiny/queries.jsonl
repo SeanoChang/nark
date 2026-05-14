@@ -1,0 +1,10 @@
+{"query_id": "q01", "query": "sicilian defense move order", "relevant": ["n01", "n02"], "class": "single_hop"}
+{"query_id": "q02", "query": "najdorf 5 a6 idea", "relevant": ["n02"], "class": "single_hop"}
+{"query_id": "q03", "query": "centralising the king in the endgame", "relevant": ["n03"], "class": "synonym"}
+{"query_id": "q04", "query": "sourdough hydration ratio", "relevant": ["n04"], "class": "single_hop"}
+{"query_id": "q05", "query": "developing gluten without kneading", "relevant": ["n05", "n10"], "class": "multi_hop"}
+{"query_id": "q06", "query": "how long does bulk ferment take", "relevant": ["n06"], "class": "synonym"}
+{"query_id": "q07", "query": "i2c pull up resistor value", "relevant": ["n07", "n08"], "class": "multi_hop"}
+{"query_id": "q08", "query": "esp32 low power sleep modes", "relevant": ["n09"], "class": "synonym"}
+{"query_id": "q09", "query": "decoupling capacitor near IC", "relevant": ["n12"], "class": "synonym"}
+{"query_id": "q10", "query": "pawn structure asymmetric c-file", "relevant": ["n11"], "class": "single_hop"}
