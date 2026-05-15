@@ -18,6 +18,11 @@ use std::time::Instant;
 
 use crate::protocol::{Adapter, Document, SearchMetrics, SearchResult, WriteMetrics};
 
+/// Pinned version of the `nark` crate this adapter targets. Kept in sync with
+/// the workspace `nark` crate's Cargo.toml via the `nark_version_matches_workspace`
+/// test below. Bump both together when nark releases.
+const NARK_VERSION: &str = "0.13.0";
+
 pub struct NarkAdapter {
     workdir: Option<PathBuf>,
     staging: Option<PathBuf>,
@@ -101,11 +106,11 @@ impl Adapter for NarkAdapter {
     fn name(&self) -> &str { "nark" }
 
     fn version(&self) -> Result<String> {
-        // The current nark CLI does not implement `--version`; report our pinned
-        // crate version of nark instead, taken from the binary's parent workspace.
-        // (If a later nark adds --version, replace this with `self.run_nark(&["--version"])`
-        // and trim the output.)
-        Ok(format!("nark {}", env!("CARGO_PKG_VERSION")))
+        // The current nark CLI does not implement `--version`. We pin the nark
+        // version as a constant here; a test (`nark_version_matches_workspace`)
+        // verifies it stays in sync with the parent crate's Cargo.toml.
+        // When nark adds --version, swap this for `self.run_nark(&["--version"])`.
+        Ok(format!("nark {}", NARK_VERSION))
     }
 
     fn setup(&mut self, workdir: &Path) -> Result<()> {
@@ -185,19 +190,20 @@ impl Adapter for NarkAdapter {
     }
 }
 
-/// Find the nark binary built in this workspace. Looks at `target/debug/nark`
-/// relative to CARGO_MANIFEST_DIR, then `target/release/nark`, then falls back
-/// to `nark` on PATH.
+/// Find the nark binary built in this workspace. Prefers the release binary
+/// over debug because most bench invocations run `cargo build -p nark --release`
+/// and we want consistent latency measurements between local runs and CI.
+/// Falls back to `nark` on PATH if neither exists.
 fn locate_nark_bin() -> Result<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest.parent().ok_or_else(|| anyhow!("no workspace root"))?;
-    let target_debug = workspace_root.join("target/debug/nark");
-    if target_debug.exists() {
-        return Ok(target_debug);
-    }
     let target_release = workspace_root.join("target/release/nark");
     if target_release.exists() {
         return Ok(target_release);
+    }
+    let target_debug = workspace_root.join("target/debug/nark");
+    if target_debug.exists() {
+        return Ok(target_debug);
     }
     Ok(PathBuf::from("nark"))
 }
@@ -207,6 +213,39 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::tempdir;
+
+    /// Guards against `NARK_VERSION` drifting from the actual nark crate version.
+    /// Reads the parent `Cargo.toml` and parses the `[package].version` line.
+    #[test]
+    fn nark_version_matches_workspace() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest.parent().unwrap();
+        let nark_cargo_toml = std::fs::read_to_string(workspace_root.join("Cargo.toml")).unwrap();
+        let mut in_package = false;
+        let mut found = None;
+        for line in nark_cargo_toml.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_package = trimmed == "[package]";
+                continue;
+            }
+            if in_package {
+                if let Some(rest) = trimmed.strip_prefix("version") {
+                    let rest = rest.trim_start().strip_prefix('=').unwrap().trim();
+                    let version = rest.trim_matches('"').trim_matches('\'');
+                    found = Some(version.to_string());
+                    break;
+                }
+            }
+        }
+        let actual = found.expect("could not find [package].version in workspace Cargo.toml");
+        assert_eq!(
+            actual, NARK_VERSION,
+            "NARK_VERSION constant ({}) is out of sync with workspace nark Cargo.toml ({}). \
+             Bump NARK_VERSION in bench/src/adapters/nark.rs to match.",
+            NARK_VERSION, actual
+        );
+    }
 
     /// Smoke test — this is gated on the nark binary being built. The integration
     /// test (`tests/smoke.rs`) builds nark first; here we only verify that if the

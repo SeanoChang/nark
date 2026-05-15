@@ -74,7 +74,7 @@ impl BenchResult {
         let filename = format!("{}-{}-{}.json", self.task, self.system, self.config);
         let path = output_dir.join(filename);
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, json)?;
+        std::fs::write(&path, format!("{}\n", json))?;
         Ok(path)
     }
 }

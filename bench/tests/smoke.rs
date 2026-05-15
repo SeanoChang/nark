@@ -44,5 +44,16 @@ fn smoke_fts5_and_nark_run_against_synthetic_tiny() {
 
         // Per-class breakdowns exist
         assert!(v["ir_per_class"]["single_hop"].is_object(), "missing single_hop breakdown");
+
+        // Both adapters should now run all 10 queries cleanly. Previously FTS5
+        // erroed on q10 due to hyphen-as-column-prefix; the FTS5 adapter now
+        // sanitizes queries before MATCH, so this assertion catches any future
+        // regression that re-introduces silent query failures.
+        let errors = v["errors"].as_array().expect("errors field must be present");
+        assert!(
+            errors.is_empty(),
+            "{} run had unexpected errors (regression?): {:?}",
+            system, errors
+        );
     }
 }

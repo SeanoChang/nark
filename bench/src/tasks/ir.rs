@@ -46,17 +46,21 @@ pub fn run_ir_task(
     let mut tokens_in_total = 0u64;
     let mut tokens_out_total = 0u64;
 
-    for entry in std::fs::read_dir(&corpus_dir)
+    // Sort corpus entries by file name so ingest order is deterministic across
+    // platforms (read_dir order is filesystem-dependent on macOS vs Linux).
+    let mut entries: Vec<_> = std::fs::read_dir(&corpus_dir)
         .with_context(|| format!("failed to read corpus dir {:?}", corpus_dir))?
-    {
-        let entry = entry?;
+        .collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("md") {
             continue;
         }
         let body = std::fs::read_to_string(&path)?;
         let id = path.file_stem().unwrap().to_string_lossy().to_string();
-        let doc = Document { id, body, metadata: serde_json::json!({}) };
+        let doc = Document { id: id.clone(), body, metadata: serde_json::json!({}) };
         match adapter.write(&doc) {
             Ok(m) => {
                 write_latencies.push(m.latency_ms);
@@ -65,7 +69,7 @@ pub fn run_ir_task(
             }
             Err(e) => {
                 result.errors.push(BenchError {
-                    phase: format!("write:{:?}", path.file_name()),
+                    phase: format!("write:{}", id),
                     message: e.to_string(),
                 });
             }
