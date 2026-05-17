@@ -76,9 +76,10 @@ impl BenchResult {
     pub fn write_to_disk(&self, output_dir: &Path) -> Result<std::path::PathBuf> {
         std::fs::create_dir_all(output_dir)?;
         let filename = format!(
-            "{}-{}-{}.json",
+            "{}-{}-{}-{}.json",
             sanitize_for_filename(&self.task),
             sanitize_for_filename(&self.system),
+            sanitize_for_filename(&self.corpus),
             sanitize_for_filename(&self.config),
         );
         let path = output_dir.join(filename);

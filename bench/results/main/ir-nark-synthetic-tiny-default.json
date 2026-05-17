@@ -5,7 +5,7 @@
   "config": "default",
   "system_version": "nark 0.13.0",
   "bench_version": "0.1.0",
-  "run_started_at": "2026-05-17T01:06:09.499406+00:00",
+  "run_started_at": "2026-05-17T05:13:03.573068+00:00",
   "corpus": "synthetic-tiny",
   "ir": {
     "recall_at_1": 0.75,
@@ -16,14 +16,6 @@
     "queries": 10
   },
   "ir_per_class": {
-    "single_hop": {
-      "recall_at_1": 0.625,
-      "recall_at_5": 1.0,
-      "recall_at_10": 1.0,
-      "mrr": 0.875,
-      "ndcg_at_10": 0.8876626356799113,
-      "queries": 4
-    },
     "multi_hop": {
       "recall_at_1": 0.5,
       "recall_at_5": 1.0,
@@ -39,18 +31,26 @@
       "mrr": 1.0,
       "ndcg_at_10": 1.0,
       "queries": 4
+    },
+    "single_hop": {
+      "recall_at_1": 0.625,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "mrr": 0.875,
+      "ndcg_at_10": 0.8876626356799113,
+      "queries": 4
     }
   },
   "perf": {
     "write": {
-      "latency_p50_us": 477447,
-      "latency_p99_us": 891133,
+      "latency_p50_us": 475480,
+      "latency_p99_us": 780963,
       "llm_tokens_in_total": 0,
       "llm_tokens_out_total": 0
     },
     "search": {
-      "latency_p50_us": 333046,
-      "latency_p99_us": 345975,
+      "latency_p50_us": 351159,
+      "latency_p99_us": 484762,
       "llm_tokens_in_total": 0,
       "llm_tokens_out_total": 0
     }

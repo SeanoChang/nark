@@ -27,37 +27,51 @@ fn smoke_fts5_nark_vector_all_run_against_synthetic_tiny() {
 
     let out = cmd.assert().success().get_output().clone();
     let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // New-naming files should be mentioned in stderr.
     for system in ["fts5", "nark", "vector"] {
+        let new_name = format!("ir-{}-synthetic-tiny-default.json", system);
         assert!(
-            stderr.contains(&format!("ir-{}-default.json", system)),
-            "stderr did not mention {} result: {}", system, stderr
+            stderr.contains(&new_name),
+            "stderr did not mention {} result file '{}': {}",
+            system, new_name, stderr
+        );
+    }
+
+    // Defensive: old-naming files must NOT exist. Catches a regression that
+    // accidentally reverts write_to_disk to the pre-Phase-1c filename shape.
+    for system in ["fts5", "nark", "vector"] {
+        let old = out_dir.path().join(format!("ir-{}-default.json", system));
+        assert!(
+            !old.exists(),
+            "old (pre-Phase-1c) filename pattern present (regression?): {}",
+            old.display()
         );
     }
 
     for system in ["fts5", "nark", "vector"] {
-        let path = out_dir.path().join(format!("ir-{}-default.json", system));
+        let path = out_dir.path().join(format!("ir-{}-synthetic-tiny-default.json", system));
         let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("could not read {}: {}", path.display(), e)
         });
         let v: Value = serde_json::from_str(&content).unwrap();
 
-        // Schema bumped to "2" in Task 3
+        // Schema bumped to "2" in Phase 1b.
         assert_eq!(v["schema_version"], "2", "{} schema_version mismatch", system);
         assert_eq!(v["task"], "ir");
         assert_eq!(v["system"], system);
+        assert_eq!(v["corpus"], "synthetic-tiny");
         assert!(v["ir"]["recall_at_5"].is_number());
 
-        // Metrics in valid range
+        // Metrics in valid range.
         let r5 = v["ir"]["recall_at_5"].as_f64().unwrap();
         assert!((0.0..=1.0).contains(&r5), "{} recall_at_5 out of range: {}", system, r5);
 
-        // Per-class breakdowns
+        // Per-class breakdowns present.
         assert!(v["ir_per_class"]["single_hop"].is_object(),
             "{} missing single_hop breakdown", system);
 
-        // All three adapters should produce zero errors. FTS5's q10
-        // sanitizer (Phase 1a fix) handles the column-prefix issue;
-        // nark with embeddings and vector both run all queries cleanly.
+        // Zero errors required — Phase 1b's gate stays in force.
         let errors = v["errors"].as_array().expect("errors field required");
         assert!(
             errors.is_empty(),
