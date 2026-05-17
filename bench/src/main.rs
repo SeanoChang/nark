@@ -47,7 +47,13 @@ fn main() -> Result<()> {
                 anyhow::bail!("corpus not found at {:?}", corpus_root);
             }
             let cache = model_cache::cache_root()?;
-            model_cache::ensure_ready(&cache)?;
+            // Only download/verify the embedding model if at least one
+            // requested adapter needs it. fts5-only runs should not trigger
+            // a 270MB download on cold cache.
+            let needs_model = systems.split(',').any(|s| matches!(s.trim(), "nark" | "vector"));
+            if needs_model {
+                model_cache::ensure_ready(&cache)?;
+            }
             for system in systems.split(',') {
                 let system = system.trim();
                 if system.is_empty() { continue; }

@@ -28,11 +28,14 @@ pub fn cache_root() -> Result<PathBuf> {
 /// expected marker files aren't already present.
 pub fn ensure_ready(cache: &Path) -> Result<()> {
     let lib_marker = cache.join("lib").join(nark::embed::onnx_dylib_name());
-    let model_marker = cache
-        .join("models")
-        .join(nark::embed::MODEL_NAME)
-        .join("model.onnx");
-    if lib_marker.exists() && model_marker.exists() {
+    let model_dir = cache.join("models").join(nark::embed::MODEL_NAME);
+    let model_marker = model_dir.join("model.onnx");
+    let tokenizer_marker = model_dir.join("tokenizer.json");
+    // Check all three core files. A partially-completed prior download (e.g.
+    // network drop after model.onnx but before tokenizer.json) would otherwise
+    // be silently accepted, and init_embedding would later fail with a
+    // misleading "model files corrupt" error from the adapter setup path.
+    if lib_marker.exists() && model_marker.exists() && tokenizer_marker.exists() {
         return Ok(());
     }
     std::fs::create_dir_all(cache)?;
@@ -78,10 +81,16 @@ mod tests {
 
     #[test]
     fn cache_root_honors_env_var() {
-        // SAFETY: tests in the same process share env; isolate via tempdir-derived path
+        // This test mutates a global env var. It is safe today because no
+        // other test in this crate reads CACHE_ENV. If future tests touch
+        // cache_root(), they will race on this env var — at that point,
+        // either gate with #[serial_test::serial] or refactor cache_root
+        // to take the env var name as a parameter.
         let tmp = tempdir().unwrap();
         let path_str = tmp.path().to_string_lossy().to_string();
-        // SAFETY: single-threaded test, no other test reads CACHE_ENV
+        // SAFETY (Rust 2024 edition): mutating env is unsafe due to
+        // threading hazards; see the note above for why this call is
+        // currently sound.
         unsafe { std::env::set_var(CACHE_ENV, &path_str); }
         let resolved = cache_root().unwrap();
         unsafe { std::env::remove_var(CACHE_ENV); }

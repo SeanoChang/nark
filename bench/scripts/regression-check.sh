@@ -44,9 +44,13 @@ for new_file in "$NEW_DIR"/ir-*.json; do
   # Query-count check (fatal): catches the case where a future change makes
   # more queries error out, which would otherwise be invisible since per-query
   # averages can look fine even when fewer queries are contributing.
+  #
+  # Guard against "null" (Phase 2's Task B output may have `ir: null` for
+  # non-IR result types). Skip the check rather than crash on bash integer
+  # comparison of a non-numeric string.
   new_q=$(jq -r '.ir.queries' "$new_file")
   base_q=$(jq -r '.ir.queries' "$base_file")
-  if [[ "$new_q" -lt "$base_q" ]]; then
+  if [[ "$new_q" != "null" && "$base_q" != "null" && "$new_q" -lt "$base_q" ]]; then
     printf 'REGRESSION: %s query count dropped from %d to %d (likely new adapter errors)\n' \
       "$(basename "$new_file")" "$base_q" "$new_q"
     fail=1
