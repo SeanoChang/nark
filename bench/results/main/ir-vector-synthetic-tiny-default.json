@@ -1,0 +1,59 @@
+{
+  "schema_version": "2",
+  "task": "ir",
+  "system": "vector",
+  "config": "default",
+  "system_version": "vector nomic-embed-text-v1.5",
+  "bench_version": "0.1.0",
+  "run_started_at": "2026-05-17T05:13:13.549704+00:00",
+  "corpus": "synthetic-tiny",
+  "ir": {
+    "recall_at_1": 0.85,
+    "recall_at_5": 1.0,
+    "recall_at_10": 1.0,
+    "mrr": 1.0,
+    "ndcg_at_10": 0.9919720789148186,
+    "queries": 10
+  },
+  "ir_per_class": {
+    "single_hop": {
+      "recall_at_1": 0.875,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "mrr": 1.0,
+      "ndcg_at_10": 0.9799301972870469,
+      "queries": 4
+    },
+    "multi_hop": {
+      "recall_at_1": 0.5,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "mrr": 1.0,
+      "ndcg_at_10": 1.0,
+      "queries": 2
+    },
+    "synonym": {
+      "recall_at_1": 1.0,
+      "recall_at_5": 1.0,
+      "recall_at_10": 1.0,
+      "mrr": 1.0,
+      "ndcg_at_10": 1.0,
+      "queries": 4
+    }
+  },
+  "perf": {
+    "write": {
+      "latency_p50_us": 208703,
+      "latency_p99_us": 281512,
+      "llm_tokens_in_total": 0,
+      "llm_tokens_out_total": 0
+    },
+    "search": {
+      "latency_p50_us": 33466,
+      "latency_p99_us": 34490,
+      "llm_tokens_in_total": 0,
+      "llm_tokens_out_total": 0
+    }
+  },
+  "errors": []
+}

@@ -78,6 +78,24 @@ pub fn run_init(vault_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Library-friendly variant of `run_init`: downloads the ORT dylib and
+/// nomic-embed model into `target`, producing the standard
+/// `<target>/lib/...` and `<target>/models/<MODEL_NAME>/...` layout that
+/// `init_embedding` expects.
+///
+/// Unlike `run_init`, this emits no interactive instructions or post-install
+/// guidance (no "Run `nark embed build`" message) — it is intended for
+/// programmatic callers (such as the bench harness) that need the same
+/// file layout `nark embed init` produces but want a library-shaped API.
+/// The underlying download helpers still emit progress bars for large
+/// transfers; callers that need true silence should redirect stderr.
+pub fn install_into(target: &Path) -> Result<()> {
+    std::fs::create_dir_all(target)?;
+    download_ort(target)?;
+    download_model(target)?;
+    Ok(())
+}
+
 fn download_ort(vault_dir: &Path) -> Result<()> {
     let asset = ort_asset()?;
     let lib_dir = vault_dir.join("lib");

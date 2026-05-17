@@ -1,7 +1,15 @@
+[workspace]
+members = [".", "bench"]
+resolver = "2"
+
 [package]
 name = "nark"
 version = "0.13.0"
 edition = "2024"
+
+[lib]
+name = "nark"
+path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1.0.101"
