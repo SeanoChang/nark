@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+fn sanitize_for_filename(s: &str) -> String {
+    s.replace('/', "_").replace(std::path::MAIN_SEPARATOR, "_")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchResult {
     pub schema_version: String,
@@ -39,8 +43,8 @@ pub struct PerfMetrics {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PhaseMetrics {
-    pub latency_p50_ms: u64,
-    pub latency_p99_ms: u64,
+    pub latency_p50_us: u64,
+    pub latency_p99_us: u64,
     pub llm_tokens_in_total: u64,
     pub llm_tokens_out_total: u64,
 }
@@ -54,7 +58,7 @@ pub struct BenchError {
 impl BenchResult {
     pub fn new(task: &str, system: &str, config: &str, system_version: &str, corpus: &str) -> Self {
         Self {
-            schema_version: "1".to_string(),
+            schema_version: "2".to_string(),
             task: task.to_string(),
             system: system.to_string(),
             config: config.to_string(),
@@ -71,7 +75,12 @@ impl BenchResult {
 
     pub fn write_to_disk(&self, output_dir: &Path) -> Result<std::path::PathBuf> {
         std::fs::create_dir_all(output_dir)?;
-        let filename = format!("{}-{}-{}.json", self.task, self.system, self.config);
+        let filename = format!(
+            "{}-{}-{}.json",
+            sanitize_for_filename(&self.task),
+            sanitize_for_filename(&self.system),
+            sanitize_for_filename(&self.config),
+        );
         let path = output_dir.join(filename);
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(&path, format!("{}\n", json))?;

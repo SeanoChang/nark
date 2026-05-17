@@ -1097,6 +1097,8 @@ dependencies = [
  "assert_cmd",
  "chrono",
  "clap",
+ "dirs",
+ "nark",
  "rusqlite",
  "serde",
  "serde_json",

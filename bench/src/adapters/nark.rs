@@ -30,15 +30,19 @@ pub struct NarkAdapter {
     nark_bin: Option<PathBuf>,
     /// nark-assigned UUID → bench-managed document id.
     uuid_to_bench_id: HashMap<String, String>,
+    /// Path to the shared model cache. If `None`, nark runs in BM25-only
+    /// mode (no embedding files staged into workdir).
+    model_cache: Option<PathBuf>,
 }
 
 impl NarkAdapter {
-    pub fn new() -> Self {
+    pub fn new(model_cache: Option<PathBuf>) -> Self {
         Self {
             workdir: None,
             staging: None,
             nark_bin: None,
             uuid_to_bench_id: HashMap::new(),
+            model_cache,
         }
     }
 
@@ -64,7 +68,7 @@ impl NarkAdapter {
 }
 
 impl Default for NarkAdapter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self { Self::new(None) }
 }
 
 #[derive(Debug, Deserialize)]
@@ -123,6 +127,16 @@ impl Adapter for NarkAdapter {
         self.nark_bin = Some(nark_bin);
         self.uuid_to_bench_id.clear();
 
+        // Stage model files into workdir so nark write produces embeddings
+        // inline. If staging fails (cache missing, download failed, etc),
+        // fall back to BM25-only — adapter still functions, just without
+        // the cosine component. We log to stderr so operator sees what happened.
+        if let Some(cache) = &self.model_cache {
+            if let Err(e) = crate::model_cache::stage_into(cache, &workdir) {
+                eprintln!("nark adapter: model staging failed, continuing without embeddings: {}", e);
+            }
+        }
+
         // Initialize the vault
         self.run_nark(&["init"])?;
         Ok(())
@@ -149,7 +163,7 @@ impl Adapter for NarkAdapter {
         let uuid = parsed.notes.into_iter().next().unwrap().id;
         self.uuid_to_bench_id.insert(uuid, doc.id.clone());
         Ok(WriteMetrics {
-            latency_ms: t0.elapsed().as_millis() as u64,
+            latency_us: t0.elapsed().as_micros() as u64,
             llm_tokens_in: 0,
             llm_tokens_out: 0,
         })
@@ -175,7 +189,7 @@ impl Adapter for NarkAdapter {
             })
             .collect();
         Ok((results, SearchMetrics {
-            latency_ms: t0.elapsed().as_millis() as u64,
+            latency_us: t0.elapsed().as_micros() as u64,
             llm_tokens_in: 0,
             llm_tokens_out: 0,
         }))
@@ -254,7 +268,7 @@ mod tests {
     #[ignore = "requires built nark binary; run via the integration smoke test"]
     fn nark_smoke_write_then_search() {
         let dir = tempdir().unwrap();
-        let mut a = NarkAdapter::new();
+        let mut a = NarkAdapter::new(None);
         a.setup(dir.path()).unwrap();
 
         let body = "---\ntitle: Test note\nauthor: bench\ndomain: games\nintent: reference\nkind: note\nstatus: active\ntags: [chess]\n---\n\nThe sicilian defense begins with 1.e4 c5.\n";

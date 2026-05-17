@@ -7,6 +7,7 @@ mod metrics;
 mod adapters;
 mod result;
 mod tasks;
+mod model_cache;
 
 #[derive(Parser)]
 #[command(name = "nark-bench", about = "Benchmark harness for nark")]
@@ -45,10 +46,12 @@ fn main() -> Result<()> {
             if !corpus_root.exists() {
                 anyhow::bail!("corpus not found at {:?}", corpus_root);
             }
+            let cache = model_cache::cache_root()?;
+            model_cache::ensure_ready(&cache)?;
             for system in systems.split(',') {
                 let system = system.trim();
                 if system.is_empty() { continue; }
-                let mut adapter = adapters::make_adapter(system)?;
+                let mut adapter = adapters::make_adapter(system, Some(&cache))?;
                 let result = tasks::ir::run_ir_task(adapter.as_mut(), &corpus_root, "default")?;
                 let path = result.write_to_disk(&output)?;
                 eprintln!("wrote {}", path.display());

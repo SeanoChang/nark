@@ -20,6 +20,13 @@ jobs:
           shared-key: bench-pr
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Cache nark-bench embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/nark-bench/models
+          key: nark-bench-model-${{ hashFiles('src/embed/download.rs', 'src/embed/mod.rs') }}
+          restore-keys: |
+            nark-bench-model-
       - name: Build nark
         run: cargo build -p nark --release
       - name: Build nark-bench
@@ -31,7 +38,7 @@ jobs:
           mkdir -p /tmp/bench-pr-out
           cargo run -p nark-bench --release -- run \
             --task ir \
-            --systems fts5,nark \
+            --systems fts5,nark,vector \
             --corpus synthetic-tiny \
             --output /tmp/bench-pr-out
       - name: Regression check

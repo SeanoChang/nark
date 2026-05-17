@@ -47,7 +47,7 @@ impl Adapter for Fts5Adapter {
             rusqlite::params![doc.id, doc.body],
         )?;
         Ok(WriteMetrics {
-            latency_ms: t0.elapsed().as_millis() as u64,
+            latency_us: t0.elapsed().as_micros() as u64,
             llm_tokens_in: 0,
             llm_tokens_out: 0,
         })
@@ -78,7 +78,7 @@ impl Adapter for Fts5Adapter {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok((rows, SearchMetrics {
-            latency_ms: t0.elapsed().as_millis() as u64,
+            latency_us: t0.elapsed().as_micros() as u64,
             llm_tokens_in: 0,
             llm_tokens_out: 0,
         }))

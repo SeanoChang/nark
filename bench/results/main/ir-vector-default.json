@@ -1,27 +1,27 @@
 {
   "schema_version": "2",
   "task": "ir",
-  "system": "nark",
+  "system": "vector",
   "config": "default",
-  "system_version": "nark 0.13.0",
+  "system_version": "vector nomic-embed-text-v1.5",
   "bench_version": "0.1.0",
-  "run_started_at": "2026-05-17T01:06:09.499406+00:00",
+  "run_started_at": "2026-05-17T01:06:19.499336+00:00",
   "corpus": "synthetic-tiny",
   "ir": {
-    "recall_at_1": 0.75,
+    "recall_at_1": 0.85,
     "recall_at_5": 1.0,
     "recall_at_10": 1.0,
-    "mrr": 0.95,
-    "ndcg_at_10": 0.9550650542719644,
+    "mrr": 1.0,
+    "ndcg_at_10": 0.9919720789148186,
     "queries": 10
   },
   "ir_per_class": {
-    "single_hop": {
-      "recall_at_1": 0.625,
+    "synonym": {
+      "recall_at_1": 1.0,
       "recall_at_5": 1.0,
       "recall_at_10": 1.0,
-      "mrr": 0.875,
-      "ndcg_at_10": 0.8876626356799113,
+      "mrr": 1.0,
+      "ndcg_at_10": 1.0,
       "queries": 4
     },
     "multi_hop": {
@@ -32,25 +32,25 @@
       "ndcg_at_10": 1.0,
       "queries": 2
     },
-    "synonym": {
-      "recall_at_1": 1.0,
+    "single_hop": {
+      "recall_at_1": 0.875,
       "recall_at_5": 1.0,
       "recall_at_10": 1.0,
       "mrr": 1.0,
-      "ndcg_at_10": 1.0,
+      "ndcg_at_10": 0.9799301972870469,
       "queries": 4
     }
   },
   "perf": {
     "write": {
-      "latency_p50_us": 477447,
-      "latency_p99_us": 891133,
+      "latency_p50_us": 203099,
+      "latency_p99_us": 276990,
       "llm_tokens_in_total": 0,
       "llm_tokens_out_total": 0
     },
     "search": {
-      "latency_p50_us": 333046,
-      "latency_p99_us": 345975,
+      "latency_p50_us": 33406,
+      "latency_p99_us": 34012,
       "llm_tokens_in_total": 0,
       "llm_tokens_out_total": 0
     }

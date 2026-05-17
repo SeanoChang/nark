@@ -16,6 +16,8 @@ serde_json = "1"
 rusqlite = { version = "0.38", features = ["bundled"] }
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
+nark = { path = ".." }
+dirs = "6"
 
 [dev-dependencies]
 assert_cmd = "2"

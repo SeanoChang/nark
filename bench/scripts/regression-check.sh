@@ -31,6 +31,27 @@ for new_file in "$NEW_DIR"/ir-*.json; do
     continue
   fi
 
+  # Schema version warning (non-fatal): comparison still works because the
+  # regression check only reads .ir.* metrics, but a mismatch usually means
+  # the baseline needs regenerating.
+  new_schema=$(jq -r '.schema_version' "$new_file")
+  base_schema=$(jq -r '.schema_version' "$base_file")
+  if [[ "$new_schema" != "$base_schema" ]]; then
+    printf 'WARNING: %s schema version mismatch (new=%s, baseline=%s) — re-bootstrap baseline if intentional\n' \
+      "$(basename "$new_file")" "$new_schema" "$base_schema"
+  fi
+
+  # Query-count check (fatal): catches the case where a future change makes
+  # more queries error out, which would otherwise be invisible since per-query
+  # averages can look fine even when fewer queries are contributing.
+  new_q=$(jq -r '.ir.queries' "$new_file")
+  base_q=$(jq -r '.ir.queries' "$base_file")
+  if [[ "$new_q" -lt "$base_q" ]]; then
+    printf 'REGRESSION: %s query count dropped from %d to %d (likely new adapter errors)\n' \
+      "$(basename "$new_file")" "$base_q" "$new_q"
+    fail=1
+  fi
+
   for metric in recall_at_5 mrr ndcg_at_10; do
     new_val=$(jq -r ".ir.${metric}" "$new_file")
     base_val=$(jq -r ".ir.${metric}" "$base_file")

@@ -23,14 +23,14 @@ pub struct SearchResult {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WriteMetrics {
-    pub latency_ms: u64,
+    pub latency_us: u64,
     pub llm_tokens_in: u64,
     pub llm_tokens_out: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchMetrics {
-    pub latency_ms: u64,
+    pub latency_us: u64,
     pub llm_tokens_in: u64,
     pub llm_tokens_out: u64,
 }

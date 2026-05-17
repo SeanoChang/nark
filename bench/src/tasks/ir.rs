@@ -63,7 +63,7 @@ pub fn run_ir_task(
         let doc = Document { id: id.clone(), body, metadata: serde_json::json!({}) };
         match adapter.write(&doc) {
             Ok(m) => {
-                write_latencies.push(m.latency_ms);
+                write_latencies.push(m.latency_us);
                 tokens_in_total += m.llm_tokens_in;
                 tokens_out_total += m.llm_tokens_out;
             }
@@ -98,7 +98,7 @@ pub fn run_ir_task(
         let relevant: HashSet<String> = q.relevant.iter().cloned().collect();
         match adapter.search(&q.query, 10) {
             Ok((hits, m)) => {
-                search_latencies.push(m.latency_ms);
+                search_latencies.push(m.latency_us);
                 s_tokens_in_total += m.llm_tokens_in;
                 s_tokens_out_total += m.llm_tokens_out;
                 let ranked: Vec<String> = hits.into_iter().map(|h| h.doc_id).collect();
@@ -127,12 +127,12 @@ pub fn run_ir_task(
     // Performance
     write_latencies.sort_unstable();
     search_latencies.sort_unstable();
-    result.perf.write.latency_p50_ms = percentile(&write_latencies, 0.5);
-    result.perf.write.latency_p99_ms = percentile(&write_latencies, 0.99);
+    result.perf.write.latency_p50_us = percentile(&write_latencies, 0.5);
+    result.perf.write.latency_p99_us = percentile(&write_latencies, 0.99);
     result.perf.write.llm_tokens_in_total = tokens_in_total;
     result.perf.write.llm_tokens_out_total = tokens_out_total;
-    result.perf.search.latency_p50_ms = percentile(&search_latencies, 0.5);
-    result.perf.search.latency_p99_ms = percentile(&search_latencies, 0.99);
+    result.perf.search.latency_p50_us = percentile(&search_latencies, 0.5);
+    result.perf.search.latency_p99_us = percentile(&search_latencies, 0.99);
     result.perf.search.llm_tokens_in_total = s_tokens_in_total;
     result.perf.search.llm_tokens_out_total = s_tokens_out_total;
 
