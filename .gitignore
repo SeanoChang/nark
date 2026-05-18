@@ -5,3 +5,11 @@
 CLAUDE.md
 .claude/
 
+# Bench dataset upstream clones — large; live in upstream's git / HuggingFace.
+bench/datasets/*/upstream/
+
+# LLM cache — committed after baseline runs (Tasks 11/14) verify content is
+# free of API keys or sensitive request payloads before un-ignoring. Until
+# then, treat as local-only to prevent accidental commit of prompts that
+# might contain API key material (e.g. from ApiBackend auth headers).
+bench/cache/

@@ -56,8 +56,8 @@ fn smoke_fts5_nark_vector_all_run_against_synthetic_tiny() {
         });
         let v: Value = serde_json::from_str(&content).unwrap();
 
-        // Schema bumped to "2" in Phase 1b.
-        assert_eq!(v["schema_version"], "2", "{} schema_version mismatch", system);
+        // Schema bumped to "3" in Phase 2 Task 7.
+        assert_eq!(v["schema_version"], "3", "{} schema_version mismatch", system);
         assert_eq!(v["task"], "ir");
         assert_eq!(v["system"], system);
         assert_eq!(v["corpus"], "synthetic-tiny");

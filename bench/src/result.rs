@@ -20,7 +20,11 @@ pub struct BenchResult {
     pub corpus: String,
     pub ir: Option<IrMetrics>,
     pub ir_per_class: HashMap<String, IrMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<AnswerMetrics>,
     pub perf: PerfMetrics,
+    #[serde(default)]
+    pub properties: serde_json::Value,
     pub errors: Vec<BenchError>,
 }
 
@@ -39,6 +43,10 @@ pub struct IrMetrics {
 pub struct PerfMetrics {
     pub write: PhaseMetrics,
     pub search: PhaseMetrics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<LlmPhaseMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judging: Option<LlmPhaseMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -47,6 +55,30 @@ pub struct PhaseMetrics {
     pub latency_p99_us: u64,
     pub llm_tokens_in_total: u64,
     pub llm_tokens_out_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmPhaseMetrics {
+    pub calls: usize,
+    pub cache_hits: usize,
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    pub cost_usd_micros: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AnswerMetrics {
+    pub accuracy: f64,
+    pub per_ability: HashMap<String, AbilityMetrics>,
+    pub abstention_precision: f64,
+    pub judge_error_rate: f64,
+    pub questions: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AbilityMetrics {
+    pub accuracy: f64,
+    pub questions: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,7 +90,7 @@ pub struct BenchError {
 impl BenchResult {
     pub fn new(task: &str, system: &str, config: &str, system_version: &str, corpus: &str) -> Self {
         Self {
-            schema_version: "2".to_string(),
+            schema_version: "3".to_string(),
             task: task.to_string(),
             system: system.to_string(),
             config: config.to_string(),
@@ -68,7 +100,9 @@ impl BenchResult {
             corpus: corpus.to_string(),
             ir: None,
             ir_per_class: HashMap::new(),
+            answer: None,
             perf: PerfMetrics::default(),
+            properties: serde_json::Value::Object(serde_json::Map::new()),
             errors: vec![],
         }
     }
