@@ -4,10 +4,16 @@
 //! Same prompt + same model + same prompt version = cache hit.
 //!
 //! Persisted to disk at the path provided to `LlmCache::open`. The bench
-//! defaults to `bench/cache/llm.db` and commits this file so re-runs are
-//! free across contributors.
+//! defaults to `bench/cache/llm.db`. This file is **currently gitignored**
+//! pending a content audit (see `.gitignore` rationale): cached requests
+//! from `ApiBackend` could contain prompt-embedded auth material from
+//! upstream HTTP headers if anything ever leaks. After Tasks 11/14 (the
+//! first baseline runs) verify content is clean, the cache will be
+//! un-ignored and committed so re-runs across contributors are free.
 //!
-//! Schema is created idempotently on first open.
+//! Schema is created idempotently on first open. WAL journal mode is
+//! enabled so multi-hour baseline runs survive crashes without journal
+//! recovery overhead.
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -55,6 +61,12 @@ impl LlmCache {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open llm cache at {:?}", path))?;
+        // WAL mode survives crashes during long-running benchmarks without
+        // journal recovery on next open; NORMAL synchronous trades a tiny
+        // crash window for ~10x fewer fsyncs (~1500 LLM-call cache writes
+        // per LongMemEval sweep). The journal mode pragma is harmless on
+        // in-memory DBs but may emit a warning — we ignore the result.
+        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
         conn.execute_batch(SCHEMA_SQL)
             .context("failed to initialize llm cache schema")?;
         Ok(Self { conn })

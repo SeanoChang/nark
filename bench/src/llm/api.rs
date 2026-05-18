@@ -123,11 +123,12 @@ impl LlmBackend for ApiBackend {
                         .filter_map(|b| b.text)
                         .collect::<Vec<_>>()
                         .join("");
-                    // Cost estimate: rough per-token pricing for claude-opus-4-7
-                    // (~$15/Mtok in, ~$75/Mtok out, expressed as micros).
-                    // Update if pricing changes.
-                    let cost_usd_micros = body.usage.input_tokens * 15
-                        + body.usage.output_tokens * 75;
+                    // Per-model pricing — see `pricing_for_model` below.
+                    // Anthropic CLI returns cost directly; we have to estimate
+                    // it for the HTTP path.
+                    let (in_per_tok, out_per_tok) = pricing_for_model(&self.model);
+                    let cost_usd_micros = body.usage.input_tokens * in_per_tok
+                        + body.usage.output_tokens * out_per_tok;
                     return Ok(LlmResponse {
                         text,
                         tokens_in: body.usage.input_tokens,
@@ -146,9 +147,37 @@ impl LlmBackend for ApiBackend {
     }
 }
 
+/// Returns (input_micros_per_token, output_micros_per_token) for the given
+/// Anthropic model. Defaults to Opus pricing for unknown models so we
+/// never underestimate cost. Update when Anthropic pricing changes.
+///
+/// Approximate prices (May 2026):
+/// - Opus:   $15.00 / Mtok in,  $75.00 / Mtok out  → 15 / 75 micros per token
+/// - Sonnet:  $3.00 / Mtok in,  $15.00 / Mtok out  →  3 / 15 micros per token
+/// - Haiku:   $1.00 / Mtok in,   $5.00 / Mtok out  →  1 /  5 micros per token
+fn pricing_for_model(model: &str) -> (u64, u64) {
+    let m = model.to_lowercase();
+    if m.contains("haiku") {
+        (1, 5)
+    } else if m.contains("sonnet") {
+        (3, 15)
+    } else {
+        (15, 75)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pricing_for_known_models() {
+        assert_eq!(pricing_for_model("claude-opus-4-7"), (15, 75));
+        assert_eq!(pricing_for_model("claude-sonnet-4-6"), (3, 15));
+        assert_eq!(pricing_for_model("claude-haiku-4-5"), (1, 5));
+        // Unknown defaults to Opus (overestimate, safer).
+        assert_eq!(pricing_for_model("claude-future-7-0"), (15, 75));
+    }
 
     #[test]
     fn from_env_errors_when_key_missing() {

@@ -94,6 +94,7 @@ pub fn run_locomo_task(
                 phase: format!("setup:{}", sample.sample_id),
                 message: e.to_string(),
             });
+            let _ = adapter.teardown();
             continue;
         }
 
@@ -159,13 +160,16 @@ pub fn run_locomo_task(
                         continue;
                     }
                 };
-            gen_calls += 1;
+            // `calls` counts LIVE LLM invocations; cache_hits counts skipped ones.
+            // Keeps cost-per-call meaningful on re-runs.
             if gen_result.from_cache {
                 gen_cache_hits += 1;
+            } else {
+                gen_calls += 1;
+                gen_tokens_in += gen_result.tokens_in;
+                gen_tokens_out += gen_result.tokens_out;
+                gen_cost += gen_result.cost_usd_micros;
             }
-            gen_tokens_in += gen_result.tokens_in;
-            gen_tokens_out += gen_result.tokens_out;
-            gen_cost += gen_result.cost_usd_micros;
 
             let judgment = match judge_answer(
                 judge_backend,
@@ -184,13 +188,14 @@ pub fn run_locomo_task(
                     continue;
                 }
             };
-            judge_calls += 1;
             if judgment.from_cache {
                 judge_cache_hits += 1;
+            } else {
+                judge_calls += 1;
+                judge_tokens_in += judgment.tokens_in;
+                judge_tokens_out += judgment.tokens_out;
+                judge_cost += judgment.cost_usd_micros;
             }
-            judge_tokens_in += judgment.tokens_in;
-            judge_tokens_out += judgment.tokens_out;
-            judge_cost += judgment.cost_usd_micros;
 
             if matches!(judgment.verdict, Verdict::JudgeError) {
                 judge_errors += 1;

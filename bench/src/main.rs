@@ -148,7 +148,14 @@ fn run_task_b(
     let judge_template_path = PathBuf::from(format!("bench/llm/prompts/{}-judge.md", task_name));
 
     let system_count = systems.split(',').filter(|s| !s.trim().is_empty()).count();
-    let est_calls = 500usize * system_count * 2;
+    // Question counts per dataset — keep in sync with what fetch.sh + loaders pull.
+    // The estimate exists to prevent accidental subscription burn, so err high.
+    let est_questions = match task_name {
+        "longmemeval" => 500,
+        "locomo" => 1986,
+        _ => 500,
+    };
+    let est_calls = est_questions * system_count * 2;
     if !yes {
         eprintln!(
             "About to run {} on {} systems with up to ~{} LLM calls (gen + judge per question).\n\

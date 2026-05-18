@@ -43,7 +43,7 @@ pub fn run_longmemeval_task(
 
     let questions = load_questions(dataset_path)?;
 
-    let mut probe = adapter_factory()?;
+    let probe = adapter_factory()?;
     let system_name = probe.name().to_string();
     let system_version = probe.version().unwrap_or_else(|_| "unknown".to_string());
     drop(probe);
@@ -84,6 +84,7 @@ pub fn run_longmemeval_task(
                 phase: format!("setup:{}", q.question_id),
                 message: e.to_string(),
             });
+            let _ = adapter.teardown();
             continue;
         }
 
@@ -132,11 +133,17 @@ pub fn run_longmemeval_task(
                 continue;
             }
         };
-        gen_calls += 1;
-        if gen_result.from_cache { gen_cache_hits += 1; }
-        gen_tokens_in += gen_result.tokens_in;
-        gen_tokens_out += gen_result.tokens_out;
-        gen_cost += gen_result.cost_usd_micros;
+        // `calls` counts LIVE LLM invocations; `cache_hits` counts skipped ones.
+        // tokens/cost are only populated on live calls (cache returns zeros).
+        // Keeping these counters consistent avoids cost-per-call drift on re-runs.
+        if gen_result.from_cache {
+            gen_cache_hits += 1;
+        } else {
+            gen_calls += 1;
+            gen_tokens_in += gen_result.tokens_in;
+            gen_tokens_out += gen_result.tokens_out;
+            gen_cost += gen_result.cost_usd_micros;
+        }
 
         let judgment = match judge_answer(judge_backend, cache, &judge_template, &q.question, &q.answer, &gen_result.candidate) {
             Ok(j) => j,
@@ -149,11 +156,14 @@ pub fn run_longmemeval_task(
                 continue;
             }
         };
-        judge_calls += 1;
-        if judgment.from_cache { judge_cache_hits += 1; }
-        judge_tokens_in += judgment.tokens_in;
-        judge_tokens_out += judgment.tokens_out;
-        judge_cost += judgment.cost_usd_micros;
+        if judgment.from_cache {
+            judge_cache_hits += 1;
+        } else {
+            judge_calls += 1;
+            judge_tokens_in += judgment.tokens_in;
+            judge_tokens_out += judgment.tokens_out;
+            judge_cost += judgment.cost_usd_micros;
+        }
 
         if matches!(judgment.verdict, Verdict::JudgeError) {
             judge_errors += 1;
