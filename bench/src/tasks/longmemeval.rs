@@ -26,6 +26,7 @@ use crate::tasks::longmemeval_loader::{ability_class, haystack_to_documents, loa
 
 const K: usize = 10;
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_longmemeval_task(
     adapter_factory: &mut dyn FnMut() -> Result<Box<dyn Adapter>>,
     dataset_path: &Path,
@@ -35,13 +36,17 @@ pub fn run_longmemeval_task(
     judge_template_path: &Path,
     cache: &LlmCache,
     config_label: &str,
+    limit: Option<usize>,
 ) -> Result<BenchResult> {
     let gen_template = PromptTemplate::load(gen_template_path)
         .with_context(|| format!("failed to load gen template at {:?}", gen_template_path))?;
     let judge_template = PromptTemplate::load(judge_template_path)
         .with_context(|| format!("failed to load judge template at {:?}", judge_template_path))?;
 
-    let questions = load_questions(dataset_path)?;
+    let mut questions = load_questions(dataset_path)?;
+    if let Some(n) = limit {
+        questions.truncate(n);
+    }
 
     let probe = adapter_factory()?;
     let system_name = probe.name().to_string();
@@ -88,20 +93,15 @@ pub fn run_longmemeval_task(
             continue;
         }
 
-        let docs = haystack_to_documents(q);
-        let mut ingest_failed = false;
-        for (doc_id, body) in docs {
-            let doc = Document { id: doc_id, body, metadata: json!({}) };
-            if let Err(e) = adapter.write(&doc) {
-                result.errors.push(BenchError {
-                    phase: format!("write:{}:doc", q.question_id),
-                    message: e.to_string(),
-                });
-                ingest_failed = true;
-                break;
-            }
-        }
-        if ingest_failed {
+        let docs: Vec<Document> = haystack_to_documents(q)
+            .into_iter()
+            .map(|(doc_id, body)| Document { id: doc_id, body, metadata: json!({}) })
+            .collect();
+        if let Err(e) = adapter.write_batch(&docs) {
+            result.errors.push(BenchError {
+                phase: format!("write_batch:{}", q.question_id),
+                message: e.to_string(),
+            });
             let _ = adapter.teardown();
             continue;
         }
@@ -145,7 +145,8 @@ pub fn run_longmemeval_task(
             gen_cost += gen_result.cost_usd_micros;
         }
 
-        let judgment = match judge_answer(judge_backend, cache, &judge_template, &q.question, &q.answer, &gen_result.candidate) {
+        let gold = q.answer_as_string();
+        let judgment = match judge_answer(judge_backend, cache, &judge_template, &q.question, &gold, &gen_result.candidate) {
             Ok(j) => j,
             Err(e) => {
                 result.errors.push(BenchError {
@@ -169,8 +170,11 @@ pub fn run_longmemeval_task(
             judge_errors += 1;
         }
 
-        let gold_abstains = q.answer.trim().eq_ignore_ascii_case("I don't know")
-            || q.answer.trim().eq_ignore_ascii_case("idk");
+        // LongMemEval marks abstention questions with an `_abs` suffix on
+        // question_id — their gold answer is a long phrase like "You did not
+        // mention this information...", NOT literal "I don't know", so the
+        // qid suffix is the canonical signal.
+        let gold_abstains = q.question_id.ends_with("_abs");
         if gold_abstains {
             abstention_total += 1;
             if matches!(judgment.verdict, Verdict::Correct) {
@@ -181,7 +185,7 @@ pub fn run_longmemeval_task(
         // Use paper-aligned 5-class ability (free function from loader, NOT a method).
         // The loader exposes `ability_class(question_type: &str)` mapping 6 raw
         // question_type values to 5 paper-aligned ability classes.
-        all_verdicts.push((ability_class(&q.question_type).to_string(), judgment.verdict));
+        all_verdicts.push((ability_class(&q.question_id, &q.question_type).to_string(), judgment.verdict));
 
         let _ = adapter.teardown();
 
@@ -301,6 +305,7 @@ mod tests {
             &judge_path,
             &cache,
             "smoke",
+            None,
         ).unwrap();
 
         assert_eq!(result.task, "longmemeval");

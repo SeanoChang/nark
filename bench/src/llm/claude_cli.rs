@@ -98,8 +98,12 @@ impl LlmBackend for ClaudeCliBackend {
         let mut attempts = 0;
         loop {
             attempts += 1;
+            // --tools "" disables every built-in tool so adversarial content in
+            // prompts (LongMemEval/LOCOMO haystacks can contain arbitrary user text)
+            // cannot trigger Bash/Edit/Write on the host running the bench.
             let output = Command::new(&self.binary)
                 .arg("-p")
+                .arg("--tools").arg("")
                 .arg("--model").arg(&self.model)
                 .arg("--output-format").arg("json")
                 .arg(prompt)

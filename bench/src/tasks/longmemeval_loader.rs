@@ -34,8 +34,10 @@ pub struct Turn {
 pub struct LongMemEvalQuestion {
     pub question_id: String,
     pub question: String,
-    /// Gold answer.
-    pub answer: String,
+    /// Gold answer. LongMemEval mixes string and numeric answers
+    /// (e.g. "How many shirts" → 3), so we accept either and coerce
+    /// to a display string at the call site via `answer_as_string()`.
+    pub answer: serde_json::Value,
     /// Ability class — drives per-ability breakdown in the result JSON.
     /// One of: `single-session-user`, `single-session-assistant`,
     /// `single-session-preference`, `multi-session`, `knowledge-update`,
@@ -54,6 +56,20 @@ pub struct LongMemEvalQuestion {
     /// Haystack: nested list of sessions; each session is a list of turns.
     /// Each turn has `role` (`"user"` or `"assistant"`) and `content`.
     pub haystack_sessions: Vec<Vec<Turn>>,
+}
+
+impl LongMemEvalQuestion {
+    /// Coerce the gold answer to a display string for prompting the judge.
+    /// Strings pass through as-is; numbers/bools/nulls get to_string'd.
+    pub fn answer_as_string(&self) -> String {
+        match &self.answer {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Bool(b) => b.to_string(),
+            serde_json::Value::Null => "null".to_string(),
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Load all questions from a LongMemEval JSON file.
@@ -92,7 +108,17 @@ pub fn haystack_to_documents(q: &LongMemEvalQuestion) -> Vec<(String, String)> {
 ///
 /// The dataset uses 6 `question_type` values; the three `single-session-*`
 /// subtypes all fall under the paper's "Information Extraction" class.
-pub fn ability_class(question_type: &str) -> &'static str {
+/// Map a question to one of the 5 paper-aligned ability classes from the
+/// LongMemEval paper (ICLR 2025): information-extraction, multi-session-reasoning,
+/// knowledge-updates, temporal-reasoning, abstention.
+///
+/// Abstention is signaled by an `_abs` suffix on the question_id, not by
+/// question_type — abstention questions reuse the regular types but expect
+/// the system to recognize the answer is not in the haystack.
+pub fn ability_class(question_id: &str, question_type: &str) -> &'static str {
+    if question_id.ends_with("_abs") {
+        return "abstention";
+    }
     match question_type {
         "single-session-user" | "single-session-assistant" | "single-session-preference" => {
             "information-extraction"
@@ -149,7 +175,7 @@ mod tests {
         let q = LongMemEvalQuestion {
             question_id: "q1".into(),
             question: "Q".into(),
-            answer: "A".into(),
+            answer: serde_json::Value::String("A".into()),
             question_type: "single-session-user".into(),
             question_date: "2023/01/01 (Sun) 00:00".into(),
             answer_session_ids: vec![],
@@ -177,12 +203,18 @@ mod tests {
 
     #[test]
     fn ability_class_mapping() {
-        assert_eq!(ability_class("single-session-user"), "information-extraction");
-        assert_eq!(ability_class("single-session-assistant"), "information-extraction");
-        assert_eq!(ability_class("single-session-preference"), "information-extraction");
-        assert_eq!(ability_class("multi-session"), "multi-session-reasoning");
-        assert_eq!(ability_class("knowledge-update"), "knowledge-updates");
-        assert_eq!(ability_class("temporal-reasoning"), "temporal-reasoning");
-        assert_eq!(ability_class("unknown-type"), "unknown");
+        // Regular questions: dispatch by question_type
+        assert_eq!(ability_class("abc123", "single-session-user"), "information-extraction");
+        assert_eq!(ability_class("abc123", "single-session-assistant"), "information-extraction");
+        assert_eq!(ability_class("abc123", "single-session-preference"), "information-extraction");
+        assert_eq!(ability_class("abc123", "multi-session"), "multi-session-reasoning");
+        assert_eq!(ability_class("abc123", "knowledge-update"), "knowledge-updates");
+        assert_eq!(ability_class("abc123", "temporal-reasoning"), "temporal-reasoning");
+        assert_eq!(ability_class("abc123", "unknown-type"), "unknown");
+
+        // _abs suffix on question_id overrides type — abstention is its own class
+        assert_eq!(ability_class("abc123_abs", "single-session-user"), "abstention");
+        assert_eq!(ability_class("abc123_abs", "multi-session"), "abstention");
+        assert_eq!(ability_class("abc123_abs", "temporal-reasoning"), "abstention");
     }
 }

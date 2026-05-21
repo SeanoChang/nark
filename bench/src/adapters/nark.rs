@@ -84,6 +84,10 @@ struct NarkWriteNote {
     id: String,
     #[allow(dead_code)]
     title: String,
+    /// Source file path nark ingested from. Populated by `nark write --json`
+    /// and used to map nark UUIDs back to bench doc IDs on batch writes.
+    #[serde(default)]
+    file: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,7 +150,8 @@ impl Adapter for NarkAdapter {
         let t0 = Instant::now();
         let staging = self.staging.as_ref().ok_or_else(|| anyhow!("setup not called"))?;
         let path = staging.join(format!("{}.md", doc.id));
-        std::fs::write(&path, &doc.body)?;
+        let body = ensure_frontmatter(&doc.id, &doc.body);
+        std::fs::write(&path, &body)?;
         let path_str = path.to_string_lossy().to_string();
         let out = self.run_nark(&["write", &path_str])?;
         let parsed: NarkWriteOut = serde_json::from_slice(&out.stdout)
@@ -162,6 +167,52 @@ impl Adapter for NarkAdapter {
         }
         let uuid = parsed.notes.into_iter().next().unwrap().id;
         self.uuid_to_bench_id.insert(uuid, doc.id.clone());
+        Ok(WriteMetrics {
+            latency_us: t0.elapsed().as_micros() as u64,
+            llm_tokens_in: 0,
+            llm_tokens_out: 0,
+        })
+    }
+
+    fn write_batch(&mut self, docs: &[Document]) -> Result<WriteMetrics> {
+        // Bulk ingest in a single subprocess call. nark write accepts a
+        // directory and walks it for *.md, which sidesteps the ~700ms/turn
+        // process-spawn cost that made LongMemEval-S unworkable per-turn.
+        let t0 = Instant::now();
+        let staging = self.staging.as_ref()
+            .ok_or_else(|| anyhow!("setup not called"))?
+            .clone();
+
+        // Stage every doc to disk. Track filename → bench_id so we can
+        // reconstruct the mapping from the `file` field nark returns.
+        let mut filename_to_bench_id: HashMap<String, String> = HashMap::new();
+        for doc in docs {
+            let filename = format!("{}.md", doc.id);
+            let path = staging.join(&filename);
+            let body = ensure_frontmatter(&doc.id, &doc.body);
+            std::fs::write(&path, &body)?;
+            filename_to_bench_id.insert(filename, doc.id.clone());
+        }
+
+        let staging_str = staging.to_string_lossy().to_string();
+        let out = self.run_nark(&["write", &staging_str])?;
+        let parsed: NarkWriteOut = serde_json::from_slice(&out.stdout)
+            .with_context(|| format!(
+                "failed to parse batch nark write JSON ({} docs): {}",
+                docs.len(),
+                String::from_utf8_lossy(&out.stdout)
+            ))?;
+
+        for note in parsed.notes {
+            let basename = note.file.as_deref()
+                .and_then(|f| std::path::Path::new(f).file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if let Some(bench_id) = filename_to_bench_id.get(basename) {
+                self.uuid_to_bench_id.insert(note.id, bench_id.clone());
+            }
+        }
+
         Ok(WriteMetrics {
             latency_us: t0.elapsed().as_micros() as u64,
             llm_tokens_in: 0,
@@ -202,6 +253,29 @@ impl Adapter for NarkAdapter {
         self.uuid_to_bench_id.clear();
         Ok(())
     }
+}
+
+/// Wrap a raw body in nark's required YAML frontmatter unless it already has one.
+/// nark refuses notes without frontmatter, so the bench has to synthesize defaults
+/// for corpora (LongMemEval/LOCOMO turns) that don't carry one. Detection: if the
+/// body starts with `---\n` it's assumed to already be a full note.
+fn ensure_frontmatter(doc_id: &str, body: &str) -> String {
+    if body.starts_with("---\n") || body.starts_with("---\r\n") {
+        return body.to_string();
+    }
+    format!(
+        "---\n\
+         title: bench {doc_id}\n\
+         author: bench\n\
+         domain: conversation\n\
+         intent: reference\n\
+         kind: note\n\
+         status: active\n\
+         tags: []\n\
+         ---\n\n{body}\n",
+        doc_id = doc_id,
+        body = body,
+    )
 }
 
 /// Find the nark binary built in this workspace. Prefers the release binary

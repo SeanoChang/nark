@@ -30,6 +30,7 @@ pub fn run_locomo_task(
     judge_template_path: &Path,
     cache: &LlmCache,
     config_label: &str,
+    limit: Option<usize>,
 ) -> Result<BenchResult> {
     let gen_template = PromptTemplate::load(gen_template_path)
         .with_context(|| format!("failed to load gen template at {:?}", gen_template_path))?;
@@ -83,6 +84,7 @@ pub fn run_locomo_task(
 
     let total_qa: usize = samples.iter().map(|s| s.qa.len()).sum();
     let mut processed = 0;
+    let mut stop = false;
 
     for sample in &samples {
         // Ingest this sample's conversation ONCE per adapter setup
@@ -98,24 +100,15 @@ pub fn run_locomo_task(
             continue;
         }
 
-        let docs = conversation_to_documents(sample);
-        let mut ingest_failed = false;
-        for (doc_id, body) in docs {
-            let doc = Document {
-                id: doc_id,
-                body,
-                metadata: json!({}),
-            };
-            if let Err(e) = adapter.write(&doc) {
-                result.errors.push(BenchError {
-                    phase: format!("write:{}", sample.sample_id),
-                    message: e.to_string(),
-                });
-                ingest_failed = true;
-                break;
-            }
-        }
-        if ingest_failed {
+        let docs: Vec<Document> = conversation_to_documents(sample)
+            .into_iter()
+            .map(|(doc_id, body)| Document { id: doc_id, body, metadata: json!({}) })
+            .collect();
+        if let Err(e) = adapter.write_batch(&docs) {
+            result.errors.push(BenchError {
+                phase: format!("write_batch:{}", sample.sample_id),
+                message: e.to_string(),
+            });
             let _ = adapter.teardown();
             continue;
         }
@@ -215,10 +208,22 @@ pub fn run_locomo_task(
 
             all_verdicts.push((category, judgment.verdict));
             processed += 1;
+
+            // --limit early-break: still let adapter.teardown() run so SQLite
+            // handles close cleanly; just break out after the current sample.
+            if let Some(cap) = limit {
+                if processed >= cap {
+                    stop = true;
+                    break;
+                }
+            }
         }
 
         let _ = adapter.teardown();
 
+        if stop {
+            break;
+        }
         if processed % 50 == 0 {
             eprintln!("  locomo: {}/{} QAs ({})", processed, total_qa, system_name);
         }
@@ -351,6 +356,7 @@ mod tests {
             &judge_path,
             &cache,
             "smoke",
+            None,
         ).unwrap();
 
         assert_eq!(result.task, "locomo");

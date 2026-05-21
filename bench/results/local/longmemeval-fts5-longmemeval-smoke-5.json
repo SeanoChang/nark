@@ -1,0 +1,54 @@
+{
+  "schema_version": "3",
+  "task": "longmemeval",
+  "system": "fts5",
+  "config": "smoke-5",
+  "system_version": "sqlite-fts5 3.51.1",
+  "bench_version": "0.1.0",
+  "run_started_at": "2026-05-21T00:36:17.879173+00:00",
+  "corpus": "longmemeval",
+  "ir": null,
+  "ir_per_class": {},
+  "answer": {
+    "accuracy": 0.0,
+    "per_ability": {
+      "information-extraction": {
+        "accuracy": 0.0,
+        "questions": 5
+      }
+    },
+    "abstention_precision": 1.0,
+    "judge_error_rate": 0.0,
+    "questions": 5
+  },
+  "perf": {
+    "write": {
+      "latency_p50_us": 0,
+      "latency_p99_us": 0,
+      "llm_tokens_in_total": 0,
+      "llm_tokens_out_total": 0
+    },
+    "search": {
+      "latency_p50_us": 0,
+      "latency_p99_us": 0,
+      "llm_tokens_in_total": 0,
+      "llm_tokens_out_total": 0
+    },
+    "generation": {
+      "calls": 0,
+      "cache_hits": 5,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "cost_usd_micros": 0
+    },
+    "judging": {
+      "calls": 0,
+      "cache_hits": 5,
+      "tokens_in": 0,
+      "tokens_out": 0,
+      "cost_usd_micros": 0
+    }
+  },
+  "properties": {},
+  "errors": []
+}

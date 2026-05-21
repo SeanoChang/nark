@@ -58,17 +58,21 @@ enum Commands {
         /// Skip the pre-run confirmation prompt
         #[arg(long)]
         yes: bool,
+        /// Cap total questions answered (smoke testing).
+        /// LongMemEval: first N questions. LOCOMO: stop after N QAs across samples.
+        #[arg(long)]
+        limit: Option<usize>,
     },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run { task, systems, corpus, output, gen_backend, gen_model, judge_backend, judge_model, llm_concurrency, yes } => {
+        Commands::Run { task, systems, corpus, output, gen_backend, gen_model, judge_backend, judge_model, llm_concurrency, yes, limit } => {
             match task.as_str() {
                 "ir" => run_ir(systems, corpus, output),
-                "longmemeval" => run_task_b("longmemeval", systems, output, gen_backend, gen_model, judge_backend, judge_model, llm_concurrency, yes),
-                "locomo" => run_task_b("locomo", systems, output, gen_backend, gen_model, judge_backend, judge_model, llm_concurrency, yes),
+                "longmemeval" => run_task_b("longmemeval", systems, output, gen_backend, gen_model, judge_backend, judge_model, llm_concurrency, yes, limit),
+                "locomo" => run_task_b("locomo", systems, output, gen_backend, gen_model, judge_backend, judge_model, llm_concurrency, yes, limit),
                 other => anyhow::bail!("unknown --task value: {}", other),
             }
         }
@@ -119,6 +123,7 @@ fn run_task_b(
     judge_model: Option<String>,
     concurrency: usize,
     yes: bool,
+    limit: Option<usize>,
 ) -> Result<()> {
     let model_cache_path = model_cache::cache_root()?;
     let needs_model = systems.split(',').any(|s| matches!(s.trim(), "nark" | "vector"));
@@ -150,9 +155,11 @@ fn run_task_b(
     let system_count = systems.split(',').filter(|s| !s.trim().is_empty()).count();
     // Question counts per dataset — keep in sync with what fetch.sh + loaders pull.
     // The estimate exists to prevent accidental subscription burn, so err high.
-    let est_questions = match task_name {
-        "longmemeval" => 500,
-        "locomo" => 1986,
+    // --limit caps this for smoke runs.
+    let est_questions = match (task_name, limit) {
+        (_, Some(n)) => n,
+        ("longmemeval", _) => 500,
+        ("locomo", _) => 1986,
         _ => 500,
     };
     let est_calls = est_questions * system_count * 2;
@@ -183,6 +190,10 @@ fn run_task_b(
             adapters::make_adapter(&sys_owned, Some(&cache_path))
         };
 
+        let config_label = match limit {
+            Some(n) => format!("smoke-{}", n),
+            None => "default".to_string(),
+        };
         let result = match task_name {
             "longmemeval" => tasks::longmemeval::run_longmemeval_task(
                 &mut factory,
@@ -192,7 +203,8 @@ fn run_task_b(
                 judge_backend.as_mut(),
                 &judge_template_path,
                 &llm_cache,
-                "default",
+                &config_label,
+                limit,
             )?,
             "locomo" => tasks::locomo::run_locomo_task(
                 &mut factory,
@@ -202,7 +214,8 @@ fn run_task_b(
                 judge_backend.as_mut(),
                 &judge_template_path,
                 &llm_cache,
-                "default",
+                &config_label,
+                limit,
             )?,
             _ => unreachable!(),
         };

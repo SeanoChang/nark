@@ -146,8 +146,8 @@ pub fn judge_answer(
     let resp = loop {
         attempts += 1;
         let r = backend.call(&prompt)?;
-        let trimmed = r.text.trim();
-        let parsed: Result<JudgeOutput, _> = serde_json::from_str(trimmed);
+        let cleaned = strip_json_fence(&r.text);
+        let parsed: Result<JudgeOutput, _> = serde_json::from_str(cleaned);
         if parsed.is_ok() || attempts >= 2 {
             break r;
         }
@@ -179,7 +179,20 @@ pub fn judge_answer(
     })
 }
 
+/// Strip a leading/trailing ```json ... ``` fence from a model response.
+/// Haiku and other Claude models frequently wrap JSON in fences despite
+/// instructions to return raw JSON.
+fn strip_json_fence(text: &str) -> &str {
+    let t = text.trim();
+    let stripped = t
+        .strip_prefix("```json").or_else(|| t.strip_prefix("```"))
+        .unwrap_or(t)
+        .trim_start_matches('\n');
+    stripped.strip_suffix("```").unwrap_or(stripped).trim()
+}
+
 fn parse_verdict(text: &str) -> (Verdict, String) {
+    let text = strip_json_fence(text);
     match serde_json::from_str::<JudgeOutput>(text) {
         Ok(j) => {
             let v = match j.verdict.to_lowercase().as_str() {

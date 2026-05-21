@@ -53,6 +53,24 @@ pub trait Adapter {
     /// adapters that don't call LLMs on write.
     fn write(&mut self, doc: &Document) -> Result<WriteMetrics>;
 
+    /// Ingest a batch of documents. The default loops over `write`, but adapters
+    /// that pay heavy per-invocation overhead (subprocess startup, model loads)
+    /// should override this to amortize across the batch. Returns aggregate
+    /// metrics; per-document latency is summed into `latency_us`.
+    ///
+    /// Required for the LongMemEval/LOCOMO tasks where haystacks are 500+ turns
+    /// — subprocess-per-turn ingest is otherwise unworkable.
+    fn write_batch(&mut self, docs: &[Document]) -> Result<WriteMetrics> {
+        let mut total = WriteMetrics::default();
+        for doc in docs {
+            let m = self.write(doc)?;
+            total.latency_us += m.latency_us;
+            total.llm_tokens_in += m.llm_tokens_in;
+            total.llm_tokens_out += m.llm_tokens_out;
+        }
+        Ok(total)
+    }
+
     /// Run a query, return top-k hits ranked by the adapter's own scoring.
     fn search(&mut self, query: &str, k: usize) -> Result<(Vec<SearchResult>, SearchMetrics)>;
 
