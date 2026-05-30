@@ -10,3 +10,4 @@ pub mod embed;
 pub mod registry;
 pub mod types;
 pub mod vault;
+pub mod wire;
