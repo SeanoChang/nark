@@ -21,6 +21,9 @@ dirs = "6.0.0"
 flate2 = "1"
 include_dir = "0.7.4"
 indicatif = "0.17"
+# Both "user" AND "socket" are required for getpeereid on macOS: nix gates
+# getpeereid on `all(feature = "socket", feature = "user")` (verified against
+# nix-0.31.3). Do not trim either feature or peer-uid extraction breaks.
 nix = { version = "0.31.3", features = ["user", "socket"] }
 ndarray = "0.16"
 ort = { version = "2.0.0-rc.11", features = ["load-dynamic"] }
@@ -33,7 +36,7 @@ similar = "2"
 sha2 = "0.10"
 tar = "0.4"
 tokenizers = "0.20"
-tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "signal", "sync"] }
+tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
 ureq = "2"
 uuid = { version = "1.21.0", features = ["v4"] }
 toml = "0.8"

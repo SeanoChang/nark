@@ -15,12 +15,12 @@ use std::path::Path;
 
 use anyhow::Result;
 
-pub use authz::{AgentMap, guard_socket_owner};
-// `socket_owner_uid` is the lower-level primitive behind `guard_socket_owner`;
-// it is part of the serve module's public surface (and exercised by tests) but
-// the daemon path only calls the guard directly today.
+pub use authz::AgentMap;
+// `guard_preexisting_socket_path` is the pre-bind lstat guard; it is invoked by
+// `BoundListener::bind` before unlink+bind, so the daemon path does not call it
+// directly. Re-exported as part of the serve module's surface (and used by tests).
 #[allow(unused_imports)]
-pub use authz::socket_owner_uid;
+pub use authz::guard_preexisting_socket_path;
 pub use listener::{BoundListener, resolve_socket_path};
 
 use crate::config;
@@ -39,9 +39,9 @@ pub fn run(vault_dir: &Path, socket: Option<String>) -> Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(async {
+        // `bind` runs the pre-bind lstat guard (symlink-swap / socket-planting)
+        // before it unlinks any stale socket and binds — see `BoundListener::bind`.
         let bound = BoundListener::bind(&socket_path)?;
-        // Anti symlink-swap: the socket we just bound must be owned by us.
-        guard_socket_owner(bound.path())?;
         eprintln!("nark serve: listening on {}", bound.path().display());
         bound
             .serve_authenticated_until(agents, async {
@@ -58,7 +58,9 @@ mod tests {
 
     #[test]
     fn resolve_socket_path_default() {
+        // The default socket lives in a dedicated `run/` subdir so the daemon
+        // never touches the vault root's mode (see `ensure_socket_dir`).
         let path = resolve_socket_path(Path::new("/tmp/vault"), None);
-        assert_eq!(path, Path::new("/tmp/vault/nark.sock"));
+        assert_eq!(path, Path::new("/tmp/vault/run/nark.sock"));
     }
 }
