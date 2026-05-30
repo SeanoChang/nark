@@ -498,6 +498,13 @@ pub enum Commands {
 
     /// Pull latest code and rebuild the binary
     Update,
+
+    /// Serve the vault over a Unix domain socket (Ark comm protocol)
+    Serve {
+        /// Override the Unix socket path
+        #[arg(long)]
+        socket: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
