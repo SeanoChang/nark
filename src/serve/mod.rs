@@ -5,6 +5,7 @@
 //! shutdown); peer-credential authentication arrives in a later slice.
 
 mod listener;
+mod peercred;
 
 use std::path::Path;
 
