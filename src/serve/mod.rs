@@ -3,7 +3,9 @@
 //! Listens on a Unix domain socket and serves the vault to local agents.
 //! Slice 2.2 lands the listener loop (bind / accept / ping->pong / clean
 //! shutdown); slice 2.3 extracts peer credentials; slice 2.4 adds peer
-//! authorization (uid -> agent map + socket-ownership guard).
+//! authorization (uid -> agent map + socket-ownership guard); slice 2.5
+//! assembles the authenticated ping path end-to-end (peer uid -> agent ->
+//! ping/pong, with unknown uids rejected with `unauthorized`).
 
 mod authz;
 mod listener;
@@ -33,7 +35,6 @@ pub fn run(vault_dir: &Path, socket: Option<String>) -> Result<()> {
     let socket_path = resolve_socket_path(vault_dir, socket);
     let cfg = config::load(vault_dir)?;
     let agents = AgentMap::from_config(&cfg.serve.agents);
-    let _ = &agents; // wired into the accept/authz path in a later slice.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -43,7 +44,7 @@ pub fn run(vault_dir: &Path, socket: Option<String>) -> Result<()> {
         guard_socket_owner(bound.path())?;
         eprintln!("nark serve: listening on {}", bound.path().display());
         bound
-            .serve_until(async {
+            .serve_authenticated_until(agents, async {
                 let _ = tokio::signal::ctrl_c().await;
                 eprintln!("nark serve: shutting down");
             })
