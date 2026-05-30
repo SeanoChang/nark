@@ -2,8 +2,10 @@
 //!
 //! Listens on a Unix domain socket and serves the vault to local agents.
 //! Slice 2.2 lands the listener loop (bind / accept / ping->pong / clean
-//! shutdown); peer-credential authentication arrives in a later slice.
+//! shutdown); slice 2.3 extracts peer credentials; slice 2.4 adds peer
+//! authorization (uid -> agent map + socket-ownership guard).
 
+mod authz;
 mod listener;
 mod peercred;
 
@@ -11,7 +13,15 @@ use std::path::Path;
 
 use anyhow::Result;
 
+pub use authz::{AgentMap, guard_socket_owner};
+// `socket_owner_uid` is the lower-level primitive behind `guard_socket_owner`;
+// it is part of the serve module's public surface (and exercised by tests) but
+// the daemon path only calls the guard directly today.
+#[allow(unused_imports)]
+pub use authz::socket_owner_uid;
 pub use listener::{BoundListener, resolve_socket_path};
+
+use crate::config;
 
 /// Run the serve daemon.
 ///
@@ -21,11 +31,16 @@ pub use listener::{BoundListener, resolve_socket_path};
 /// ctrl-c.
 pub fn run(vault_dir: &Path, socket: Option<String>) -> Result<()> {
     let socket_path = resolve_socket_path(vault_dir, socket);
+    let cfg = config::load(vault_dir)?;
+    let agents = AgentMap::from_config(&cfg.serve.agents);
+    let _ = &agents; // wired into the accept/authz path in a later slice.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
         let bound = BoundListener::bind(&socket_path)?;
+        // Anti symlink-swap: the socket we just bound must be owned by us.
+        guard_socket_owner(bound.path())?;
         eprintln!("nark serve: listening on {}", bound.path().display());
         bound
             .serve_until(async {
