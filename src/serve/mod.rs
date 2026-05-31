@@ -10,6 +10,7 @@
 mod authz;
 mod listener;
 mod peercred;
+mod readpool;
 
 use std::path::Path;
 
