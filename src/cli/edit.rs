@@ -194,7 +194,11 @@ fn apply_operation(full_doc: &str, fm_raw: &str, body: &str, op: &EditOp) -> Res
 }
 
 pub fn run(vault_dir: &Path, id: &str, batch: bool, auto_link: bool, args: Vec<String>) -> Result<()> {
-    let conn = db::open_registry(vault_dir)?;
+    // Write command: hold the advisory write lock for the whole edit. A
+    // conflicting RW open is refused with the plain write-locked error; the
+    // handle derefs to the `Connection` so the logic below is unchanged, and
+    // the lock is released when the handle drops at end of function.
+    let conn = db::open_registry_guarded(vault_dir)?;
     let vault = Vault::new(vault_dir.to_path_buf());
 
     // Validate note exists and resolve prefix

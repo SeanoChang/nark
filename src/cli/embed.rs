@@ -13,7 +13,14 @@ pub fn run_init(vault_dir: &Path) -> Result<()> {
 }
 
 pub fn run_build(vault_dir: &Path) -> Result<()> {
-    let conn = db::open_registry(vault_dir)?;
+    // Write command: `embed build` upserts embeddings, so it holds the advisory
+    // write lock for the whole build. A conflicting RW open is refused with the
+    // plain write-locked error; the handle derefs to the `Connection` so the
+    // logic below is unchanged, and the lock is released on drop at end of
+    // function (also covers `run_migrate`, which calls `run_build`). `embed
+    // init` / model download (`run_init`) never open the registry, so they are
+    // not lock-gated.
+    let conn = db::open_registry_guarded(vault_dir)?;
     let vault = Vault::new(vault_dir.to_path_buf());
     let cfg = config::load(vault_dir)?;
 

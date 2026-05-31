@@ -21,7 +21,17 @@ pub fn run(
     find: Vec<String>,
     bulk: BulkTagOpts,
 ) -> Result<()> {
-    let conn = db::open_registry(vault_dir)?;
+    // Write command: hold the advisory write lock for the whole invocation. A
+    // conflicting RW open is refused with the plain write-locked error; the
+    // handle derefs to the `Connection` so every mode below is unchanged, and
+    // the lock is released when the handle drops at end of function.
+    //
+    // Note: `--list` / `--find` / read-only tag lookups are technically
+    // non-mutating, but `tag` is dispatched as a single write command, so it is
+    // guarded as a whole. The write CLIs are a defense-in-depth safety net (not
+    // used directly on the deploy box), so gating these rarely-direct read
+    // sub-modes too is acceptable and keeps the open path uniform.
+    let conn = db::open_registry_guarded(vault_dir)?;
 
     // Mode 1: --list
     if list {
@@ -172,4 +182,55 @@ fn validate_tag(tag: &str) -> Result<String> {
         bail!("invalid tag '{}': only lowercase alphanumeric and hyphens allowed", tag);
     }
     Ok(tag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_vault() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nark-tag-lock-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp vault");
+        dir
+    }
+
+    fn empty_bulk() -> BulkTagOpts {
+        BulkTagOpts {
+            domain: None,
+            kind: None,
+            filter_tag: Vec::new(),
+            since: None,
+            before: None,
+            confirm: false,
+        }
+    }
+
+    /// Spot-check: `tag` routes through the guarded open, so while the write
+    /// lock is held it is refused with the plain write-locked error (before any
+    /// mode dispatch).
+    #[test]
+    fn tag_refuses_when_write_locked() {
+        let dir = fresh_vault();
+        let held = db::open_registry_guarded(&dir).expect("hold the write lock");
+
+        let err = run(
+            &dir,
+            vec!["someid".to_string(), "+topic".to_string()],
+            false,
+            Vec::new(),
+            empty_bulk(),
+        )
+        .expect_err("tag must be refused while the write lock is held");
+        assert_eq!(
+            err.to_string(),
+            "registry is write-locked by another process"
+        );
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

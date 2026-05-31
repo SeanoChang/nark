@@ -11,7 +11,11 @@ use crate::vault::fs::Vault;
 
 pub fn run(vault_dir: &Path, paths: Vec<String>, depth: Option<u64>, auto_link: bool) -> Result<()> {
     let vault = Vault::new(vault_dir.to_path_buf());
-    let conn = db::open_registry(vault_dir)?;
+    // Write command: hold the advisory write lock for the whole batch ingest.
+    // A conflicting RW open is refused with the plain write-locked error; the
+    // handle derefs to the `Connection` so the loop below is unchanged, and the
+    // lock is released when the handle drops at end of function.
+    let conn = db::open_registry_guarded(vault_dir)?;
 
     let files = resolve_paths(&paths, depth)?;
 
