@@ -18,6 +18,10 @@
 //! * `nark/orient` -> a markdown vault briefing ([`methods_read::orient`]),
 //! * `nark/write` -> ingest a note via the single serializing writer queue, the
 //!   first WRITE method (see [`methods_write::write`]),
+//! * `nark/link` -> create typed edges from sources to a target via the writer
+//!   queue (see [`methods_write::link`]),
+//! * `nark/delete` -> soft-retract / hard-delete / purge notes via the writer
+//!   queue (see [`methods_write::delete`]),
 //! * any other method -> JSON-RPC `-32601 method not found`.
 //!
 //! The read methods call the same `registry::*` functions the CLI handlers do
@@ -34,7 +38,7 @@ use super::embed_permit;
 use super::methods_read;
 use super::methods_read::{OrientParams, SearchParams};
 use super::methods_write;
-use super::methods_write::WriteParams;
+use super::methods_write::{DeleteParams, LinkParams, WriteParams};
 use super::writer::Writer;
 use crate::wire::{RPCRequest, RPCResponse};
 use std::path::{Path, PathBuf};
@@ -210,6 +214,14 @@ pub async fn dispatch(ctx: &Ctx, req: &RPCRequest) -> RPCResponse {
             Ok(params) => result_or_invalid(req, methods_write::write(ctx, params).await),
             Err(resp) => resp,
         },
+        "nark/link" => match link_params(req) {
+            Ok(params) => result_or_invalid(req, methods_write::link(ctx, params).await),
+            Err(resp) => resp,
+        },
+        "nark/delete" => match delete_params(req) {
+            Ok(params) => result_or_invalid(req, methods_write::delete(ctx, params).await),
+            Err(resp) => resp,
+        },
         _ => RPCResponse::error(req.id.clone(), METHOD_NOT_FOUND, "method not found", None),
     }
 }
@@ -284,6 +296,68 @@ fn write_params(req: &RPCRequest) -> Result<WriteParams, RPCResponse> {
     Ok(WriteParams {
         note,
         auto_link: opt_bool(req, obj, "auto_link")?,
+        idempotency_key: opt_string(req, obj, "idempotency_key")?,
+    })
+}
+
+/// Parse the `nark/link` `params` object into [`LinkParams`].
+///
+/// Mirrors `nark link <sources...> --target <id> [--rel <rel>]` (`cli/link.rs`):
+/// `sources` is a **required**, non-empty array of note id strings; `target` is a
+/// **required** note id string; `rel` is optional and defaults to `"references"`
+/// (the CLI's `--rel` default). `idempotency_key` is an optional string (slice
+/// 6.3). A missing/empty `sources`, a missing `target`, or a wrong-typed field is
+/// `-32602 invalid params`.
+fn link_params(req: &RPCRequest) -> Result<LinkParams, RPCResponse> {
+    let obj = params_object(req)?;
+    let sources = opt_string_array(req, obj, "sources")?;
+    if sources.is_empty() {
+        return Err(invalid(
+            req,
+            "invalid params: 'sources' (a non-empty array of note ids) is required",
+        ));
+    }
+    let target = match opt_string(req, obj, "target")? {
+        Some(target) => target,
+        None => {
+            return Err(invalid(
+                req,
+                "invalid params: 'target' (the target note id) is required",
+            ));
+        }
+    };
+    Ok(LinkParams {
+        sources,
+        target,
+        rel: opt_string(req, obj, "rel")?.unwrap_or_else(|| "references".to_string()),
+        idempotency_key: opt_string(req, obj, "idempotency_key")?,
+    })
+}
+
+/// Parse the `nark/delete` `params` object into [`DeleteParams`].
+///
+/// Mirrors `nark delete <ids...> [-f] [-rf]` (`cli/delete.rs`): `ids` is an array
+/// of note id strings (absent -> empty, exactly the clap positional default — an
+/// empty delete is a no-op deleting zero notes), `force` (`-f`) and `recursive`
+/// (`-r`) are optional booleans defaulting to `false`. The CLI's clap layer makes
+/// `recursive` require `force`; this enforces the same guard so `recursive` without
+/// `force` is `-32602 invalid params` rather than a silently-ignored flag.
+/// `idempotency_key` is an optional string (slice 6.3). A wrong-typed field is
+/// `-32602`.
+fn delete_params(req: &RPCRequest) -> Result<DeleteParams, RPCResponse> {
+    let obj = params_object(req)?;
+    let force = opt_bool(req, obj, "force")?;
+    let recursive = opt_bool(req, obj, "recursive")?;
+    if recursive && !force {
+        return Err(invalid(
+            req,
+            "invalid params: 'recursive' requires 'force' (the -rf purge mode)",
+        ));
+    }
+    Ok(DeleteParams {
+        ids: opt_string_array(req, obj, "ids")?,
+        force,
+        recursive,
         idempotency_key: opt_string(req, obj, "idempotency_key")?,
     })
 }
@@ -821,6 +895,210 @@ tags:\n\
 
         let resp = dispatch(&ctx, &request("w2", "nark/write", Some(json!({})))).await;
         let err = expect_error(resp);
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a fresh write-capable vault dir for the link/delete router tests.
+    fn fresh_write_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nark-rpc-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp vault");
+        drop(crate::db::open_registry(&dir).expect("seed registry"));
+        dir
+    }
+
+    /// Write a note through the daemon and return its committed id.
+    async fn write_note(ctx: &Ctx, title: &str, body: &str) -> String {
+        let note = format!(
+            "---\n\
+title: {title}\n\
+author: tester\n\
+domain: engineering\n\
+intent: reference\n\
+kind: note\n\
+status: active\n\
+tags:\n\
+  - gamma\n\
+---\n\
+{body}\n"
+        );
+        let resp = dispatch(
+            ctx,
+            &request("seed", "nark/write", Some(json!({ "note": note }))),
+        )
+        .await;
+        expect_result(resp)["id"]
+            .as_str()
+            .expect("write returns id")
+            .to_string()
+    }
+
+    /// The router routes `nark/link`: a typed edge is created between two seeded
+    /// notes (verified via a follow-up `nark/peek` link-count read over the same
+    /// daemon), and the response mirrors the CLI's `{target, rel, linked, ...}`.
+    #[tokio::test]
+    async fn link_routes_through_dispatch_and_creates_edge() {
+        let dir = fresh_write_dir("link");
+        let ctx = ctx_with_writer(&dir).await;
+
+        let src = write_note(&ctx, "Src", "Source body.").await;
+        let dst = write_note(&ctx, "Dst", "Target body.").await;
+
+        let resp = dispatch(
+            &ctx,
+            &request(
+                "l1",
+                "nark/link",
+                Some(json!({ "sources": [src], "target": dst, "rel": "depends-on" })),
+            ),
+        )
+        .await;
+        let v = expect_result(resp);
+        assert_eq!(v["target"], dst);
+        assert_eq!(v["rel"], "depends-on");
+        assert_eq!(v["linked"], 1);
+
+        // The typed edge materialized (verified directly): src -> dst, depends-on.
+        let outgoing = {
+            let conn = crate::db::open_registry(&dir).expect("open registry");
+            let (out, _in) = crate::registry::edges::get_edges(&conn, &src).expect("get_edges");
+            drop(conn);
+            out
+        };
+        assert!(
+            outgoing
+                .iter()
+                .any(|e| e.note_id == dst && e.edge_type == "depends-on"),
+            "the depends-on edge from src to dst must exist"
+        );
+
+        // And it is visible through a read: the target gained incoming link(s).
+        let peek = expect_result(
+            dispatch(
+                &ctx,
+                &request("p1", "nark/peek", Some(json!({ "id": dst }))),
+            )
+            .await,
+        );
+        assert!(
+            peek["links_in"].as_i64().unwrap() >= 1,
+            "target has incoming link(s)"
+        );
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The router routes `nark/delete`: a soft delete (default) retracts the note —
+    /// a follow-up `nark/peek` shows `status: retracted` — and the response mirrors
+    /// the CLI's `{deleted, mode, notes}`.
+    #[tokio::test]
+    async fn delete_routes_through_dispatch_and_retracts() {
+        let dir = fresh_write_dir("delete");
+        let ctx = ctx_with_writer(&dir).await;
+
+        let id = write_note(&ctx, "Doomed", "Body.").await;
+
+        let resp = dispatch(
+            &ctx,
+            &request("d1", "nark/delete", Some(json!({ "ids": [id] }))),
+        )
+        .await;
+        let v = expect_result(resp);
+        assert_eq!(v["deleted"], 1);
+        assert_eq!(v["mode"], "retract");
+
+        let peek = expect_result(
+            dispatch(&ctx, &request("p2", "nark/peek", Some(json!({ "id": id })))).await,
+        );
+        assert_eq!(peek["status"], "retracted", "soft delete retracts the note");
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two `nark/delete` requests with the SAME `idempotency_key` dedup through the
+    /// writer: the second returns the identical cached result without re-applying
+    /// (which would otherwise error on the already-deleted note).
+    #[tokio::test]
+    async fn delete_same_idempotency_key_dedups_through_dispatch() {
+        let dir = fresh_write_dir("delete-idem");
+        let ctx = ctx_with_writer(&dir).await;
+
+        let id = write_note(&ctx, "Once", "Body.").await;
+        let params = json!({ "ids": [id], "force": true, "idempotency_key": "wire-del" });
+
+        let first = expect_result(
+            dispatch(&ctx, &request("d1", "nark/delete", Some(params.clone()))).await,
+        );
+        let second =
+            expect_result(dispatch(&ctx, &request("d2", "nark/delete", Some(params))).await);
+
+        assert_eq!(
+            first, second,
+            "a retried delete with the same key returns the identical cached result"
+        );
+        assert_eq!(first["mode"], "hard_delete");
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `nark/link` with missing `sources` / `target` is `-32602 invalid params`
+    /// (the required-field guards), not a panic.
+    #[tokio::test]
+    async fn link_missing_required_params_is_invalid_params() {
+        let dir = fresh_write_dir("link-bad");
+        let ctx = ctx_with_writer(&dir).await;
+
+        // Missing target.
+        let err = expect_error(
+            dispatch(
+                &ctx,
+                &request("l1", "nark/link", Some(json!({ "sources": ["abc"] }))),
+            )
+            .await,
+        );
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        // Missing / empty sources.
+        let err = expect_error(
+            dispatch(
+                &ctx,
+                &request("l2", "nark/link", Some(json!({ "target": "abc" }))),
+            )
+            .await,
+        );
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `nark/delete` with `recursive` but no `force` is `-32602` (mirrors clap's
+    /// `requires = "force"` guard) — `recursive` is never silently ignored.
+    #[tokio::test]
+    async fn delete_recursive_without_force_is_invalid_params() {
+        let dir = fresh_write_dir("delete-bad");
+        let ctx = ctx_with_writer(&dir).await;
+
+        let err = expect_error(
+            dispatch(
+                &ctx,
+                &request(
+                    "d1",
+                    "nark/delete",
+                    Some(json!({ "ids": ["abc"], "recursive": true })),
+                ),
+            )
+            .await,
+        );
         assert_eq!(err.code, INVALID_PARAMS);
 
         drop(ctx);
