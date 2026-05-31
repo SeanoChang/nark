@@ -164,13 +164,6 @@ pub fn run(
         }
     }
 
-    // Bump access for every hit — agent read these notes' content. Gated by the
-    // advisory write lock: non-blocking (the read is never delayed) and skipped
-    // for ALL hits if a writer/serve holds the lock (best-effort tracking, no
-    // unguarded dual-write). Acquire once, bump all, release.
-    let note_ids: Vec<&str> = hits.iter().map(|h| h.note_id.as_str()).collect();
-    access::try_bump_access(vault_dir, &conn, &note_ids)?;
-
     // Active tags section
     if !all_tags.is_empty() {
         md.push_str("## Active Tags\n");
@@ -219,6 +212,19 @@ pub fn run(
     ));
 
     print!("{}", md);
+
+    // Bump access for every hit — agent read these notes' content. Gated by the
+    // advisory write lock: non-blocking (the read is never delayed) and skipped
+    // for ALL hits if a writer/serve holds the lock (best-effort tracking, no
+    // unguarded dual-write). Acquire once, bump all, release.
+    //
+    // Run AFTER the briefing print: the bump is a pure side effect, so a rare
+    // lock-file IO Err while acquiring the advisory lock must not suppress
+    // orient's already-built output. The briefing is emitted first, then the
+    // best-effort bump is attempted (its Err still propagates as before).
+    let note_ids: Vec<&str> = hits.iter().map(|h| h.note_id.as_str()).collect();
+    access::try_bump_access(vault_dir, &conn, &note_ids)?;
+
     Ok(())
 }
 

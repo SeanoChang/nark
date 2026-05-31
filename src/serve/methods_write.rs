@@ -1240,4 +1240,83 @@ tags:\n\
         drop(ctx);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Phase 6 slice 6.5: a READ over the read-only deadpool runs CONCURRENTLY
+    /// with an in-flight WRITE. The single writer thread is parked inside an open
+    /// `BEGIN IMMEDIATE` transaction (so it genuinely holds the WAL write lock and
+    /// occupies the one writer thread), gated by a channel the test controls; while
+    /// that write is in flight a `nark/read` through the read-only pool must still
+    /// complete PROMPTLY (WAL readers do not block on the writer). The read is
+    /// asserted to finish *before* the gate is opened, proving the overlap is real,
+    /// not an artifact of the write having already finished.
+    #[tokio::test]
+    async fn read_runs_concurrently_with_in_flight_write() {
+        use std::time::Duration;
+
+        let dir = fresh_vault();
+        let ctx = ctx_with_writer(&dir).await;
+
+        // Seed a note to read back.
+        let id = write_note(&ctx, "Concurrent", "Concurrent body.").await;
+
+        // A barrier the gated write job blocks on while INSIDE an open write
+        // transaction, so it holds the WAL write lock and occupies the single
+        // writer thread until the test opens the gate.
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let gate_rx = std::sync::Mutex::new(gate_rx);
+        // Signals that the gated job has actually started (so the write is truly
+        // in flight before we issue the concurrent read).
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let writer = Arc::clone(ctx.writer().expect("writer present"));
+        let inflight = tokio::spawn(async move {
+            writer
+                .submit(move |conn| {
+                    // BEGIN IMMEDIATE takes the WAL write lock now; the single
+                    // writer thread is parked here until the gate opens.
+                    conn.execute_batch("BEGIN IMMEDIATE")?;
+                    let _ = started_tx.send(());
+                    let _ = gate_rx.lock().expect("gate lock").recv();
+                    conn.execute_batch("ROLLBACK")?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+        });
+
+        // Wait until the write is genuinely in flight (transaction open, thread
+        // parked on the gate).
+        started_rx.await.expect("gated write started");
+
+        // While the write is in flight, a read through the read-only pool must
+        // complete promptly (WAL readers are not blocked by the writer).
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            methods_read::read(ctx_pool(&ctx), &dir, &id),
+        )
+        .await
+        .expect("a WAL read must not block on an in-flight write")
+        .expect("read succeeds");
+        assert_eq!(
+            read["body"], "Concurrent body.",
+            "the concurrent read returns the note while the write holds the lock"
+        );
+
+        // The read completed BEFORE we open the gate, proving the overlap was real
+        // (the writer thread is still parked in its transaction).
+        assert!(
+            !inflight.is_finished(),
+            "the gated write must still be in flight when the read completes"
+        );
+
+        // Release the writer; the in-flight job rolls back and completes cleanly.
+        gate_tx.send(()).expect("open the gate");
+        tokio::time::timeout(Duration::from_secs(10), inflight)
+            .await
+            .expect("the in-flight write completes once the gate opens")
+            .expect("in-flight task join")
+            .expect("in-flight submit ok");
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
