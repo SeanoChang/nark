@@ -9,6 +9,7 @@
 
 mod authz;
 mod dpool;
+mod embed_permit;
 mod listener;
 mod methods_read;
 mod peercred;

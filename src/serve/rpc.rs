@@ -25,8 +25,10 @@
 
 use deadpool::managed::Pool;
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 
 use super::dpool::{self, RoManager};
+use super::embed_permit;
 use super::methods_read;
 use super::methods_read::{OrientParams, SearchParams};
 use super::readpool::ReadPool;
@@ -63,9 +65,18 @@ const INVALID_PARAMS: i64 = -32602;
 ///   embedding-bearing methods (`search` / `orient`), which still run their
 ///   blocking work (including ONNX inference) on a `spawn_blocking` thread this
 ///   slice. Slice 3.5.4 migrates them onto `dpool` and removes this field.
+///
+/// `embed_sem` is the bounded embedding-worker semaphore (slice 3.5.3): an
+/// `Arc<Semaphore>` with [`embed_permit::DEFAULT_EMBED_PERMITS`] permits that
+/// caps how many ONNX inferences run concurrently. It is landed here as the 2B
+/// primitive; slice 3.5.4 routes `search`/`orient`'s inference step through
+/// [`embed_permit::with_embed_permit`] using it, so it reads as unused on the
+/// binary target until then (exercised by the `embed_permit` tests).
 pub struct Ctx {
     dpool: Pool<RoManager>,
     ro_pool: Arc<ReadPool>,
+    #[allow(dead_code)]
+    embed_sem: Arc<Semaphore>,
     vault_dir: PathBuf,
 }
 
@@ -79,6 +90,7 @@ impl Ctx {
         Ok(Self {
             dpool: dpool::open_ro_pool(vault_dir, dpool::DEFAULT_POOL_SIZE).await?,
             ro_pool: Arc::new(ReadPool::open(vault_dir)?),
+            embed_sem: embed_permit::default_embed_semaphore(),
             vault_dir: vault_dir.to_path_buf(),
         })
     }
@@ -92,6 +104,7 @@ impl Ctx {
         Self {
             dpool,
             ro_pool: Arc::new(ro_pool),
+            embed_sem: embed_permit::default_embed_semaphore(),
             vault_dir,
         }
     }
