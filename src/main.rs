@@ -9,6 +9,7 @@ mod registry;
 mod serve;
 mod types;
 mod vault;
+mod wire;
 
 use crate::cli::Commands::{
     Init,

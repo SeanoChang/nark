@@ -9,9 +9,13 @@
 
 mod authz;
 mod listener;
+mod methods_read;
 mod peercred;
+mod readpool;
+mod rpc;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -38,13 +42,17 @@ pub fn run(vault_dir: &Path, socket: Option<String>) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    // Read-only registry pool + vault dir the READ methods dispatch against. The
+    // writer (the CLI's `db::open_registry`) owns creation/migration/seeding and
+    // has WAL enabled; this only reads.
+    let ctx = Arc::new(rpc::Ctx::open(vault_dir)?);
     runtime.block_on(async {
         // `bind` runs the pre-bind lstat guard (symlink-swap / socket-planting)
         // before it unlinks any stale socket and binds — see `BoundListener::bind`.
         let bound = BoundListener::bind(&socket_path)?;
         eprintln!("nark serve: listening on {}", bound.path().display());
         bound
-            .serve_authenticated_until(agents, async {
+            .serve_authenticated_until(agents, ctx, async {
                 let _ = tokio::signal::ctrl_c().await;
                 eprintln!("nark serve: shutting down");
             })

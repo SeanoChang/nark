@@ -6,9 +6,15 @@
 //!
 //! Slice 2.5 assembles the authenticated path: each connection's peer uid is
 //! extracted ([`super::peercred::peer_uid`]), resolved to an agent via the
-//! injected [`AgentMap`], and only known agents are served `ping`->`pong`.
-//! Unknown / forged uids get an `unauthorized` line and the connection is
-//! closed (fail closed).
+//! injected [`AgentMap`], and only known agents are served. Unknown / forged
+//! uids get an `unauthorized` line and the connection is closed (fail closed).
+//!
+//! Slice 3.2 replaces the line protocol with one JSON-RPC request per
+//! connection: after auth, the handler reads one [`crate::wire::RPCRequest`]
+//! line, dispatches it via [`super::rpc::dispatch`], and writes one
+//! [`crate::wire::RPCResponse`] line. `ping` is now a JSON-RPC method
+//! (`{"pong": true}`); unknown methods return `-32601`, malformed JSON returns
+//! `-32700`. The unknown-uid rejection still precedes any RPC parsing.
 //!
 //! Before binding, a pre-bind lstat guard ([`guard_preexisting_socket_path`])
 //! refuses to serve if a symlink or a foreign-owned file already sits at the
@@ -23,17 +29,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::AgentMap;
 use super::authz::guard_preexisting_socket_path;
 use super::peercred::peer_uid;
+use super::rpc::{self, Ctx};
+use crate::wire::{RPCRequest, RPCResponse};
+
+/// JSON-RPC error code: the request line was not valid JSON.
+const PARSE_ERROR: i64 = -32700;
+/// JSON-RPC error code: the request was not a valid request (here: too large).
+const INVALID_REQUEST: i64 = -32600;
 
 /// How long to wait for an authenticated peer to send its request line before
 /// the connection is logged and closed. A peer that connects and never sends a
 /// newline would otherwise park the spawned task forever.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of bytes accepted for a single request line. An authenticated
+/// peer that streams bytes without a newline would otherwise grow the read
+/// buffer unbounded until [`READ_TIMEOUT`] fires (a large allocation). The read
+/// is capped at this many bytes (Spec §16 max message size); a line that hits
+/// the cap without a terminating newline is rejected with a `-32600` error and
+/// the connection is closed cleanly.
+const MAX_REQUEST_BYTES: u64 = 1 << 20; // 1 MiB
 
 /// Resolve the socket path for the daemon.
 ///
@@ -123,13 +144,13 @@ impl BoundListener {
     }
 
     /// Accept-loop until `shutdown` resolves. Each connection is handled by
-    /// reading a single line and replying `pong\n` to `ping`.
+    /// reading a single JSON-RPC request line and writing its response.
     ///
     /// This is the unauthenticated baseline from slice 2.2; the daemon path now
     /// uses [`Self::serve_authenticated_until`]. It is retained (and exercised
-    /// by tests) as the documented pre-auth ping/pong primitive.
+    /// by tests) as the documented pre-auth round-trip primitive.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn serve_until<F>(&self, shutdown: F) -> Result<()>
+    pub async fn serve_until<F>(&self, ctx: Arc<Ctx>, shutdown: F) -> Result<()>
     where
         F: std::future::Future<Output = ()>,
     {
@@ -138,8 +159,9 @@ impl BoundListener {
             tokio::select! {
                 accepted = self.listener.accept() => {
                     let (stream, _addr) = accepted.context("accepting connection")?;
+                    let ctx = Arc::clone(&ctx);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream).await {
+                        if let Err(e) = handle_connection(stream, &ctx).await {
                             eprintln!("nark serve: connection error: {e:#}");
                         }
                     });
@@ -155,28 +177,73 @@ impl BoundListener {
     /// Authenticated accept-loop until `shutdown` resolves.
     ///
     /// For each connection the peer's uid is extracted and resolved against
-    /// `agents`. Known uids are served `ping`->`pong`; unknown / forged uids
-    /// receive an `unauthorized` line and the connection is closed (fail
-    /// closed). This is the assembled Phase 2 serve path.
+    /// `agents`. Known uids are served one JSON-RPC request/response round-trip;
+    /// unknown / forged uids receive an `unauthorized` line and the connection is
+    /// closed (fail closed) before any RPC parsing. This is the Phase 3 serve
+    /// path built on the Phase 2 authenticated accept loop.
     ///
     /// The per-connection request read is bounded by [`READ_TIMEOUT`]; a peer
     /// that connects and never sends a line is closed rather than parking its
     /// task forever.
-    pub async fn serve_authenticated_until<F>(&self, agents: AgentMap, shutdown: F) -> Result<()>
+    pub async fn serve_authenticated_until<F>(
+        &self,
+        agents: AgentMap,
+        ctx: Arc<Ctx>,
+        shutdown: F,
+    ) -> Result<()>
     where
         F: std::future::Future<Output = ()>,
     {
-        self.serve_authenticated_until_with_timeout(agents, READ_TIMEOUT, shutdown)
-            .await
+        self.serve_authenticated_until_with_limits(
+            agents,
+            ctx,
+            READ_TIMEOUT,
+            MAX_REQUEST_BYTES,
+            shutdown,
+        )
+        .await
     }
 
     /// As [`Self::serve_authenticated_until`], but with an explicit per-connection
     /// read timeout. Lets tests drive the timeout path with a short duration
-    /// without waiting the production [`READ_TIMEOUT`].
+    /// without waiting the production [`READ_TIMEOUT`]. The request-size cap stays
+    /// at the production [`MAX_REQUEST_BYTES`].
+    #[cfg(test)]
     pub async fn serve_authenticated_until_with_timeout<F>(
         &self,
         agents: AgentMap,
+        ctx: Arc<Ctx>,
         read_timeout: Duration,
+        shutdown: F,
+    ) -> Result<()>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        self.serve_authenticated_until_with_limits(
+            agents,
+            ctx,
+            read_timeout,
+            MAX_REQUEST_BYTES,
+            shutdown,
+        )
+        .await
+    }
+
+    /// As [`Self::serve_authenticated_until`], but with an explicit per-connection
+    /// read timeout *and* request-size cap. Lets tests drive both the timeout path
+    /// (short duration) and the over-size path (small cap) without the production
+    /// [`READ_TIMEOUT`] / [`MAX_REQUEST_BYTES`].
+    ///
+    /// Each connection's blocking JSON-RPC dispatch runs on a `spawn_blocking`
+    /// thread (see [`handle_authenticated_connection`]) so the pool's blocking
+    /// `Condvar` checkout can never park a tokio worker and starve the accept loop
+    /// / shutdown future (Spec §10).
+    pub async fn serve_authenticated_until_with_limits<F>(
+        &self,
+        agents: AgentMap,
+        ctx: Arc<Ctx>,
+        read_timeout: Duration,
+        max_request_bytes: u64,
         shutdown: F,
     ) -> Result<()>
     where
@@ -189,9 +256,16 @@ impl BoundListener {
                 accepted = self.listener.accept() => {
                     let (stream, _addr) = accepted.context("accepting connection")?;
                     let agents = Arc::clone(&agents);
+                    let ctx = Arc::clone(&ctx);
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_authenticated_connection(stream, &agents, read_timeout).await
+                        if let Err(e) = handle_authenticated_connection(
+                            stream,
+                            &agents,
+                            ctx,
+                            read_timeout,
+                            max_request_bytes,
+                        )
+                        .await
                         {
                             eprintln!("nark serve: connection error: {e:#}");
                         }
@@ -212,12 +286,16 @@ impl Drop for BoundListener {
     }
 }
 
-/// Handle a single connection: read one line, answer `ping` with `pong`.
+/// Handle a single connection: read one JSON-RPC request line and write its
+/// response.
 ///
 /// Unauthenticated baseline from slice 2.2, superseded on the daemon path by
-/// [`handle_authenticated_connection`]; retained as a tested primitive.
+/// [`handle_authenticated_connection`]; retained as a tested primitive. Phase 3
+/// moves it to the same JSON-RPC framing as the authenticated path so there is a
+/// single protocol on the wire (no dual line/JSON-RPC handling). Malformed JSON
+/// yields a `-32700 parse error` with an empty id.
 #[cfg_attr(not(test), allow(dead_code))]
-async fn handle_connection(stream: UnixStream) -> Result<()> {
+async fn handle_connection(stream: UnixStream, ctx: &Ctx) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -228,30 +306,50 @@ async fn handle_connection(stream: UnixStream) -> Result<()> {
     if n == 0 {
         return Ok(());
     }
-    if line.trim_end() == "ping" {
-        write_half
-            .write_all(b"pong\n")
-            .await
-            .context("writing pong")?;
-        write_half.flush().await.context("flushing pong")?;
-    }
-    Ok(())
+    let response = match serde_json::from_str::<RPCRequest>(line.trim_end()) {
+        Ok(req) => rpc::dispatch(ctx, &req),
+        Err(e) => {
+            eprintln!("nark serve: unauthenticated peer sent malformed JSON-RPC: {e}");
+            RPCResponse::error("", PARSE_ERROR, "parse error", None)
+        }
+    };
+    write_response(&mut write_half, &response).await
 }
 
-/// Handle a single connection with peer authentication.
+/// Handle a single connection with peer authentication, then one JSON-RPC
+/// request/response round-trip.
 ///
-/// Extracts the peer uid, resolves it to an agent via `agents`, and only then
-/// serves `ping`->`pong`. Unknown uids get an `unauthorized` line and the
-/// connection is closed without serving anything (fail closed).
+/// Order, fail-closed:
+/// 1. Extract the peer uid and resolve it to an agent via `agents`. Unknown
+///    uids get an `unauthorized` line and the connection is closed *before any
+///    RPC parsing* (the unknown-uid rejection precedes everything else).
+/// 2. Read exactly one line, bounded by `read_timeout` *and* `max_request_bytes`:
+///    a peer that authenticates but never sends a request is logged and closed
+///    instead of parking the spawned task forever, and a peer that streams bytes
+///    without a newline is cut off at the cap (not allowed to grow the buffer
+///    unbounded) and answered with a `-32600 request too large` error.
+/// 3. Parse the line as a [`RPCRequest`]. Malformed JSON yields a JSON-RPC
+///    `-32700 parse error` with an empty id (there is no id to echo).
+/// 4. Dispatch via [`rpc::dispatch`] and write the single [`RPCResponse`] as one
+///    JSON line + newline.
 ///
-/// The request read is bounded by `read_timeout`: a peer that authenticates but
-/// never sends a request line is logged and the connection closed, instead of
-/// parking the spawned task forever. The accept loop is unaffected because this
-/// runs inside the per-connection task.
+/// The synchronous [`rpc::dispatch`] does a *blocking* pool checkout
+/// ([`super::readpool::ReadPool::with_conn`] waits on a `Condvar` when every
+/// connection is busy), so it is run on a [`tokio::task::spawn_blocking`] thread
+/// rather than the async worker. This keeps the accept loop and shutdown future
+/// making progress even when all pool connections are held (Spec §10: reads must
+/// never block the reactor). The owned `req` and a cloned `Arc<Ctx>` move into
+/// the blocking closure; the response is awaited and written back on the async
+/// side.
+///
+/// The accept loop is unaffected by the per-connection timeout because this runs
+/// inside the spawned per-connection task.
 async fn handle_authenticated_connection(
     stream: UnixStream,
     agents: &AgentMap,
+    ctx: Arc<Ctx>,
     read_timeout: Duration,
+    max_request_bytes: u64,
 ) -> Result<()> {
     let uid = peer_uid(&stream).context("extracting peer uid")?;
     let agent = match agents.resolve(uid) {
@@ -273,7 +371,10 @@ async fn handle_authenticated_connection(
     eprintln!("nark serve: authenticated {agent} (uid {uid})");
 
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    // Cap the read at `max_request_bytes`: `take` makes the underlying reader
+    // return EOF once the cap is reached, so `read_line` cannot grow `line`
+    // beyond the cap regardless of whether the peer ever sends a newline.
+    let mut reader = BufReader::new(read_half).take(max_request_bytes);
     let mut line = String::new();
     let n = match tokio::time::timeout(read_timeout, reader.read_line(&mut line)).await {
         Ok(read) => read.context("reading request line")?,
@@ -289,13 +390,50 @@ async fn handle_authenticated_connection(
     if n == 0 {
         return Ok(());
     }
-    if line.trim_end() == "ping" {
-        write_half
-            .write_all(b"pong\n")
-            .await
-            .context("writing pong")?;
-        write_half.flush().await.context("flushing pong")?;
+
+    // If the read filled the cap without a terminating newline, the request is
+    // over-size (or unterminated). Answer with `-32600 request too large` and
+    // close cleanly rather than parse a truncated line or keep reading.
+    if n as u64 >= max_request_bytes && !line.ends_with('\n') {
+        eprintln!(
+            "nark serve: {agent} (uid {uid}) sent an over-size request (>= {max_request_bytes} bytes); closing"
+        );
+        let response = RPCResponse::error("", INVALID_REQUEST, "request too large", None);
+        return write_response(&mut write_half, &response).await;
     }
+
+    // Parse the one request line as JSON-RPC; malformed JSON is reported with a
+    // `-32700 parse error` and an empty id (we have no id to echo).
+    let response = match serde_json::from_str::<RPCRequest>(line.trim_end()) {
+        Ok(req) => {
+            // The pool checkout inside dispatch blocks (Condvar); run it off the
+            // async worker so it cannot park the reactor (Spec §10).
+            let ctx = Arc::clone(&ctx);
+            tokio::task::spawn_blocking(move || rpc::dispatch(&ctx, &req))
+                .await
+                .context("joining dispatch task")?
+        }
+        Err(e) => {
+            eprintln!("nark serve: {agent} (uid {uid}) sent malformed JSON-RPC: {e}");
+            RPCResponse::error("", PARSE_ERROR, "parse error", None)
+        }
+    };
+
+    write_response(&mut write_half, &response).await
+}
+
+/// Serialize a [`RPCResponse`] to one JSON line + newline and flush it.
+async fn write_response<W>(write_half: &mut W, response: &RPCResponse) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut bytes = serde_json::to_vec(response).context("serializing RPC response")?;
+    bytes.push(b'\n');
+    write_half
+        .write_all(&bytes)
+        .await
+        .context("writing RPC response")?;
+    write_half.flush().await.context("flushing RPC response")?;
     Ok(())
 }
 
@@ -330,9 +468,53 @@ mod tests {
         assert_eq!(resolved, Path::new("/run/custom.sock"));
     }
 
-    /// End-to-end Phase 2 exit: an authenticated `ping` round-trips to `pong`
-    /// when the connecting uid is a known agent, and an unknown uid is rejected
-    /// at the application layer with an `unauthorized` line.
+    /// Seed `dir` as a vault (writer creates/migrates/seeds `registry.db` and
+    /// enables WAL) with one ingested note, then build the read-only [`Ctx`] the
+    /// serve loops dispatch against. Returns `(ctx, note_id)`. The writer
+    /// connection is dropped before the read pool opens.
+    fn seeded_ctx(dir: &Path) -> (Arc<Ctx>, String) {
+        use crate::registry::write::commit_version;
+        use crate::vault::fs::Vault;
+
+        const NOTE: &str = "---\n\
+title: Socket Note\n\
+author: tester\n\
+domain: engineering\n\
+intent: reference\n\
+kind: note\n\
+status: active\n\
+tags:\n\
+  - delta\n\
+---\n\
+Socket body text.\n";
+
+        std::fs::create_dir_all(dir).expect("create vault dir");
+        let conn = crate::db::open_registry(dir).expect("open writer registry");
+        let vault = Vault::new(dir.to_path_buf());
+        let result = vault.ingest(NOTE, None).expect("ingest note");
+        commit_version(&conn, &result).expect("commit version");
+        let note_id = result.note_id.clone();
+        drop(conn);
+
+        let ctx = Ctx::open(dir).expect("open serve ctx");
+        (Arc::new(ctx), note_id)
+    }
+
+    /// Read one newline-terminated line from `stream` and parse it as JSON.
+    /// Shared by the JSON-RPC round-trip tests.
+    async fn read_json_line(stream: UnixStream) -> serde_json::Value {
+        let mut reply = String::new();
+        let mut reader = BufReader::new(stream);
+        reader
+            .read_line(&mut reply)
+            .await
+            .expect("read response line");
+        serde_json::from_str(reply.trim_end()).expect("response is valid JSON")
+    }
+
+    /// Phase 3 exit: an authenticated JSON-RPC `ping` request round-trips to a
+    /// `{"pong": true}` result whose id echoes the request id, when the
+    /// connecting uid is a known agent.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn authenticated_ping_known_uid_gets_pong() {
@@ -342,6 +524,7 @@ mod tests {
         let dir = temp_socket_dir();
         let socket_path = dir.join("nark.sock");
         let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        let (ctx, _note_id) = seeded_ctx(&dir);
 
         // Register the *test process's own* uid as a known agent so the
         // connecting client (this process) authenticates as "tester".
@@ -353,7 +536,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             bound
-                .serve_authenticated_until(agents, async {
+                .serve_authenticated_until(agents, ctx, async {
                     let _ = rx.await;
                 })
                 .await
@@ -363,12 +546,361 @@ mod tests {
         let mut stream = UnixStream::connect(&socket_path)
             .await
             .expect("connect to socket");
-        stream.write_all(b"ping\n").await.expect("write ping");
-        stream.flush().await.expect("flush ping");
+        stream
+            .write_all(b"{\"id\":\"abc\",\"method\":\"ping\"}\n")
+            .await
+            .expect("write ping request");
+        stream.flush().await.expect("flush ping request");
 
-        let mut buf = [0u8; 5];
-        stream.read_exact(&mut buf).await.expect("read pong");
-        assert_eq!(&buf, b"pong\n", "known uid should get pong");
+        let v = read_json_line(stream).await;
+        assert_eq!(v["id"], "abc", "response id should echo request id");
+        assert_eq!(v["result"]["pong"], true, "ping should yield pong=true");
+        assert!(v.get("error").is_none(), "ping should not be an error");
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 3 slice 3.3 exit: the three READ methods (`nark/peek`, `nark/read`,
+    /// `nark/stats`) round-trip over the socket against a seeded note, and a bad
+    /// id returns a clean error response (not a panic / dropped connection).
+    /// One request per connection, so each method opens a fresh connection.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn authenticated_read_methods_round_trip_over_socket() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        let (ctx, note_id) = seeded_ctx(&dir);
+
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        // Helper: one request line -> one parsed JSON response over a fresh conn.
+        async fn round_trip(socket_path: &Path, line: &str) -> serde_json::Value {
+            let mut stream = UnixStream::connect(socket_path)
+                .await
+                .expect("connect to socket");
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .expect("write request");
+            stream.flush().await.expect("flush request");
+            read_json_line(stream).await
+        }
+
+        // nark/peek
+        let peek = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"p\",\"method\":\"nark/peek\",\"params\":{{\"id\":\"{note_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(peek["id"], "p");
+        assert_eq!(peek["result"]["id"], note_id);
+        assert_eq!(peek["result"]["title"], "Socket Note");
+
+        // nark/read
+        let read = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"r\",\"method\":\"nark/read\",\"params\":{{\"id\":\"{note_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(read["result"]["body"], "Socket body text.");
+        assert_eq!(read["result"]["frontmatter"]["title"], "Socket Note");
+
+        // nark/stats
+        let stats = round_trip(&socket_path, "{\"id\":\"s\",\"method\":\"nark/stats\"}\n").await;
+        assert_eq!(stats["result"]["total_notes"], 1);
+        assert_eq!(stats["result"]["total_versions"], 1);
+
+        // Bad id -> clean error response, connection stays well-behaved.
+        let bad = round_trip(
+            &socket_path,
+            "{\"id\":\"b\",\"method\":\"nark/peek\",\"params\":{\"id\":\"ffffffff\"}}\n",
+        )
+        .await;
+        assert_eq!(bad["id"], "b");
+        assert_eq!(
+            bad["error"]["code"], -32602,
+            "bad id is invalid-params, not a panic"
+        );
+        assert!(bad.get("result").is_none());
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Slice 3.5 end-to-end: an authenticated client (its own uid mapped to an
+    /// agent) issues `nark/peek` and then `nark/search` over two one-shot
+    /// connections and gets correct, distinct responses. This exercises the full
+    /// assembled path — peer auth -> JSON-RPC framing -> router -> ReadPool ->
+    /// `registry::*` — for more than one method on a single running daemon.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn authenticated_client_peek_then_search_end_to_end() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        let (ctx, note_id) = seeded_ctx(&dir);
+
+        // Map the test process's own uid to a known agent so we authenticate.
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        async fn round_trip(socket_path: &Path, line: &str) -> serde_json::Value {
+            let mut stream = UnixStream::connect(socket_path)
+                .await
+                .expect("connect to socket");
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .expect("write request");
+            stream.flush().await.expect("flush request");
+            read_json_line(stream).await
+        }
+
+        // 1) nark/peek over its own one-shot connection.
+        let peek = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"pk\",\"method\":\"nark/peek\",\"params\":{{\"id\":\"{note_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(peek["id"], "pk");
+        assert_eq!(peek["result"]["id"], note_id);
+        assert_eq!(peek["result"]["title"], "Socket Note");
+        assert!(peek.get("error").is_none());
+
+        // 2) nark/search over a fresh one-shot connection. The seeded note has a
+        // distinctive body word ("Socket") that the query should match.
+        let search = round_trip(
+            &socket_path,
+            "{\"id\":\"se\",\"method\":\"nark/search\",\"params\":{\"query\":\"socket\"}}\n",
+        )
+        .await;
+        assert_eq!(search["id"], "se");
+        assert_eq!(search["result"]["query"], "socket");
+        assert_eq!(search["result"]["mode"], "normal");
+        assert!(
+            search["result"]["hits"].as_u64().unwrap() >= 1,
+            "the socket query should hit the seeded note"
+        );
+        assert_eq!(
+            search["result"]["results"][0]["id"], note_id,
+            "the seeded note should be the top search hit"
+        );
+        assert!(search.get("error").is_none());
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Slice 3.5: an unknown-uid connection is rejected *before any method runs*.
+    /// The client sends a well-formed `nark/peek` JSON-RPC request, but the
+    /// server (empty `AgentMap`) must answer with the plain `unauthorized` line
+    /// and close — never a JSON-RPC response — proving auth gates dispatch.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn unknown_uid_rejected_before_any_method_runs() {
+        use super::super::AgentMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+
+        // Empty map -> the connecting uid is unknown -> rejected at the app layer.
+        let agents = AgentMap::default();
+        let (ctx, note_id) = seeded_ctx(&dir);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        let mut stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to socket");
+        // A perfectly valid peek request: if auth did not gate dispatch, this
+        // would return a JSON-RPC result. The server must reject before running
+        // the method.
+        let request = format!(
+            "{{\"id\":\"x\",\"method\":\"nark/peek\",\"params\":{{\"id\":\"{note_id}\"}}}}\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write peek request");
+        stream.flush().await.expect("flush peek request");
+
+        // The very first line back must be the rejection, not a JSON-RPC reply.
+        let mut reply = String::new();
+        let mut reader = BufReader::new(stream);
+        reader
+            .read_line(&mut reply)
+            .await
+            .expect("read rejection line");
+        assert_eq!(
+            reply, "unauthorized\n",
+            "unknown uid must be rejected before nark/peek runs"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(reply.trim_end()).is_err(),
+            "rejection must not be a JSON-RPC response (no method ran)"
+        );
+
+        // And the connection is then closed (EOF), with no peek result trailing.
+        let mut rest = String::new();
+        let n = reader
+            .read_line(&mut rest)
+            .await
+            .expect("read after reject");
+        assert_eq!(
+            n, 0,
+            "server must close after rejecting; no method response follows"
+        );
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An authenticated unknown method returns a JSON-RPC `-32601` error echoing
+    /// the request id.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn authenticated_unknown_method_returns_32601() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+
+        let (ctx, _note_id) = seeded_ctx(&dir);
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        let mut stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to socket");
+        stream
+            .write_all(b"{\"id\":\"7\",\"method\":\"nope\"}\n")
+            .await
+            .expect("write request");
+        stream.flush().await.expect("flush request");
+
+        let v = read_json_line(stream).await;
+        assert_eq!(v["id"], "7", "error response should echo request id");
+        assert_eq!(v["error"]["code"], -32601, "unknown method is -32601");
+        assert_eq!(v["error"]["message"], "method not found");
+        assert!(v.get("result").is_none(), "error has no result");
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Malformed JSON on an authenticated connection returns a JSON-RPC
+    /// `-32700 parse error` with an empty id.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn authenticated_malformed_json_returns_32700() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+
+        let (ctx, _note_id) = seeded_ctx(&dir);
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        let mut stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to socket");
+        stream
+            .write_all(b"this is not json\n")
+            .await
+            .expect("write garbage");
+        stream.flush().await.expect("flush garbage");
+
+        let v = read_json_line(stream).await;
+        assert_eq!(v["id"], "", "parse error carries an empty id");
+        assert_eq!(v["error"]["code"], -32700, "malformed JSON is -32700");
+        assert_eq!(v["error"]["message"], "parse error");
 
         tx.send(()).expect("send shutdown");
         server.await.expect("server task join");
@@ -387,11 +919,14 @@ mod tests {
 
         // Empty map: the connecting uid is unknown -> rejected at app layer.
         let agents = AgentMap::default();
+        // Ctx is required by the loop signature but never reached: rejection
+        // precedes any RPC dispatch.
+        let (ctx, _note_id) = seeded_ctx(&dir);
 
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             bound
-                .serve_authenticated_until(agents, async {
+                .serve_authenticated_until(agents, ctx, async {
                     let _ = rx.await;
                 })
                 .await
@@ -450,11 +985,12 @@ mod tests {
         // Socket file exists once bound.
         assert!(socket_path.exists(), "socket file should exist after bind");
 
+        let (ctx, _note_id) = seeded_ctx(&dir);
         let (tx, rx) = oneshot::channel::<()>();
         let serve_path = socket_path.clone();
         let server = tokio::spawn(async move {
             bound
-                .serve_until(async {
+                .serve_until(ctx, async {
                     let _ = rx.await;
                 })
                 .await
@@ -463,16 +999,19 @@ mod tests {
             drop(serve_path);
         });
 
-        // Connect and exercise ping -> pong.
+        // Connect and exercise a JSON-RPC ping -> pong round-trip.
         let mut stream = UnixStream::connect(&socket_path)
             .await
             .expect("connect to socket");
-        stream.write_all(b"ping\n").await.expect("write ping");
-        stream.flush().await.expect("flush ping");
+        stream
+            .write_all(b"{\"id\":\"life\",\"method\":\"ping\"}\n")
+            .await
+            .expect("write ping request");
+        stream.flush().await.expect("flush ping request");
 
-        let mut buf = [0u8; 5];
-        stream.read_exact(&mut buf).await.expect("read pong");
-        assert_eq!(&buf, b"pong\n");
+        let v = read_json_line(stream).await;
+        assert_eq!(v["id"], "life", "response id should echo request id");
+        assert_eq!(v["result"]["pong"], true, "ping should yield pong=true");
 
         // Trigger shutdown and wait for the server task to finish.
         tx.send(()).expect("send shutdown");
@@ -606,6 +1145,7 @@ mod tests {
         let mut table = HashMap::new();
         table.insert(me, "tester".to_string());
         let agents = AgentMap::new(table);
+        let (ctx, _note_id) = seeded_ctx(&dir);
 
         // Short timeout so the test does not hang.
         let read_timeout = Duration::from_millis(150);
@@ -613,7 +1153,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             bound
-                .serve_authenticated_until_with_timeout(agents, read_timeout, async {
+                .serve_authenticated_until_with_timeout(agents, ctx, read_timeout, async {
                     let _ = rx.await;
                 })
                 .await
@@ -631,6 +1171,313 @@ mod tests {
             .expect("server should close the idle connection within the test budget")
             .expect("read to EOF");
         assert_eq!(read, 0, "idle connection should be closed at EOF, no bytes");
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- FIX 1: blocking pool checkout must not park a tokio worker ----
+
+    /// Seed a vault on disk (writer ingests one note, drops) and return its dir.
+    /// Used by the saturation test, which then opens its own sized pool.
+    fn seeded_vault_dir() -> PathBuf {
+        use crate::registry::write::commit_version;
+        use crate::vault::fs::Vault;
+
+        const NOTE: &str = "---\n\
+title: Saturation Note\n\
+author: tester\n\
+domain: engineering\n\
+intent: reference\n\
+kind: note\n\
+status: active\n\
+tags:\n\
+  - delta\n\
+---\n\
+Saturation body text.\n";
+
+        let dir = temp_socket_dir();
+        std::fs::create_dir_all(&dir).expect("create vault dir");
+        let conn = crate::db::open_registry(&dir).expect("open writer registry");
+        let vault = Vault::new(dir.clone());
+        let result = vault.ingest(NOTE, None).expect("ingest note");
+        commit_version(&conn, &result).expect("commit version");
+        drop(conn);
+        dir
+    }
+
+    /// FIX 1 — when every read-pool connection is held busy, a concurrent
+    /// `ping`-style request still makes progress within a short timeout, proving
+    /// the blocking pool checkout (and the synchronous `dispatch` it sits under)
+    /// runs on a `spawn_blocking` thread rather than parking a tokio worker and
+    /// starving the accept loop. The `dispatch` runs on a worker-limited runtime
+    /// so a parked worker would deadlock the runtime within the test budget.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn saturated_pool_does_not_block_concurrent_request() {
+        use super::super::AgentMap;
+        use super::super::readpool::ReadPool;
+        use std::collections::HashMap;
+
+        const N: usize = 2;
+
+        // A 1-worker multi-thread runtime: if the synchronous dispatch ran on the
+        // async worker, a blocking pool checkout would park the only worker and
+        // the concurrent ping could never be driven, tripping the timeout.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let dir = seeded_vault_dir();
+            let socket_path = dir.join("nark.sock");
+            let bound = BoundListener::bind(&socket_path).expect("bind listener");
+
+            // One pool of N conns, shared between the daemon `Ctx` and this test
+            // (which holds the other handle to occupy every connection).
+            let pool = Arc::new(ReadPool::open_with_size(&dir, N).expect("open read pool"));
+            let ctx = Arc::new(Ctx::new_shared(Arc::clone(&pool), dir.clone()));
+
+            let me = nix::unistd::getuid().as_raw();
+            let mut table = HashMap::new();
+            table.insert(me, "tester".to_string());
+            let agents = AgentMap::new(table);
+
+            let (tx, rx) = oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                bound
+                    .serve_authenticated_until(agents, ctx, async {
+                        let _ = rx.await;
+                    })
+                    .await
+                    .expect("serve loop");
+            });
+
+            // Occupy ALL N pool connections on blocking threads: each enters
+            // `with_conn`, signals "checked out" via a barrier, then blocks the
+            // blocking thread on a release barrier so the conn stays checked out.
+            // The hold barrier has N+1 parties (the N holders + this task) so we
+            // know every connection is checked out before we fire the ping. The
+            // release barrier (also N+1) is purely synchronous, so the blocking
+            // closure never needs to touch the async runtime.
+            let hold_barrier = Arc::new(std::sync::Barrier::new(N + 1));
+            let release_barrier = Arc::new(std::sync::Barrier::new(N + 1));
+            let mut holders = Vec::new();
+            for _ in 0..N {
+                let pool = Arc::clone(&pool);
+                let hold_barrier = Arc::clone(&hold_barrier);
+                let release_barrier = Arc::clone(&release_barrier);
+                holders.push(tokio::task::spawn_blocking(move || {
+                    pool.with_conn(|_conn| {
+                        hold_barrier.wait();
+                        release_barrier.wait();
+                        Ok(())
+                    })
+                    .expect("hold conn");
+                }));
+            }
+            // Wait (off the async worker) until all N connections are confirmed
+            // checked out, so the pool is fully saturated before the ping.
+            tokio::task::spawn_blocking({
+                let hold_barrier = Arc::clone(&hold_barrier);
+                move || hold_barrier.wait()
+            })
+            .await
+            .expect("barrier join");
+
+            // Fire a pool-NEEDING request (`nark/stats`) while the pool is fully
+            // saturated. Its dispatch must block on the Condvar checkout until a
+            // holder releases. If that dispatch ran on the async worker, it would
+            // park the runtime's only worker — the discriminating condition.
+            let blocked = tokio::spawn({
+                let socket_path = socket_path.clone();
+                async move {
+                    let mut stream = UnixStream::connect(&socket_path)
+                        .await
+                        .expect("connect to socket");
+                    stream
+                        .write_all(b"{\"id\":\"blk\",\"method\":\"nark/stats\"}\n")
+                        .await
+                        .expect("write stats");
+                    stream.flush().await.expect("flush stats");
+                    read_json_line(stream).await
+                }
+            });
+
+            // Give the blocked stats request time to reach the checkout (it cannot
+            // complete: every connection is held). Then a concurrent `ping` must
+            // STILL round-trip promptly. Under synchronous dispatch the worker is
+            // parked on the stats checkout and this ping would time out.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let ping = async {
+                let mut stream = UnixStream::connect(&socket_path)
+                    .await
+                    .expect("connect to socket");
+                stream
+                    .write_all(b"{\"id\":\"sat\",\"method\":\"ping\"}\n")
+                    .await
+                    .expect("write ping");
+                stream.flush().await.expect("flush ping");
+                read_json_line(stream).await
+            };
+            let v = tokio::time::timeout(Duration::from_secs(5), ping)
+                .await
+                .expect("ping must make progress while the pool is saturated");
+            assert_eq!(v["id"], "sat");
+            assert_eq!(v["result"]["pong"], true);
+
+            // Release the holders (rendezvous on the release barrier off the async
+            // worker); the previously-blocked stats request now completes.
+            tokio::task::spawn_blocking(move || release_barrier.wait())
+                .await
+                .expect("release barrier join");
+            for h in holders {
+                h.await.expect("holder join");
+            }
+            let stats = tokio::time::timeout(Duration::from_secs(5), blocked)
+                .await
+                .expect("blocked stats must complete once the pool frees up")
+                .expect("stats task join");
+            assert_eq!(stats["id"], "blk");
+            assert_eq!(stats["result"]["total_notes"], 1);
+            tx.send(()).expect("send shutdown");
+            server.await.expect("server task join");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    // ---- FIX 2: capped request-line read ----
+
+    /// FIX 2 — an authenticated connection that streams bytes without a newline
+    /// past the (test-injected small) cap is answered with a `-32600 request too
+    /// large` error and the connection is closed cleanly — it does not hang until
+    /// the read timeout nor grow the buffer unbounded.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn oversize_request_gets_invalid_request_and_clean_close() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+        let (ctx, _note_id) = seeded_ctx(&dir);
+
+        // Small injected cap so the test sends a modest over-size payload. Generous
+        // read timeout so a hang (not the cap) would be the failure, not a timeout.
+        let max_request_bytes: u64 = 64;
+        let read_timeout = Duration::from_secs(30);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until_with_limits(
+                    agents,
+                    ctx,
+                    read_timeout,
+                    max_request_bytes,
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await
+                .expect("serve loop");
+        });
+
+        let mut stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to socket");
+        // Send more than the cap with NO newline: the server must cut us off at the
+        // cap and answer with an error rather than waiting for a newline.
+        let payload = vec![b'x'; (max_request_bytes as usize) * 4];
+        stream.write_all(&payload).await.expect("write oversize");
+        stream.flush().await.expect("flush oversize");
+
+        // The reply must be the `-32600 request too large` error, arriving well
+        // within the read timeout (the cap, not the timeout, ends the read).
+        let mut reader = BufReader::new(stream);
+        let mut reply = String::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut reply))
+            .await
+            .expect("oversize request must be answered promptly, not after the read timeout")
+            .expect("read error line");
+        assert!(read > 0, "server should send an error line, not just EOF");
+        let v: serde_json::Value =
+            serde_json::from_str(reply.trim_end()).expect("error reply is JSON");
+        assert_eq!(v["id"], "", "request-too-large carries an empty id");
+        assert_eq!(v["error"]["code"], -32600, "over-size request is -32600");
+        assert_eq!(v["error"]["message"], "request too large");
+
+        // After the error the connection is closed (EOF), no second response.
+        let mut rest = String::new();
+        let n = reader.read_line(&mut rest).await.expect("read after error");
+        assert_eq!(n, 0, "server must close after the over-size error");
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FIX 2 — a normal-size request still round-trips under the same explicit
+    /// limits path (a small cap that comfortably fits the request), proving the
+    /// cap does not break the happy path.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn normal_request_still_works_under_explicit_cap() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+        let (ctx, _note_id) = seeded_ctx(&dir);
+
+        // 256-byte cap comfortably fits the ping request line below.
+        let max_request_bytes: u64 = 256;
+        let read_timeout = Duration::from_secs(30);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until_with_limits(
+                    agents,
+                    ctx,
+                    read_timeout,
+                    max_request_bytes,
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await
+                .expect("serve loop");
+        });
+
+        let mut stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to socket");
+        stream
+            .write_all(b"{\"id\":\"ok\",\"method\":\"ping\"}\n")
+            .await
+            .expect("write ping");
+        stream.flush().await.expect("flush ping");
+
+        let v = read_json_line(stream).await;
+        assert_eq!(v["id"], "ok");
+        assert_eq!(v["result"]["pong"], true);
+        assert!(v.get("error").is_none());
 
         tx.send(()).expect("send shutdown");
         server.await.expect("server task join");
