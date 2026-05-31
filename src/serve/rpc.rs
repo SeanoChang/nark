@@ -31,7 +31,6 @@ use super::dpool::{self, RoManager};
 use super::embed_permit;
 use super::methods_read;
 use super::methods_read::{OrientParams, SearchParams};
-use super::readpool::ReadPool;
 use crate::wire::{RPCRequest, RPCResponse};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,58 +51,52 @@ const INVALID_PARAMS: i64 = -32602;
 /// Per-daemon context the router hands to the read methods plus the vault root
 /// (needed by `nark/read` to resolve CAS object paths).
 ///
-/// During Phase 3.5 the read path is split across two pools, both over
-/// `<vault_dir>/registry.db` and both strictly read-only:
+/// As of Phase 3.5 the whole read path runs over a single [`deadpool`]-managed,
+/// strictly read-only pool against `<vault_dir>/registry.db`:
 ///
-/// * `dpool` — the [`deadpool`]-managed pool ([`super::dpool`]). The cheap
-///   methods (`peek` / `read` / `stats`) check a connection out of it and run
-///   their blocking SQLite on a managed thread via `conn.interact(...)`; `get()`
-///   backpressures when every connection is busy (slice 3.5.2). It is [`Clone`]
-///   (internally `Arc`-based), so tests can hold a second handle to drive
-///   contention.
-/// * `ro_pool` — the hand-rolled [`ReadPool`] from Phase 3, kept only for the
-///   embedding-bearing methods (`search` / `orient`), which still run their
-///   blocking work (including ONNX inference) on a `spawn_blocking` thread this
-///   slice. Slice 3.5.4 migrates them onto `dpool` and removes this field.
+/// * `dpool` — the [`deadpool`]-managed pool ([`super::dpool`]). **Every** read
+///   method (`peek` / `read` / `stats` / `search` / `orient`) checks a connection
+///   out of it and runs its blocking SQLite on a managed thread via
+///   `conn.interact(...)`; `get()` backpressures when every connection is busy.
+///   It is [`Clone`] (internally `Arc`-based), so tests can hold a second handle
+///   to drive contention. Slice 3.5.4 migrated `search`/`orient` onto it (off the
+///   hand-rolled `ReadPool`), so there is no second pool any more.
 ///
 /// `embed_sem` is the bounded embedding-worker semaphore (slice 3.5.3): an
 /// `Arc<Semaphore>` with [`embed_permit::DEFAULT_EMBED_PERMITS`] permits that
-/// caps how many ONNX inferences run concurrently. It is landed here as the 2B
-/// primitive; slice 3.5.4 routes `search`/`orient`'s inference step through
-/// [`embed_permit::with_embed_permit`] using it, so it reads as unused on the
-/// binary target until then (exercised by the `embed_permit` tests).
+/// caps how many ONNX inferences run concurrently. As of slice 3.5.4 the
+/// `search` method's inference step runs through
+/// [`embed_permit::with_embed_permit`] using it — the embedding work happens
+/// under a permit and **outside** any DB checkout (the 2B payoff), so a burst of
+/// `search` load cannot hold a connection across inference and stall cheap reads.
 pub struct Ctx {
     dpool: Pool<RoManager>,
-    ro_pool: Arc<ReadPool>,
-    #[allow(dead_code)]
     embed_sem: Arc<Semaphore>,
     vault_dir: PathBuf,
 }
 
 impl Ctx {
-    /// Build a context, opening both read-only pools against `vault_dir`.
+    /// Build a context, opening the read-only pool against `vault_dir`.
     ///
-    /// The registry must already exist (the writer owns creation/migration); both
-    /// pools open it read-only. Async because the [`deadpool`] pool is built on
+    /// The registry must already exist (the writer owns creation/migration); the
+    /// pool opens it read-only. Async because the [`deadpool`] pool is built on
     /// the tokio runtime. Used by the serve daemon path.
     pub async fn open(vault_dir: &Path) -> anyhow::Result<Self> {
         Ok(Self {
             dpool: dpool::open_ro_pool(vault_dir, dpool::DEFAULT_POOL_SIZE).await?,
-            ro_pool: Arc::new(ReadPool::open(vault_dir)?),
             embed_sem: embed_permit::default_embed_semaphore(),
             vault_dir: vault_dir.to_path_buf(),
         })
     }
 
-    /// Build a context from already-open pools and vault dir. Lets tests inject
-    /// sized pools without re-opening. The [`deadpool`] pool is [`Clone`], so a
+    /// Build a context from an already-open pool and vault dir. Lets tests inject
+    /// a sized pool without re-opening. The [`deadpool`] pool is [`Clone`], so a
     /// test can keep a second handle (to occupy every connection) while the
     /// daemon dispatches against it.
     #[cfg(test)]
-    pub fn new(dpool: Pool<RoManager>, ro_pool: ReadPool, vault_dir: PathBuf) -> Self {
+    pub fn new(dpool: Pool<RoManager>, vault_dir: PathBuf) -> Self {
         Self {
             dpool,
-            ro_pool: Arc::new(ro_pool),
             embed_sem: embed_permit::default_embed_semaphore(),
             vault_dir,
         }
@@ -118,15 +111,14 @@ impl Ctx {
 /// produces `-32602 invalid params`. Every path echoes the request id, so a
 /// client always gets exactly one response per request and never a panic.
 ///
-/// `dispatch` is `async`: the cheap methods (`peek` / `read` / `stats`) check a
-/// connection out of the [`deadpool`] pool and run their blocking SQLite on a
-/// managed thread via `conn.interact(...).await`, so they never park a tokio
-/// worker (the listener awaits this directly — no `spawn_blocking` wrapper). The
-/// embedding-bearing methods (`search` / `orient`) still run on the hand-rolled
-/// [`ReadPool`], whose checkout blocks on a `Condvar`; until slice 3.5.4 moves
-/// them onto the deadpool path, this routes them through
-/// [`tokio::task::spawn_blocking`] so that blocking checkout (and the ONNX
-/// inference under it) cannot park a worker either.
+/// `dispatch` is `async`: **every** read method (`peek` / `read` / `stats` /
+/// `search` / `orient`) checks a connection out of the [`deadpool`] pool and runs
+/// its blocking SQLite on a managed thread via `conn.interact(...).await`, so
+/// none ever parks a tokio worker (the listener awaits this directly — no
+/// `spawn_blocking` wrapper). For `search`, the ONNX query embedding runs under
+/// an embedding permit and **outside** the DB checkout (slice 3.5.4), so a burst
+/// of `search` load cannot hold a connection across inference and stall the cheap
+/// reads (no head-of-line blocking).
 pub async fn dispatch(ctx: &Ctx, req: &RPCRequest) -> RPCResponse {
     match req.method.as_str() {
         "ping" => RPCResponse::result(req.id.clone(), json!({"pong": true})),
@@ -143,39 +135,21 @@ pub async fn dispatch(ctx: &Ctx, req: &RPCRequest) -> RPCResponse {
         },
         "nark/stats" => result_or_invalid(req, methods_read::stats(&ctx.dpool).await),
         "nark/search" => match search_params(req) {
-            Ok(params) => result_or_invalid(req, blocking_search(ctx, params).await),
+            Ok(params) => result_or_invalid(
+                req,
+                methods_read::search(&ctx.dpool, &ctx.embed_sem, &ctx.vault_dir, &params).await,
+            ),
             Err(resp) => resp,
         },
         "nark/orient" => match orient_params(req) {
-            Ok(params) => result_or_invalid(req, blocking_orient(ctx, params).await),
+            Ok(params) => result_or_invalid(
+                req,
+                methods_read::orient(&ctx.dpool, &ctx.vault_dir, &params).await,
+            ),
             Err(resp) => resp,
         },
         _ => RPCResponse::error(req.id.clone(), METHOD_NOT_FOUND, "method not found", None),
     }
-}
-
-/// Run `search` on a [`tokio::task::spawn_blocking`] thread. `search` still uses
-/// the hand-rolled [`ReadPool`] (blocking `Condvar` checkout) and may run ONNX
-/// inference, so it must not execute on an async worker. A panic in the blocking
-/// task surfaces as an `Err` (joined below), which the router maps to a clean
-/// `-32602` rather than tearing down the connection. Removed in slice 3.5.4 when
-/// `search` moves onto the deadpool `interact` path.
-async fn blocking_search(ctx: &Ctx, params: SearchParams) -> anyhow::Result<Value> {
-    let pool = Arc::clone(&ctx.ro_pool);
-    let vault_dir = ctx.vault_dir.clone();
-    tokio::task::spawn_blocking(move || methods_read::search(&pool, &vault_dir, &params))
-        .await
-        .map_err(|e| anyhow::anyhow!("search task join: {e}"))?
-}
-
-/// Run `orient` on a [`tokio::task::spawn_blocking`] thread, for the same reason
-/// as [`blocking_search`]. Removed in slice 3.5.4.
-async fn blocking_orient(ctx: &Ctx, params: OrientParams) -> anyhow::Result<Value> {
-    let pool = Arc::clone(&ctx.ro_pool);
-    let vault_dir = ctx.vault_dir.clone();
-    tokio::task::spawn_blocking(move || methods_read::orient(&pool, &vault_dir, &params))
-        .await
-        .map_err(|e| anyhow::anyhow!("orient task join: {e}"))?
 }
 
 /// Parse the `nark/search` `params` object into [`SearchParams`].
@@ -378,16 +352,14 @@ tags:\n\
 ---\n\
 Router body text.\n";
 
-    /// Build a [`Ctx`] over `dir`'s seeded registry: the deadpool pool the cheap
-    /// methods check out from, and the hand-rolled [`ReadPool`] search/orient
-    /// still use this slice. Async because the deadpool pool is built on the
-    /// runtime.
+    /// Build a [`Ctx`] over `dir`'s seeded registry: the single deadpool pool
+    /// every read method (cheap reads plus `search`/`orient`) checks out from as
+    /// of slice 3.5.4. Async because the deadpool pool is built on the runtime.
     async fn ctx_for(dir: &std::path::Path) -> Ctx {
         let dpool = dpool::open_ro_pool(dir, 2)
             .await
             .expect("open deadpool pool");
-        let ro_pool = ReadPool::open_with_size(dir, 2).expect("open read pool");
-        Ctx::new(dpool, ro_pool, dir.to_path_buf())
+        Ctx::new(dpool, dir.to_path_buf())
     }
 
     /// Seed a temp vault with one note (writer creates/migrates/seeds), drop the

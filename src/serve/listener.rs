@@ -235,12 +235,13 @@ impl BoundListener {
     /// [`READ_TIMEOUT`] / [`MAX_REQUEST_BYTES`].
     ///
     /// Each connection's JSON-RPC dispatch is awaited directly (see
-    /// [`handle_authenticated_connection`]): the cheap methods run their blocking
+    /// [`handle_authenticated_connection`]): every read method runs its blocking
     /// SQLite via the deadpool pool's `interact` (own thread) and `get().await`
     /// backpressures, so a saturated pool can never park a tokio worker and starve
-    /// the accept loop / shutdown future (Spec §10). The hand-rolled `ReadPool`
-    /// still backs `search` / `orient`, which `dispatch` runs via `spawn_blocking`
-    /// until slice 3.5.4 migrates them.
+    /// the accept loop / shutdown future (Spec §10). As of slice 3.5.4 `search` /
+    /// `orient` run on the same deadpool pool, and `search`'s ONNX inference runs
+    /// under an embedding permit **outside** the DB checkout, so no `spawn_blocking`
+    /// wrapper remains.
     pub async fn serve_authenticated_until_with_limits<F>(
         &self,
         agents: AgentMap,
@@ -336,16 +337,16 @@ async fn handle_connection(stream: UnixStream, ctx: &Ctx) -> Result<()> {
 /// 4. Dispatch via [`rpc::dispatch`] and write the single [`RPCResponse`] as one
 ///    JSON line + newline.
 ///
-/// [`rpc::dispatch`] is now `async`: the cheap methods (`peek` / `read` /
-/// `stats`) check a connection out of the [`deadpool`] pool and run their
-/// blocking SQLite on a managed thread via `conn.interact(...).await`, so this
-/// handler can `await` the dispatch directly — there is no `spawn_blocking`
-/// wrapper around it anymore (slice 3.5.2). The reactor stays free even when the
-/// pool is saturated: `pool.get().await` backpressures and `interact` owns its
-/// own blocking thread, so no tokio worker is parked (Spec §10: reads must never
-/// block the reactor). The embedding-bearing methods (`search` / `orient`) still
-/// run on the hand-rolled `ReadPool`; `dispatch` routes those through
-/// `spawn_blocking` internally (removed in slice 3.5.4).
+/// [`rpc::dispatch`] is now `async`: every read method (`peek` / `read` /
+/// `stats` / `search` / `orient`) checks a connection out of the [`deadpool`]
+/// pool and runs its blocking SQLite on a managed thread via
+/// `conn.interact(...).await`, so this handler can `await` the dispatch directly
+/// — there is no `spawn_blocking` wrapper around it (slice 3.5.2/3.5.4). The
+/// reactor stays free even when the pool is saturated: `pool.get().await`
+/// backpressures and `interact` owns its own blocking thread, so no tokio worker
+/// is parked (Spec §10: reads must never block the reactor). `search`'s ONNX
+/// inference runs under a bounded embedding permit and **outside** the DB
+/// checkout (slice 3.5.4), so it never holds a connection across inference.
 ///
 /// The accept loop is unaffected by the per-connection timeout because this runs
 /// inside the spawned per-connection task.
@@ -661,8 +662,8 @@ Socket body text.\n";
     /// Slice 3.5 end-to-end: an authenticated client (its own uid mapped to an
     /// agent) issues `nark/peek` and then `nark/search` over two one-shot
     /// connections and gets correct, distinct responses. This exercises the full
-    /// assembled path — peer auth -> JSON-RPC framing -> router -> ReadPool ->
-    /// `registry::*` — for more than one method on a single running daemon.
+    /// assembled path — peer auth -> JSON-RPC framing -> router -> deadpool pool
+    /// -> `registry::*` — for more than one method on a single running daemon.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn authenticated_client_peek_then_search_end_to_end() {
@@ -1231,7 +1232,6 @@ Saturation body text.\n";
     fn saturated_pool_does_not_block_concurrent_request() {
         use super::super::AgentMap;
         use super::super::dpool::open_ro_pool;
-        use super::super::readpool::ReadPool;
         use std::collections::HashMap;
 
         const N: usize = 2;
@@ -1252,11 +1252,10 @@ Saturation body text.\n";
 
             // One deadpool of N conns, shared between the daemon `Ctx` and this
             // test (the pool is `Clone`/`Arc`-backed, so the daemon and the test
-            // checkout from the same pool). The `ReadPool` only backs search/orient
-            // this slice; the cheap `nark/stats` below uses the deadpool.
+            // checkout from the same pool). As of slice 3.5.4 this single pool
+            // backs every read method; the cheap `nark/stats` below uses it.
             let dpool = open_ro_pool(&dir, N).await.expect("open deadpool pool");
-            let ro_pool = ReadPool::open_with_size(&dir, N).expect("open read pool");
-            let ctx = Arc::new(Ctx::new(dpool.clone(), ro_pool, dir.clone()));
+            let ctx = Arc::new(Ctx::new(dpool.clone(), dir.clone()));
 
             let me = nix::unistd::getuid().as_raw();
             let mut table = HashMap::new();

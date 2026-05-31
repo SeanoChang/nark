@@ -9,12 +9,21 @@
 //! design:
 //!
 //! * registry access is read-only — instead of a fresh writable
-//!   `db::open_registry`, the cheap methods ([`peek`] / [`read`] / [`stats`])
-//!   check out a connection from the [`deadpool`]-managed read-only pool
-//!   ([`super::dpool`]) and run their blocking SQLite on a managed thread via
-//!   `conn.interact(...)` (slice 3.5.2); the embedding-bearing methods
-//!   ([`search`] / [`orient`]) still use the hand-rolled
-//!   [`ReadPool`](super::readpool::ReadPool) until slice 3.5.4 migrates them;
+//!   `db::open_registry`, every method ([`peek`] / [`read`] / [`stats`] /
+//!   [`search`] / [`orient`]) checks out a connection from the
+//!   [`deadpool`]-managed read-only pool ([`super::dpool`]) and runs its blocking
+//!   SQLite on a managed thread via `conn.interact(...)`. As of slice 3.5.4 the
+//!   embedding-bearing methods ([`search`] / [`orient`]) are migrated onto the
+//!   same pool — the hand-rolled [`ReadPool`](super::readpool::ReadPool) no
+//!   longer backs them;
+//! * the embedding work in [`search`] / [`orient`] (the ONNX query embedding) is
+//!   computed **outside** any DB checkout (slice 3.5.4, the 2B payoff): the
+//!   method first acquires an embedding permit (bounding inference concurrency)
+//!   and builds the cosine context with no connection held, then checks out a
+//!   connection for the query alone. A connection is therefore never held across
+//!   ONNX inference, so a burst of `search` load cannot stall the cheap reads
+//!   ([`peek`] / [`read`] / [`stats`]) by holding the pool through inference
+//!   (no head-of-line blocking);
 //! * [`read`] does **not** call `access::bump_access` — that is a write, and the
 //!   pool's connection is read-only. The serve read path is side-effect-free; if
 //!   access tracking over the socket is wanted it belongs to a later write-path
@@ -27,14 +36,16 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
 use deadpool::managed::Pool;
+use tokio::sync::Semaphore;
 
 use super::dpool::RoManager;
-use super::readpool::ReadPool;
+use super::embed_permit::with_embed_permit;
 use crate::cli::search::parse_temporal;
 use crate::cli::util::truncate_at_word;
 use crate::config;
@@ -210,7 +221,20 @@ fn interact_err(e: deadpool_sync::InteractError) -> anyhow::Error {
 /// unavailable: [`build_cosine_context`] returns `None` and the search runs on
 /// BM25 + engagement instead of failing. The `bm25`/`semantic` flags are
 /// mutually exclusive, matching the CLI's `--bm25`/`--semantic` guard.
-pub fn search(pool: &ReadPool, vault_dir: &Path, params: &SearchParams) -> Result<Value> {
+///
+/// Slice 3.5.4 split (the 2B payoff): the cosine context — including the ONNX
+/// query embedding — is built **before** any DB checkout for the query, under an
+/// embedding permit and with no connection held (see [`build_cosine_context`]).
+/// Only once the (optional) context is in hand does this check a connection out
+/// of `pool` and run [`search::search`] under it. A connection is therefore
+/// never held across ONNX inference, so a burst of `search`/`orient` cannot stall
+/// the cheap reads by occupying the pool through inference.
+pub async fn search(
+    pool: &Pool<RoManager>,
+    embed_sem: &Arc<Semaphore>,
+    vault_dir: &Path,
+    params: &SearchParams,
+) -> Result<Value> {
     if params.bm25 && params.semantic {
         anyhow::bail!("bm25 and semantic are mutually exclusive");
     }
@@ -218,7 +242,6 @@ pub fn search(pool: &ReadPool, vault_dir: &Path, params: &SearchParams) -> Resul
     let cfg = config::load(vault_dir)?;
     let since_ts = params.since.as_deref().map(parse_temporal).transpose()?;
     let before_ts = params.before.as_deref().map(parse_temporal).transpose()?;
-    let vault = Vault::new(vault_dir.to_path_buf());
 
     let mode = if params.bm25 {
         SearchMode::Bm25Only
@@ -228,67 +251,83 @@ pub fn search(pool: &ReadPool, vault_dir: &Path, params: &SearchParams) -> Resul
         SearchMode::Normal
     };
 
-    pool.with_conn(|conn| {
-        let filters = SearchFilters {
-            domain: params.domain.as_deref(),
-            kind: params.kind.as_deref(),
-            intent: params.intent.as_deref(),
-            tags: &params.tags,
-            since: since_ts.as_deref(),
-            before: before_ts.as_deref(),
-            limit: params.limit,
-        };
+    // STEP 1 — embedding work, OUTSIDE any DB checkout for the query. Build the
+    // cosine context if we want one (not BM25-only, non-empty query): a short
+    // `interact` loads the stored vectors, then the ONNX query embedding runs
+    // under an embedding permit with NO connection held. Skipped for BM25-only,
+    // mirroring the CLI. Degrades to `None` (BM25 + engagement) on any failure.
+    let cosine_ctx = if mode != SearchMode::Bm25Only && !params.query.is_empty() {
+        build_cosine_context(pool, embed_sem, vault_dir, &cfg, &params.query).await
+    } else {
+        None
+    };
 
-        // Build cosine context if embeddings are available and there's a query.
-        // Skip for BM25-only mode (doesn't use cosine), mirroring the CLI.
-        let cosine_ctx = if mode != SearchMode::Bm25Only
-            && !params.query.is_empty()
-            && embeddings::has_embeddings(conn)
-        {
-            build_cosine_context(vault_dir, &cfg, conn, &params.query)
-        } else {
-            None
-        };
+    // STEP 2 — the query, holding a DB connection ONLY for this (never during
+    // inference). `search::search` + snippet backfill run on the managed thread.
+    let vault_dir = vault_dir.to_path_buf();
+    let query = params.query.clone();
+    let domain = params.domain.clone();
+    let kind = params.kind.clone();
+    let intent = params.intent.clone();
+    let tags = params.tags.clone();
+    let limit = params.limit;
+    let search_cfg = cfg.search.clone();
 
-        let mut hits = search::search(
-            conn,
-            &params.query,
-            &filters,
-            &cfg.search,
-            cosine_ctx.as_ref(),
-            mode,
-        )?;
+    pool.get()
+        .await?
+        .interact(move |conn| {
+            let vault = Vault::new(vault_dir);
+            let filters = SearchFilters {
+                domain: domain.as_deref(),
+                kind: kind.as_deref(),
+                intent: intent.as_deref(),
+                tags: &tags,
+                since: since_ts.as_deref(),
+                before: before_ts.as_deref(),
+                limit,
+            };
 
-        fill_missing_snippets(conn, &vault, &params.query, &mut hits);
+            let mut hits = search::search(
+                conn,
+                &query,
+                &filters,
+                &search_cfg,
+                cosine_ctx.as_ref(),
+                mode,
+            )?;
 
-        let results: Vec<Value> = hits
-            .iter()
-            .map(|h| {
-                json!({
-                    "id": h.note_id,
-                    "title": h.title,
-                    "domain": h.domain,
-                    "kind": h.kind,
-                    "snippet": h.snippet,
-                    "rank": h.rank,
-                    "links_in": h.links_in,
-                    "links_out": h.links_out,
+            fill_missing_snippets(conn, &vault, &query, &mut hits);
+
+            let results: Vec<Value> = hits
+                .iter()
+                .map(|h| {
+                    json!({
+                        "id": h.note_id,
+                        "title": h.title,
+                        "domain": h.domain,
+                        "kind": h.kind,
+                        "snippet": h.snippet,
+                        "rank": h.rank,
+                        "links_in": h.links_in,
+                        "links_out": h.links_out,
+                    })
                 })
-            })
-            .collect();
+                .collect();
 
-        Ok(json!({
-            "query": params.query,
-            "domain": params.domain,
-            "mode": match mode {
-                SearchMode::Bm25Only => "bm25",
-                SearchMode::Semantic => "semantic",
-                SearchMode::Normal => "normal",
-            },
-            "hits": results.len(),
-            "results": results,
-        }))
-    })
+            Ok(json!({
+                "query": query,
+                "domain": domain,
+                "mode": match mode {
+                    SearchMode::Bm25Only => "bm25",
+                    SearchMode::Semantic => "semantic",
+                    SearchMode::Normal => "normal",
+                },
+                "hits": results.len(),
+                "results": results,
+            }))
+        })
+        .await
+        .map_err(interact_err)?
 }
 
 /// `nark/orient`: a markdown vault briefing, mirroring `cli::orient`.
@@ -303,25 +342,81 @@ pub fn search(pool: &ReadPool, vault_dir: &Path, params: &SearchParams) -> Resul
 /// surfaced note — the serve read path is read-only and side-effect-free (the
 /// pool's connection is read-only; see the module docs). The returned `Value` is
 /// the briefing markdown as a JSON string.
-pub fn orient(pool: &ReadPool, vault_dir: &Path, params: &OrientParams) -> Result<Value> {
+///
+/// Slice 3.5.4: migrated off the hand-rolled [`ReadPool`] onto the
+/// [`deadpool`]-managed pool, running its blocking SQLite on a managed thread via
+/// `conn.interact(...)`. `orient` passes no cosine context to [`search::search`]
+/// (same as the CLI and Phase 3), so there is no ONNX inference to lift out of
+/// the checkout here — the connection is held only for the (cheap) query and
+/// briefing assembly.
+pub async fn orient(
+    pool: &Pool<RoManager>,
+    vault_dir: &Path,
+    params: &OrientParams,
+) -> Result<Value> {
     let cfg = config::load(vault_dir)?;
     let since_ts = params.since.as_deref().map(parse_temporal).transpose()?;
     let before_ts = params.before.as_deref().map(parse_temporal).transpose()?;
-    let vault = Vault::new(vault_dir.to_path_buf());
 
-    pool.with_conn(|conn| {
+    let vault_dir = vault_dir.to_path_buf();
+    let query = params.query.clone();
+    let domain = params.domain.clone();
+    let kind = params.kind.clone();
+    let tags = params.tags.clone();
+    let limit = params.limit;
+    let search_cfg = cfg.search.clone();
+
+    pool.get()
+        .await?
+        .interact(move |conn| {
+            orient_briefing(
+                conn,
+                &vault_dir,
+                &search_cfg,
+                query.as_deref(),
+                domain.as_deref(),
+                kind.as_deref(),
+                &tags,
+                limit,
+                since_ts.as_deref(),
+                before_ts.as_deref(),
+            )
+        })
+        .await
+        .map_err(interact_err)?
+}
+
+/// Build the `nark/orient` briefing markdown against a checked-out read-only
+/// connection. Factored out of [`orient`] so the blocking work is a single
+/// `'static` closure body the `interact` thread runs; the logic is unchanged
+/// from Phase 3 (no cosine context, `intent` pinned to `None`, no access bump).
+#[allow(clippy::too_many_arguments)]
+fn orient_briefing(
+    conn: &rusqlite::Connection,
+    vault_dir: &Path,
+    search_cfg: &config::SearchConfig,
+    query: Option<&str>,
+    domain: Option<&str>,
+    kind: Option<&str>,
+    tags: &[String],
+    limit: usize,
+    since: Option<&str>,
+    before: Option<&str>,
+) -> Result<Value> {
+    let vault = Vault::new(vault_dir.to_path_buf());
+    {
         let filters = SearchFilters {
-            domain: params.domain.as_deref(),
-            kind: params.kind.as_deref(),
+            domain,
+            kind,
             intent: None,
-            tags: &params.tags,
-            since: since_ts.as_deref(),
-            before: before_ts.as_deref(),
-            limit: params.limit,
+            tags,
+            since,
+            before,
+            limit,
         };
 
-        let q = params.query.as_deref().unwrap_or("");
-        let hits = search::search(conn, q, &filters, &cfg.search, None, SearchMode::Normal)?;
+        let q = query.unwrap_or("");
+        let hits = search::search(conn, q, &filters, search_cfg, None, SearchMode::Normal)?;
 
         let mut md = String::new();
         let display_query = if q.is_empty() { "vault" } else { q };
@@ -370,17 +465,17 @@ pub fn orient(pool: &ReadPool, vault_dir: &Path, params: &OrientParams) -> Resul
         );
         let mut sql_params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(seven_days_ago)];
         let mut pi = 2usize;
-        if let Some(d) = params.domain.as_deref() {
+        if let Some(d) = domain {
             sql.push_str(&format!(" AND cn.domain = ?{}", pi));
             sql_params.push(Box::new(d.to_string()));
             pi += 1;
         }
-        if let Some(k) = params.kind.as_deref() {
+        if let Some(k) = kind {
             sql.push_str(&format!(" AND cn.kind = ?{}", pi));
             sql_params.push(Box::new(k.to_string()));
             pi += 1;
         }
-        for t in &params.tags {
+        for t in tags {
             sql.push_str(&format!(
                 " AND EXISTS (SELECT 1 FROM note_tags nt JOIN tags tg ON nt.tag_id = tg.tag_id WHERE nt.note_id = cn.note_id AND tg.name = ?{})",
                 pi
@@ -392,7 +487,7 @@ pub fn orient(pool: &ReadPool, vault_dir: &Path, params: &OrientParams) -> Resul
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             sql_params.iter().map(|p| p.as_ref()).collect();
         let recent_count: i64 = conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
-        let scope = if params.domain.is_some() || params.kind.is_some() || !params.tags.is_empty() {
+        let scope = if domain.is_some() || kind.is_some() || !tags.is_empty() {
             " (matching filters)"
         } else {
             ""
@@ -404,26 +499,66 @@ pub fn orient(pool: &ReadPool, vault_dir: &Path, params: &OrientParams) -> Resul
         ));
 
         Ok(Value::String(md))
-    })
+    }
 }
 
 /// Build a cosine context (query embedding + per-note embeddings) for [`search`],
-/// mirroring `cli::search::build_cosine_context`.
+/// mirroring `cli::search::build_cosine_context` — but with the embedding work
+/// lifted **out** of the DB checkout (slice 3.5.4, the 2B payoff).
+///
+/// Order, by design:
+/// 1. a **short** `interact` loads the stored per-note embeddings from the
+///    registry (the only DB touch here, and it holds a connection only for that
+///    read — never across inference). An empty result means there are no stored
+///    embeddings, so there is nothing to compare against and we skip cosine,
+///    exactly as the CLI's `embeddings::has_embeddings` gate would;
+/// 2. the **ONNX query embedding** then runs under an embedding permit (bounding
+///    inference concurrency) via [`with_embed_permit`], on a blocking thread with
+///    **no** connection held. Both provider init and `embed_query` happen there.
 ///
 /// Returns `None` — degrading the search to BM25 + engagement instead of failing
-/// — when the embedding provider is unavailable, when the query cannot be
-/// embedded, when stored embeddings cannot be loaded, or when the stored
-/// embedding dimension does not match the query's (a provider change without a
-/// re-embed). This is the exact graceful-degradation contract the CLI has.
-fn build_cosine_context(
+/// — when there are no stored embeddings, when the stored vectors cannot be
+/// loaded, when the embedding provider is unavailable, when the query cannot be
+/// embedded, or when the stored embedding dimension does not match the query's (a
+/// provider change without a re-embed). This is the exact graceful-degradation
+/// contract the CLI has.
+async fn build_cosine_context(
+    pool: &Pool<RoManager>,
+    embed_sem: &Arc<Semaphore>,
     vault_dir: &Path,
     cfg: &config::Config,
-    conn: &rusqlite::Connection,
     query: &str,
 ) -> Option<CosineContext> {
-    let mut provider = embed::init_provider(vault_dir, &cfg.embedding)?;
-    let query_embedding = provider.embed_query(query).ok()?;
-    let all = embeddings::get_all_embeddings(conn).ok()?;
+    // (1) Load stored embeddings — a short DB read, connection released before
+    // any inference runs. An empty vec means no embeddings (skip cosine, like the
+    // CLI's `has_embeddings` gate); a pool/interact failure also degrades to None.
+    let all: Vec<(String, Vec<f32>)> = pool
+        .get()
+        .await
+        .ok()?
+        .interact(|conn| embeddings::get_all_embeddings(conn))
+        .await
+        .ok()?
+        .ok()?;
+    if all.is_empty() {
+        return None;
+    }
+
+    // (2) ONNX query embedding under an embedding permit, with NO connection held.
+    // Provider init + inference are both blocking, so they run inside the permit's
+    // spawn_blocking. A closed semaphore, an unavailable provider, or a failed
+    // embed all degrade to None.
+    let vault_dir = vault_dir.to_path_buf();
+    let embedding_cfg = cfg.embedding.clone();
+    let query = query.to_string();
+    let query_embedding: Vec<f32> = with_embed_permit(embed_sem, move || {
+        let mut provider = embed::init_provider(&vault_dir, &embedding_cfg)
+            .ok_or_else(|| anyhow::anyhow!("embedding provider unavailable"))?;
+        provider.embed_query(&query)
+    })
+    .await
+    .ok()?
+    .ok()?;
 
     if let Some((_, first_vec)) = all.first()
         && first_vec.len() != query_embedding.len()
@@ -544,16 +679,20 @@ This is the body of the test note.\n";
         (dir, note_id)
     }
 
-    fn open_pool(dir: &Path) -> ReadPool {
-        ReadPool::open_with_size(dir, 2).expect("open read pool")
-    }
-
-    /// Open the deadpool-managed read-only pool the cheap methods (peek / read /
-    /// stats) now check out from (slice 3.5.2).
+    /// Open the deadpool-managed read-only pool every read method now checks out
+    /// from (slice 3.5.2 for the cheap reads, slice 3.5.4 for `search`/`orient`).
     async fn open_dpool(dir: &Path) -> Pool<RoManager> {
         super::super::dpool::open_ro_pool(dir, 2)
             .await
             .expect("open deadpool read pool")
+    }
+
+    /// A fresh embedding-worker semaphore for the `search` tests. None of these
+    /// vaults has an ONNX model, so the permit is never actually contended here
+    /// (the cosine step degrades to `None` before any inference); the head-of-line
+    /// test in this module is the one that exercises permit saturation directly.
+    fn embed_sem() -> Arc<Semaphore> {
+        super::super::embed_permit::default_embed_semaphore()
     }
 
     #[tokio::test]
@@ -796,13 +935,16 @@ tags:\n\
         }
     }
 
-    #[test]
-    fn search_returns_ranked_hits_matching_direct_registry_call() {
+    #[tokio::test]
+    async fn search_returns_ranked_hits_matching_direct_registry_call() {
         let dir = seeded_vault_three();
-        let pool = open_pool(&dir);
+        let pool = open_dpool(&dir).await;
+        let sem = embed_sem();
         let params = search_params("tokio");
 
-        let v = search(&pool, &dir, &params).expect("search should succeed");
+        let v = search(&pool, &sem, &dir, &params)
+            .await
+            .expect("search should succeed");
 
         assert_eq!(v["query"], "tokio");
         assert_eq!(v["mode"], "normal");
@@ -813,30 +955,33 @@ tags:\n\
         );
 
         // Same args through a direct registry::search call (no embeddings seeded,
-        // so cosine_ctx is None either way) must yield the same ranked ids.
+        // so cosine_ctx is None either way) must yield the same ranked ids. The
+        // direct call runs over a fresh writer connection (the registry baseline
+        // the CLI uses), independent of the serve pool.
         let cfg = config::load(&dir).expect("load config");
-        let direct_ids: Vec<String> = pool
-            .with_conn(|conn| {
-                let filters = SearchFilters {
-                    domain: None,
-                    kind: None,
-                    intent: None,
-                    tags: &[],
-                    since: None,
-                    before: None,
-                    limit: 10,
-                };
-                let hits = search::search(
-                    conn,
-                    "tokio",
-                    &filters,
-                    &cfg.search,
-                    None,
-                    SearchMode::Normal,
-                )?;
-                Ok(hits.into_iter().map(|h| h.note_id).collect())
-            })
-            .expect("direct registry search");
+        let conn = crate::db::open_registry(&dir).expect("open writer registry");
+        let filters = SearchFilters {
+            domain: None,
+            kind: None,
+            intent: None,
+            tags: &[],
+            since: None,
+            before: None,
+            limit: 10,
+        };
+        let direct_ids: Vec<String> = search::search(
+            &conn,
+            "tokio",
+            &filters,
+            &cfg.search,
+            None,
+            SearchMode::Normal,
+        )
+        .expect("direct registry search")
+        .into_iter()
+        .map(|h| h.note_id)
+        .collect();
+        drop(conn);
 
         let method_ids: Vec<String> = v["results"]
             .as_array()
@@ -852,40 +997,106 @@ tags:\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn search_bm25_mode_sets_mode_field() {
+    #[tokio::test]
+    async fn search_bm25_mode_sets_mode_field() {
         let dir = seeded_vault_three();
-        let pool = open_pool(&dir);
+        let pool = open_dpool(&dir).await;
+        let sem = embed_sem();
         let mut params = search_params("sqlite");
         params.bm25 = true;
 
-        let v = search(&pool, &dir, &params).expect("bm25 search should succeed");
+        let v = search(&pool, &sem, &dir, &params)
+            .await
+            .expect("bm25 search should succeed");
         assert_eq!(v["mode"], "bm25");
         assert_eq!(v["results"][0]["title"], "SQLite WAL");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn search_bm25_and_semantic_is_err() {
+    #[tokio::test]
+    async fn search_bm25_and_semantic_is_err() {
         let dir = seeded_vault_three();
-        let pool = open_pool(&dir);
+        let pool = open_dpool(&dir).await;
+        let sem = embed_sem();
         let mut params = search_params("rust");
         params.bm25 = true;
         params.semantic = true;
 
         assert!(
-            search(&pool, &dir, &params).is_err(),
+            search(&pool, &sem, &dir, &params).await.is_err(),
             "bm25 + semantic are mutually exclusive"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn orient_returns_markdown_briefing() {
+    /// Graceful degradation parity: with no ONNX model in the vault, `search`
+    /// over a non-empty query in `Normal` mode must still succeed (cosine context
+    /// degrades to `None`), returning the same BM25 + engagement ranking as a
+    /// direct `registry::search` with `None` cosine — exactly as the CLI degrades.
+    #[tokio::test]
+    async fn search_degrades_gracefully_without_embeddings() {
         let dir = seeded_vault_three();
-        let pool = open_pool(&dir);
+        let pool = open_dpool(&dir).await;
+        let sem = embed_sem();
+        let params = search_params("rust");
+
+        // No embeddings stored and no ONNX model present -> cosine skipped, search
+        // succeeds rather than failing.
+        let v = search(&pool, &sem, &dir, &params)
+            .await
+            .expect("search should degrade gracefully without embeddings");
+        assert_eq!(v["mode"], "normal");
+        assert!(
+            v["hits"].as_u64().unwrap() >= 1,
+            "BM25 + engagement still returns hits without embeddings"
+        );
+
+        // Must equal the direct registry baseline with cosine = None.
+        let cfg = config::load(&dir).expect("load config");
+        let conn = crate::db::open_registry(&dir).expect("open writer registry");
+        let filters = SearchFilters {
+            domain: None,
+            kind: None,
+            intent: None,
+            tags: &[],
+            since: None,
+            before: None,
+            limit: 10,
+        };
+        let direct_ids: Vec<String> = search::search(
+            &conn,
+            "rust",
+            &filters,
+            &cfg.search,
+            None,
+            SearchMode::Normal,
+        )
+        .expect("direct registry search")
+        .into_iter()
+        .map(|h| h.note_id)
+        .collect();
+        drop(conn);
+
+        let method_ids: Vec<String> = v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            method_ids, direct_ids,
+            "degraded serve search must match the cosine-less registry::search baseline"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn orient_returns_markdown_briefing() {
+        let dir = seeded_vault_three();
+        let pool = open_dpool(&dir).await;
         let params = OrientParams {
             query: Some("rust".to_string()),
             domain: None,
@@ -896,7 +1107,9 @@ tags:\n\
             before: None,
         };
 
-        let v = orient(&pool, &dir, &params).expect("orient should succeed");
+        let v = orient(&pool, &dir, &params)
+            .await
+            .expect("orient should succeed");
         let md = v.as_str().expect("orient returns a markdown string");
 
         assert!(
@@ -919,14 +1132,14 @@ tags:\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn orient_no_query_no_filter_is_err_like_cli() {
+    #[tokio::test]
+    async fn orient_no_query_no_filter_is_err_like_cli() {
         // `nark orient` with neither a query nor a filter errors: the underlying
         // `search::search` bails (since/before are pre-filters and cannot stand
         // alone). The serve path faithfully mirrors that — it does not invent a
         // whole-vault scan the CLI does not do.
         let dir = seeded_vault_three();
-        let pool = open_pool(&dir);
+        let pool = open_dpool(&dir).await;
         let params = OrientParams {
             query: None,
             domain: None,
@@ -938,19 +1151,19 @@ tags:\n\
         };
 
         assert!(
-            orient(&pool, &dir, &params).is_err(),
+            orient(&pool, &dir, &params).await.is_err(),
             "orient with no query and no filter mirrors the CLI's error"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn orient_no_query_with_filter_briefs_the_whole_vault() {
+    #[tokio::test]
+    async fn orient_no_query_with_filter_briefs_the_whole_vault() {
         // A filter (here `domain`) makes the query optional, so the briefing
         // falls back to the 'vault' label — same as the CLI.
         let dir = seeded_vault_three();
-        let pool = open_pool(&dir);
+        let pool = open_dpool(&dir).await;
         let params = OrientParams {
             query: None,
             domain: Some("engineering".to_string()),
@@ -961,7 +1174,9 @@ tags:\n\
             before: None,
         };
 
-        let v = orient(&pool, &dir, &params).expect("orient with a filter should succeed");
+        let v = orient(&pool, &dir, &params)
+            .await
+            .expect("orient with a filter should succeed");
         let md = v.as_str().unwrap();
         assert!(
             md.starts_with("# Vault Briefing: vault"),
@@ -970,6 +1185,124 @@ tags:\n\
         assert!(
             md.contains("(matching filters)"),
             "recent-activity scope should note the active filter, got: {md}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Seed `dir`'s registry with a dummy embedding for every `ark` note, so
+    /// `build_cosine_context`'s STEP 1 (load stored vectors) returns non-empty and
+    /// the method proceeds to the embedding-permit step — without needing a real
+    /// ONNX model. The vectors are arbitrary 768-dim values; they are never
+    /// matched against a real query embedding in the head-of-line test (the
+    /// permit is held the whole time the cheap read is in flight).
+    fn seed_dummy_embeddings(dir: &Path) {
+        let conn = crate::db::open_registry(dir).expect("open writer registry");
+        let ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT note_id FROM current_notes WHERE namespace = 'ark'")
+                .expect("prepare");
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .expect("query")
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        let vec768: Vec<f32> = (0..768).map(|i| (i as f32) * 0.001).collect();
+        for id in &ids {
+            embeddings::upsert_embedding(&conn, id, &vec768, "dummy-768")
+                .expect("seed dummy embedding");
+        }
+        drop(conn);
+    }
+
+    /// HEAD-OF-LINE test (the 2B exit criterion): hold ALL embedding permits, then
+    /// fire a `search` and a cheap `peek` concurrently against a SINGLE-connection
+    /// pool, and assert the cheap read still round-trips promptly.
+    ///
+    /// The vault is seeded with stored embeddings, so `build_cosine_context`'s
+    /// STEP 1 (the short DB read) returns non-empty and the method proceeds to the
+    /// embedding step. Slice 3.5.4 runs that embedding step under an embedding
+    /// permit and BEFORE any DB checkout for the query. So when every permit is
+    /// held, the `search` parks on `acquire` with NO connection checked out,
+    /// leaving the single pool connection free. A concurrent `peek` therefore
+    /// checks out that connection and completes well within a tight budget. Under
+    /// the old design (embed under `with_conn`/`interact`), the search would hold
+    /// the only connection while waiting on the embedding worker and the cheap
+    /// read would be starved — head-of-line blocking. This proves it is not.
+    #[tokio::test]
+    async fn cheap_read_not_blocked_by_saturated_embedding_permits() {
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let dir = seeded_vault_three();
+        seed_dummy_embeddings(&dir);
+
+        // A SINGLE-connection pool: if `search` held a connection while waiting on
+        // an embedding permit, the cheap `peek` could not get one at all.
+        let pool = super::super::dpool::open_ro_pool(&dir, 1)
+            .await
+            .expect("open 1-conn deadpool");
+
+        // A 1-permit semaphore with that permit already taken and held for the
+        // whole test, so the `search` embed step blocks on `acquire`.
+        let sem = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&sem)
+            .acquire_owned()
+            .await
+            .expect("hold the only embedding permit");
+
+        // A note id for the cheap read.
+        let note_id: String = {
+            let conn = crate::db::open_registry(&dir).expect("open writer registry");
+            let id = conn
+                .query_row(
+                    "SELECT note_id FROM current_notes WHERE namespace = 'ark' LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("a seeded note id");
+            drop(conn);
+            id
+        };
+
+        // Fire a `search`. With stored embeddings present it advances past the
+        // STEP-1 DB read and PARKS in the embed step on the saturated permit —
+        // holding NO connection. Concurrently, the cheap `peek` must complete
+        // promptly because the single pool connection is free.
+        let search_handle = {
+            let pool = pool.clone();
+            let sem = Arc::clone(&sem);
+            let dir = dir.clone();
+            tokio::spawn(async move {
+                let params = search_params("rust");
+                search(&pool, &sem, &dir, &params).await
+            })
+        };
+
+        // Give the search a beat to reach (and block on) the permit acquire.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The cheap read must round-trip within a tight budget while the embedding
+        // permit is saturated — it is not waiting on any embedding work.
+        let peek_result = tokio::time::timeout(Duration::from_secs(5), peek(&pool, &note_id))
+            .await
+            .expect("cheap peek must not be blocked by saturated embedding permits")
+            .expect("peek should succeed");
+        assert_eq!(peek_result["id"], note_id);
+
+        // Release the held permit so the search's embed step can proceed (it will
+        // degrade to BM25 since there is no ONNX model — the dummy stored vectors
+        // are never matched), then confirm it completed and still returns hits.
+        drop(held);
+        let v = tokio::time::timeout(Duration::from_secs(10), search_handle)
+            .await
+            .expect("search completes once the permit frees")
+            .expect("search task join")
+            .expect("search should succeed");
+        assert_eq!(v["query"], "rust");
+        assert!(
+            v["hits"].as_u64().unwrap() >= 1,
+            "search still returns hits"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
