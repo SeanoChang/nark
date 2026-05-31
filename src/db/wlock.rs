@@ -44,6 +44,20 @@ pub struct WriteLock {
     file: File,
 }
 
+impl WriteLock {
+    /// Try to acquire the registry write lock for `vault_dir`, without blocking.
+    ///
+    /// Associated-function form of the module-level [`try_acquire`]: it simply
+    /// delegates, so the two are interchangeable. Provided so callers that own
+    /// the lock for a long-lived purpose (e.g. `nark serve`, which holds it for
+    /// the daemon's whole lifetime) can spell the acquisition as
+    /// `WriteLock::try_acquire(vault_dir)` and read at the call site as "acquire
+    /// the write lock". See [`try_acquire`] for the return-value contract.
+    pub fn try_acquire(vault_dir: &Path) -> Result<Option<Self>> {
+        try_acquire(vault_dir)
+    }
+}
+
 impl Drop for WriteLock {
     fn drop(&mut self) {
         // Best-effort explicit release. Even if this errors, closing `file`
