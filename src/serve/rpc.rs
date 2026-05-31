@@ -30,6 +30,7 @@ use super::methods_read::{OrientParams, SearchParams};
 use super::readpool::ReadPool;
 use crate::wire::{RPCRequest, RPCResponse};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// CLI default `--limit` for `nark search` (`cli::mod`), used when
 /// `params.limit` is omitted so the socket path defaults like the command line.
@@ -47,8 +48,13 @@ const INVALID_PARAMS: i64 = -32602;
 /// Per-daemon context the router hands to the read methods: a read-only
 /// connection pool over `<vault_dir>/registry.db` plus the vault root (needed by
 /// `nark/read` to resolve CAS object paths).
+///
+/// The pool is held behind an [`Arc`] so the whole [`Ctx`] can be cloned into a
+/// [`tokio::task::spawn_blocking`] closure (the connection handler runs the
+/// blocking `dispatch` off the async worker — see `listener`) and so tests can
+/// hold a second handle to the same pool to drive contention.
 pub struct Ctx {
-    pool: ReadPool,
+    pool: Arc<ReadPool>,
     vault_dir: PathBuf,
 }
 
@@ -59,7 +65,7 @@ impl Ctx {
     /// pool opens it read-only. Used by the serve daemon path.
     pub fn open(vault_dir: &Path) -> anyhow::Result<Self> {
         Ok(Self {
-            pool: ReadPool::open(vault_dir)?,
+            pool: Arc::new(ReadPool::open(vault_dir)?),
             vault_dir: vault_dir.to_path_buf(),
         })
     }
@@ -68,6 +74,17 @@ impl Ctx {
     /// a sized pool without re-opening.
     #[cfg(test)]
     pub fn new(pool: ReadPool, vault_dir: PathBuf) -> Self {
+        Self {
+            pool: Arc::new(pool),
+            vault_dir,
+        }
+    }
+
+    /// Build a context from an already-`Arc`-wrapped pool. Lets a test keep a
+    /// second handle to the same pool (to occupy every connection) while the
+    /// daemon dispatches against it.
+    #[cfg(test)]
+    pub fn new_shared(pool: Arc<ReadPool>, vault_dir: PathBuf) -> Self {
         Self { pool, vault_dir }
     }
 }

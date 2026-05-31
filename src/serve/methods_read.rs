@@ -393,15 +393,15 @@ fn build_cosine_context(
     let query_embedding = provider.embed_query(query).ok()?;
     let all = embeddings::get_all_embeddings(conn).ok()?;
 
-    if let Some((_, first_vec)) = all.first() {
-        if first_vec.len() != query_embedding.len() {
-            eprintln!(
-                "Warning: embedding dimension mismatch (query={}, stored={}). Run `nark embed build` to re-embed.",
-                query_embedding.len(),
-                first_vec.len()
-            );
-            return None;
-        }
+    if let Some((_, first_vec)) = all.first()
+        && first_vec.len() != query_embedding.len()
+    {
+        eprintln!(
+            "Warning: embedding dimension mismatch (query={}, stored={}). Run `nark embed build` to re-embed.",
+            query_embedding.len(),
+            first_vec.len()
+        );
+        return None;
     }
 
     let note_embeddings = all.into_iter().collect();
@@ -426,11 +426,11 @@ fn fill_missing_snippets(
             continue;
         }
 
-        if !query.is_empty() {
-            if let Ok(snippet) = try_fts_snippet(conn, query, &hit.note_id) {
-                hit.snippet = snippet;
-                continue;
-            }
+        if !query.is_empty()
+            && let Ok(snippet) = try_fts_snippet(conn, query, &hit.note_id)
+        {
+            hit.snippet = snippet;
+            continue;
         }
 
         match read_body_preview(conn, vault, &hit.note_id) {
