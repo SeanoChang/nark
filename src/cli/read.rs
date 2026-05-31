@@ -42,8 +42,11 @@ pub fn run(vault_dir: &Path, id: &str) -> Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&out)?);
 
-    // Bump access after successful read
-    access::bump_access(&conn, &meta.note_id)?;
+    // Bump access after successful read. This is a registry write issued from a
+    // read command, so it is gated by the advisory write lock: non-blocking
+    // (the read is never delayed) and skipped silently if a writer/serve holds
+    // the lock (best-effort tracking, no unguarded dual-write).
+    access::try_bump_access(vault_dir, &conn, &[&meta.note_id])?;
     Ok(())
 }
 
@@ -161,6 +164,71 @@ mod tests {
             socket_bytes, direct_bytes,
             "read output must be byte-identical socket-present vs socket-absent"
         );
+    }
+
+    /// LOCK-GATED BUMP (read): with the advisory write lock HELD by a separate
+    /// holder (simulating a writer or `nark serve`), a direct-path `read` still
+    /// SUCCEEDS and prints the SAME value, but does NOT bump access — proving the
+    /// bump was SKIPPED (non-blocking, lock-respecting), not blocked and not an
+    /// unguarded write. The read must not hang.
+    #[test]
+    fn read_with_lock_held_succeeds_but_skips_access_bump() {
+        let dir = temp_vault_dir();
+        let id = seed_vault(&dir);
+
+        // Baseline: the printed value is well-defined and stable.
+        let before = direct_read_value(&dir, &id);
+
+        // A separate holder owns the write lock for the whole read.
+        let held = crate::db::wlock::WriteLock::try_acquire(&dir)
+            .expect("io ok")
+            .expect("pre-acquire the write lock");
+
+        let start = std::time::Instant::now();
+        run(&dir, &id).expect("read must succeed even with the write lock held");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "a held write lock must not block (hang) the read"
+        );
+
+        // Output is unchanged by the (skipped) bump.
+        let after = direct_read_value(&dir, &id);
+        assert_eq!(
+            before, after,
+            "read output must be identical whether or not the bump runs"
+        );
+
+        // Decisive proof the bump was SKIPPED, not applied: access_count stayed 0.
+        let conn = db::open_registry(&dir).expect("open registry");
+        let s = crate::registry::stats::overview(&conn).expect("stats overview");
+        assert_eq!(
+            s.access.total_reads, 0,
+            "with the lock held the access bump must be SKIPPED (not blocked, not an unguarded write)"
+        );
+
+        drop(held);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With NO lock held, the direct-path `read` bumps access as before: a fresh
+    /// vault's first read makes `total_reads` 1.
+    #[test]
+    fn read_no_lock_bumps_access() {
+        let dir = temp_vault_dir();
+        let id = seed_vault(&dir);
+
+        run(&dir, &id).expect("direct read with no lock held");
+
+        let conn = db::open_registry(&dir).expect("open registry");
+        let s = crate::registry::stats::overview(&conn).expect("stats overview");
+        assert_eq!(
+            s.access.total_reads, 1,
+            "with no lock held the read must bump access as before"
+        );
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// FALLBACK HARDENING (read): a STALE socket — bound but never accepting —

@@ -12,8 +12,17 @@ use wlock::WriteLock;
 /// [`open_registry_guarded`] as of slice 5.2: a guarded writer-open takes this
 /// lock before opening a RW connection. As of slice 5.3 every mutating CLI
 /// command routes through `open_registry_guarded`, so the lock is now live in
-/// the binary. `pub` so callers can reason about the lock; reads
-/// (`open_registry` and the read-only deadpool) never touch it.
+/// the binary. `pub` so callers can reason about the lock.
+///
+/// Precise contract: reads never *block* on this lock — `open_registry` and the
+/// read-only deadpool never take it to open or to query. That is distinct from
+/// "reads never write": `open_registry` (and thus `open_registry_inner`) runs
+/// MIGRATIONS + `seed_defaults` (idempotent `INSERT OR IGNORE`) on EVERY open,
+/// and the read CLIs additionally bump access tracking after returning content.
+/// Those access bumps are real writes, so they are now gated by a *non-blocking*
+/// try-or-skip on this lock (see `registry::access::try_bump_access`): they run
+/// only when the lock is free and are silently skipped on contention. So the
+/// lock-free guarantee is about BLOCKING, not about reads being write-free.
 pub mod wlock;
 
 pub const DEFAULT_AGENT_ID: &str = "noah";
@@ -30,6 +39,13 @@ pub(crate) static MIGRATIONS: LazyLock<Migrations<'static>> =
 /// This is the SINGLE shared open path. Both the unlocked [`open_registry`]
 /// (reads/back-compat) and the lock-guarded [`open_registry_guarded`] (writes)
 /// delegate here so the two can never diverge.
+///
+/// Note this means an `open_registry` "read" open is NOT write-free: it runs
+/// `MIGRATIONS.to_latest` and `seed_defaults` (idempotent `INSERT OR IGNORE`) on
+/// every call. These are deliberate, self-converging schema/seed writes, not the
+/// guarded data writes the advisory lock protects — and they do not block on
+/// that lock. The lock-free invariant for reads is about BLOCKING (reads never
+/// wait on the write lock), not about reads issuing zero writes.
 fn open_registry_inner(vault_dir: &Path) -> Result<Connection> {
     let db_path = vault_dir.join("registry.db");
     let mut conn = Connection::open(db_path)?;

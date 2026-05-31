@@ -162,9 +162,14 @@ pub fn run(
                 all_tags.insert(t);
             }
         }
-
-        access::bump_access(&conn, &hit.note_id)?;
     }
+
+    // Bump access for every hit — agent read these notes' content. Gated by the
+    // advisory write lock: non-blocking (the read is never delayed) and skipped
+    // for ALL hits if a writer/serve holds the lock (best-effort tracking, no
+    // unguarded dual-write). Acquire once, bump all, release.
+    let note_ids: Vec<&str> = hits.iter().map(|h| h.note_id.as_str()).collect();
+    access::try_bump_access(vault_dir, &conn, &note_ids)?;
 
     // Active tags section
     if !all_tags.is_empty() {

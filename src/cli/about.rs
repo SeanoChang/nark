@@ -7,7 +7,13 @@ use crate::db;
 use crate::registry::{access, resolve, search};
 use crate::vault::fs::Vault;
 
-pub fn run(vault_dir: &Path, topic: &str, limit: usize, since: Option<&str>, before: Option<&str>) -> Result<()> {
+pub fn run(
+    vault_dir: &Path,
+    topic: &str,
+    limit: usize,
+    since: Option<&str>,
+    before: Option<&str>,
+) -> Result<()> {
     let conn = db::open_registry(vault_dir)?;
     let vault = Vault::new(vault_dir.to_path_buf());
     let cfg = config::load(vault_dir)?;
@@ -24,7 +30,14 @@ pub fn run(vault_dir: &Path, topic: &str, limit: usize, since: Option<&str>, bef
         before: before_ts.as_deref(),
         limit,
     };
-    let hits = search::search(&conn, topic, &filters, &cfg.search, None, search::SearchMode::Normal)?;
+    let hits = search::search(
+        &conn,
+        topic,
+        &filters,
+        &cfg.search,
+        None,
+        search::SearchMode::Normal,
+    )?;
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     for hit in &hits {
@@ -41,9 +54,6 @@ pub fn run(vault_dir: &Path, topic: &str, limit: usize, since: Option<&str>, bef
             "links_in": hit.links_in,
             "links_out": hit.links_out,
         }));
-
-        // Bump access — agent read this note's full content
-        access::bump_access(&conn, &hit.note_id)?;
     }
 
     let out = serde_json::json!({
@@ -52,6 +62,13 @@ pub fn run(vault_dir: &Path, topic: &str, limit: usize, since: Option<&str>, bef
     });
 
     println!("{}", serde_json::to_string_pretty(&out)?);
+
+    // Bump access for every hit — agent read these notes' content. Gated by the
+    // advisory write lock: non-blocking (the read is never delayed) and skipped
+    // for ALL hits if a writer/serve holds the lock (best-effort tracking, no
+    // unguarded dual-write). Acquire once, bump all, release.
+    let note_ids: Vec<&str> = hits.iter().map(|h| h.note_id.as_str()).collect();
+    access::try_bump_access(vault_dir, &conn, &note_ids)?;
     Ok(())
 }
 
