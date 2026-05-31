@@ -589,6 +589,100 @@ This is the body of the test note.\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Slice 3.5 parity: the serve `peek` method's JSON must be byte-identical to
+    /// the value built directly from `registry::resolve::get_meta` over a writer
+    /// (`db::open_registry`) connection — the exact JSON `cli/peek.rs` prints.
+    /// This proves the serve READ method has not drifted from the registry path
+    /// the CLI uses for the same input (the Phase-3 non-breaking guarantee).
+    #[test]
+    fn peek_json_matches_direct_registry_call() {
+        let (dir, note_id) = seeded_vault_with_note();
+        let pool = open_pool(&dir);
+
+        // Serve path: through the read-only pool.
+        let served = peek(&pool, &note_id).expect("serve peek should succeed");
+
+        // Registry-direct path: the exact json! block `cli/peek.rs` builds from
+        // `resolve::get_meta` over a writer connection.
+        let conn = crate::db::open_registry(&dir).expect("open writer registry");
+        let meta = resolve::get_meta(&conn, &note_id).expect("get_meta");
+        let direct = json!({
+            "id": meta.note_id,
+            "title": meta.title,
+            "domain": meta.domain,
+            "intent": meta.intent,
+            "kind": meta.kind,
+            "status": meta.status,
+            "tags": meta.tags,
+            "updated_at": meta.updated_at,
+            "links_in": meta.links_in,
+            "links_out": meta.links_out,
+        });
+        drop(conn);
+
+        assert_eq!(
+            served, direct,
+            "serve peek JSON must equal the direct registry::resolve::get_meta JSON \
+             (CLI parity, byte-identical)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Slice 3.5 parity, stats edition: the serve `stats` method's JSON must be
+    /// byte-identical to the value built directly from `registry::stats::overview`
+    /// — the exact JSON `cli/stats.rs` prints. Mirrors `peek_json_matches_direct_
+    /// registry_call` for the no-params overview method.
+    #[test]
+    fn stats_json_matches_direct_registry_call() {
+        let (dir, _note_id) = seeded_vault_with_note();
+        let pool = open_pool(&dir);
+
+        let served = stats(&pool).expect("serve stats should succeed");
+
+        let conn = crate::db::open_registry(&dir).expect("open writer registry");
+        let s = stats::overview(&conn).expect("overview");
+        let most_accessed = s
+            .access
+            .most_accessed
+            .as_ref()
+            .map(|m| json!({ "title": m.title, "count": m.count }));
+        let direct = json!({
+            "total_notes": s.total_notes,
+            "total_versions": s.total_versions,
+            "by_domain": s.by_domain.iter().map(|f| {
+                json!({ "domain": f.label, "count": f.count })
+            }).collect::<Vec<_>>(),
+            "by_kind": s.by_kind.iter().map(|f| {
+                json!({ "kind": f.label, "count": f.count })
+            }).collect::<Vec<_>>(),
+            "recent": s.recent.iter().map(|n| {
+                json!({
+                    "id": n.note_id,
+                    "title": n.title,
+                    "domain": n.domain,
+                    "intent": n.intent,
+                    "kind": n.kind,
+                    "updated_at": n.updated_at,
+                })
+            }).collect::<Vec<_>>(),
+            "access": {
+                "total_reads": s.access.total_reads,
+                "most_accessed": most_accessed,
+                "never_read": s.access.never_read,
+            },
+        });
+        drop(conn);
+
+        assert_eq!(
+            served, direct,
+            "serve stats JSON must equal the direct registry::stats::overview JSON \
+             (CLI parity, byte-identical)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Three notes with distinct, queryable bodies so search/orient have
     /// something to rank. Each carries `namespace = ark` (via `commit_version`).
     fn note_doc(title: &str, body: &str, tag: &str) -> String {

@@ -567,6 +567,164 @@ Socket body text.\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Slice 3.5 end-to-end: an authenticated client (its own uid mapped to an
+    /// agent) issues `nark/peek` and then `nark/search` over two one-shot
+    /// connections and gets correct, distinct responses. This exercises the full
+    /// assembled path — peer auth -> JSON-RPC framing -> router -> ReadPool ->
+    /// `registry::*` — for more than one method on a single running daemon.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn authenticated_client_peek_then_search_end_to_end() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        let (ctx, note_id) = seeded_ctx(&dir);
+
+        // Map the test process's own uid to a known agent so we authenticate.
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        async fn round_trip(socket_path: &Path, line: &str) -> serde_json::Value {
+            let mut stream = UnixStream::connect(socket_path)
+                .await
+                .expect("connect to socket");
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .expect("write request");
+            stream.flush().await.expect("flush request");
+            read_json_line(stream).await
+        }
+
+        // 1) nark/peek over its own one-shot connection.
+        let peek = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"pk\",\"method\":\"nark/peek\",\"params\":{{\"id\":\"{note_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(peek["id"], "pk");
+        assert_eq!(peek["result"]["id"], note_id);
+        assert_eq!(peek["result"]["title"], "Socket Note");
+        assert!(peek.get("error").is_none());
+
+        // 2) nark/search over a fresh one-shot connection. The seeded note has a
+        // distinctive body word ("Socket") that the query should match.
+        let search = round_trip(
+            &socket_path,
+            "{\"id\":\"se\",\"method\":\"nark/search\",\"params\":{\"query\":\"socket\"}}\n",
+        )
+        .await;
+        assert_eq!(search["id"], "se");
+        assert_eq!(search["result"]["query"], "socket");
+        assert_eq!(search["result"]["mode"], "normal");
+        assert!(
+            search["result"]["hits"].as_u64().unwrap() >= 1,
+            "the socket query should hit the seeded note"
+        );
+        assert_eq!(
+            search["result"]["results"][0]["id"], note_id,
+            "the seeded note should be the top search hit"
+        );
+        assert!(search.get("error").is_none());
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Slice 3.5: an unknown-uid connection is rejected *before any method runs*.
+    /// The client sends a well-formed `nark/peek` JSON-RPC request, but the
+    /// server (empty `AgentMap`) must answer with the plain `unauthorized` line
+    /// and close — never a JSON-RPC response — proving auth gates dispatch.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn unknown_uid_rejected_before_any_method_runs() {
+        use super::super::AgentMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+
+        // Empty map -> the connecting uid is unknown -> rejected at the app layer.
+        let agents = AgentMap::default();
+        let (ctx, note_id) = seeded_ctx(&dir);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        let mut stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to socket");
+        // A perfectly valid peek request: if auth did not gate dispatch, this
+        // would return a JSON-RPC result. The server must reject before running
+        // the method.
+        let request = format!(
+            "{{\"id\":\"x\",\"method\":\"nark/peek\",\"params\":{{\"id\":\"{note_id}\"}}}}\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write peek request");
+        stream.flush().await.expect("flush peek request");
+
+        // The very first line back must be the rejection, not a JSON-RPC reply.
+        let mut reply = String::new();
+        let mut reader = BufReader::new(stream);
+        reader
+            .read_line(&mut reply)
+            .await
+            .expect("read rejection line");
+        assert_eq!(
+            reply, "unauthorized\n",
+            "unknown uid must be rejected before nark/peek runs"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(reply.trim_end()).is_err(),
+            "rejection must not be a JSON-RPC response (no method ran)"
+        );
+
+        // And the connection is then closed (EOF), with no peek result trailing.
+        let mut rest = String::new();
+        let n = reader
+            .read_line(&mut rest)
+            .await
+            .expect("read after reject");
+        assert_eq!(
+            n, 0,
+            "server must close after rejecting; no method response follows"
+        );
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An authenticated unknown method returns a JSON-RPC `-32601` error echoing
     /// the request id.
     #[cfg(target_os = "macos")]

@@ -82,30 +82,34 @@ impl Ctx {
 pub fn dispatch(ctx: &Ctx, req: &RPCRequest) -> RPCResponse {
     match req.method.as_str() {
         "ping" => RPCResponse::result(req.id.clone(), json!({"pong": true})),
-        "nark/peek" => match id_param(req) {
-            Ok(id) => result_or_invalid(req, methods_read::peek(&ctx.pool, &id)),
-            Err(resp) => resp,
-        },
-        "nark/read" => match id_param(req) {
-            Ok(id) => result_or_invalid(req, methods_read::read(&ctx.pool, &ctx.vault_dir, &id)),
-            Err(resp) => resp,
-        },
+        "nark/peek" => run(req, id_param(req), |id| methods_read::peek(&ctx.pool, &id)),
+        "nark/read" => run(req, id_param(req), |id| {
+            methods_read::read(&ctx.pool, &ctx.vault_dir, &id)
+        }),
         "nark/stats" => result_or_invalid(req, methods_read::stats(&ctx.pool)),
-        "nark/search" => match search_params(req) {
-            Ok(params) => result_or_invalid(
-                req,
-                methods_read::search(&ctx.pool, &ctx.vault_dir, &params),
-            ),
-            Err(resp) => resp,
-        },
-        "nark/orient" => match orient_params(req) {
-            Ok(params) => result_or_invalid(
-                req,
-                methods_read::orient(&ctx.pool, &ctx.vault_dir, &params),
-            ),
-            Err(resp) => resp,
-        },
+        "nark/search" => run(req, search_params(req), |p| {
+            methods_read::search(&ctx.pool, &ctx.vault_dir, &p)
+        }),
+        "nark/orient" => run(req, orient_params(req), |p| {
+            methods_read::orient(&ctx.pool, &ctx.vault_dir, &p)
+        }),
         _ => RPCResponse::error(req.id.clone(), METHOD_NOT_FOUND, "method not found", None),
+    }
+}
+
+/// Run a parsed-params method: if `parsed` is the ready-made `-32602` error from
+/// a params parse failure, return it as-is; otherwise call `method` with the
+/// parsed value and wrap its `Result<Value>` via [`result_or_invalid`]. This
+/// collapses the otherwise-repeated `match parse { Ok => result_or_invalid(..),
+/// Err(resp) => resp }` arm shared by every params-taking READ method.
+fn run<P>(
+    req: &RPCRequest,
+    parsed: Result<P, RPCResponse>,
+    method: impl FnOnce(P) -> anyhow::Result<Value>,
+) -> RPCResponse {
+    match parsed {
+        Ok(params) => result_or_invalid(req, method(params)),
+        Err(resp) => resp,
     }
 }
 
