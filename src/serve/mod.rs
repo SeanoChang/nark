@@ -8,6 +8,7 @@
 //! ping/pong, with unknown uids rejected with `unauthorized`).
 
 mod authz;
+mod dpool;
 mod listener;
 mod methods_read;
 mod peercred;
