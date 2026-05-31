@@ -817,6 +817,159 @@ Socket body text.\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Phase 6 slice 6.2 exit: an authenticated client issues `nark/write` over
+    /// the socket and the daemon creates the note via the single serializing
+    /// writer queue; a follow-up `nark/read` over a fresh connection returns it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn authenticated_write_then_read_round_trip_over_socket() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        const DOC: &str = "---\\ntitle: Wire Note\\nauthor: tester\\ndomain: engineering\\nintent: reference\\nkind: note\\nstatus: active\\ntags:\\n  - omega\\n---\\nWire body text.\\n";
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        // `seeded_ctx` uses `Ctx::open`, which stands up the real writer queue.
+        let (ctx, _seed_id) = seeded_ctx(&dir).await;
+
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        async fn round_trip(socket_path: &Path, line: &str) -> serde_json::Value {
+            let mut stream = UnixStream::connect(socket_path)
+                .await
+                .expect("connect to socket");
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .expect("write request");
+            stream.flush().await.expect("flush request");
+            read_json_line(stream).await
+        }
+
+        // nark/write over its own one-shot connection.
+        let write = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"w\",\"method\":\"nark/write\",\"params\":{{\"note\":\"{DOC}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(write["id"], "w");
+        assert_eq!(write["result"]["title"], "Wire Note");
+        let new_id = write["result"]["id"]
+            .as_str()
+            .expect("write returns a note id")
+            .to_string();
+        assert!(write.get("error").is_none(), "write should not be an error");
+
+        // nark/read of the just-written note over a fresh connection.
+        let read = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"r\",\"method\":\"nark/read\",\"params\":{{\"id\":\"{new_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(read["result"]["title"], "Wire Note");
+        assert_eq!(read["result"]["body"], "Wire body text.");
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Auth still gates writes: an unknown uid that sends a well-formed
+    /// `nark/write` gets the plain `unauthorized` line and the connection closes
+    /// before the write runs — nothing is committed (note count stays at the seed).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn unknown_uid_cannot_write_nothing_committed() {
+        use super::super::AgentMap;
+
+        const DOC: &str = "---\\ntitle: Forbidden\\nauthor: tester\\ndomain: engineering\\nintent: reference\\nkind: note\\nstatus: active\\ntags:\\n  - omega\\n---\\nMust not be written.\\n";
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        // Seed exactly one note; the rejected write must not change this count.
+        let (ctx, _seed_id) = seeded_ctx(&dir).await;
+
+        fn note_count(vault_dir: &Path) -> i64 {
+            let conn = crate::db::open_registry(vault_dir).expect("open registry for count");
+            conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+                .expect("count notes")
+        }
+        assert_eq!(
+            note_count(&dir),
+            1,
+            "the seed note is present before the attempt"
+        );
+
+        // Empty map -> the connecting uid is unknown -> rejected before dispatch.
+        let agents = AgentMap::default();
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        let mut stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to socket");
+        let request = format!(
+            "{{\"id\":\"x\",\"method\":\"nark/write\",\"params\":{{\"note\":\"{DOC}\"}}}}\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write nark/write request");
+        stream.flush().await.expect("flush request");
+
+        // The first line back must be the plain rejection, not a JSON-RPC reply.
+        let mut reply = String::new();
+        let mut reader = BufReader::new(stream);
+        reader
+            .read_line(&mut reply)
+            .await
+            .expect("read rejection line");
+        assert_eq!(
+            reply, "unauthorized\n",
+            "unknown uid must be rejected before nark/write runs"
+        );
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        // The write never ran: the note count is unchanged.
+        assert_eq!(
+            note_count(&dir),
+            1,
+            "a rejected write must not commit anything"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An authenticated unknown method returns a JSON-RPC `-32601` error echoing
     /// the request id.
     #[cfg(target_os = "macos")]

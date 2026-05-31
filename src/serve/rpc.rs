@@ -16,6 +16,8 @@
 //! * `nark/stats` -> vault statistics ([`methods_read::stats`]),
 //! * `nark/search` -> ranked hits for the search `params` ([`methods_read::search`]),
 //! * `nark/orient` -> a markdown vault briefing ([`methods_read::orient`]),
+//! * `nark/write` -> ingest a note via the single serializing writer queue, the
+//!   first WRITE method (see [`methods_write::write`]),
 //! * any other method -> JSON-RPC `-32601 method not found`.
 //!
 //! The read methods call the same `registry::*` functions the CLI handlers do
@@ -31,6 +33,8 @@ use super::dpool::{self, RoManager};
 use super::embed_permit;
 use super::methods_read;
 use super::methods_read::{OrientParams, SearchParams};
+use super::methods_write;
+use super::methods_write::WriteParams;
 use super::writer::Writer;
 use crate::wire::{RPCRequest, RPCResponse};
 use std::path::{Path, PathBuf};
@@ -80,9 +84,8 @@ pub struct Ctx {
     /// daemon path) builds one; the read-path test injector [`Ctx::new`] leaves it
     /// `None` because reads never touch it. Held as `Option<Arc<Writer>>` so the
     /// writer can be shared and so read-only tests need not stand one up. The
-    /// write methods (later slice) will route mutations through it; it is
-    /// currently constructed but not yet dispatched against.
-    #[allow(dead_code)]
+    /// write methods (`nark/write`, slice 6.2 onward) route mutations through it
+    /// via [`Ctx::writer`].
     writer: Option<Arc<Writer>>,
 }
 
@@ -120,6 +123,41 @@ impl Ctx {
             vault_dir,
             writer: None,
         }
+    }
+
+    /// Build a context from an already-open pool and vault dir **with** a
+    /// [`Writer`], for the write-method tests (`nark/write`). Mirrors [`Ctx::new`]
+    /// but stands up the single serializing writer so a test can drive a write
+    /// without binding a socket or owning the runtime that [`Ctx::open`] needs.
+    #[cfg(test)]
+    pub fn with_writer(dpool: Pool<RoManager>, vault_dir: PathBuf, writer: Arc<Writer>) -> Self {
+        Self {
+            dpool,
+            embed_sem: embed_permit::default_embed_semaphore(),
+            vault_dir,
+            writer: Some(writer),
+        }
+    }
+
+    /// The single serializing [`Writer`] the write methods submit jobs to, or
+    /// `None` for a read-only context (the read-path test injector). The daemon
+    /// path ([`Ctx::open`]) always has one.
+    pub fn writer(&self) -> Option<&Arc<Writer>> {
+        self.writer.as_ref()
+    }
+
+    /// The vault root, needed by the write methods to load config and build the
+    /// [`Vault`](crate::vault::fs::Vault) for ingest.
+    pub fn vault_dir(&self) -> &Path {
+        &self.vault_dir
+    }
+
+    /// Borrow the read-only pool, for the write-method tests that write through the
+    /// writer and then read the note back via [`methods_read::read`] (which takes
+    /// the pool directly). Test-only so the production pool stays encapsulated.
+    #[cfg(test)]
+    pub fn dpool_for_test(&self) -> &Pool<RoManager> {
+        &self.dpool
     }
 }
 
@@ -168,6 +206,10 @@ pub async fn dispatch(ctx: &Ctx, req: &RPCRequest) -> RPCResponse {
             ),
             Err(resp) => resp,
         },
+        "nark/write" => match write_params(req) {
+            Ok(params) => result_or_invalid(req, methods_write::write(ctx, params).await),
+            Err(resp) => resp,
+        },
         _ => RPCResponse::error(req.id.clone(), METHOD_NOT_FOUND, "method not found", None),
     }
 }
@@ -213,6 +255,32 @@ fn orient_params(req: &RPCRequest) -> Result<OrientParams, RPCResponse> {
         limit: opt_limit(req, obj, ORIENT_DEFAULT_LIMIT)?,
         since: opt_string(req, obj, "since")?,
         before: opt_string(req, obj, "before")?,
+    })
+}
+
+/// Parse the `nark/write` `params` object into [`WriteParams`].
+///
+/// `note` is **required** — the full note markdown document (frontmatter + body)
+/// `vault.ingest` consumes, exactly what `nark write` reads from a file/stdin. A
+/// missing or non-string `note` is `-32602 invalid params`. `auto_link` is an
+/// optional boolean (default `false`), mirroring `nark write --auto-link`. A
+/// missing `params`, or a `params` that is not an object, is an error (unlike the
+/// read methods, `write` has a required field, so an empty object is rejected too
+/// via the missing `note`).
+fn write_params(req: &RPCRequest) -> Result<WriteParams, RPCResponse> {
+    let obj = params_object(req)?;
+    let note = match opt_string(req, obj, "note")? {
+        Some(note) => note,
+        None => {
+            return Err(invalid(
+                req,
+                "invalid params: 'note' (the note markdown) is required",
+            ));
+        }
+    };
+    Ok(WriteParams {
+        note,
+        auto_link: opt_bool(req, obj, "auto_link")?,
     })
 }
 
@@ -656,6 +724,67 @@ tags:\n\
             md.starts_with("# Vault Briefing: vault"),
             "omitted query with a filter defaults to a whole-vault briefing, got: {md}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a [`Ctx`] over `dir` with a real writer (the daemon's write path)
+    /// plus the read-only pool — what the router needs to route `nark/write`.
+    async fn ctx_with_writer(dir: &std::path::Path) -> Ctx {
+        let pool = dpool::open_ro_pool(dir, 2).await.expect("open read pool");
+        let writer = std::sync::Arc::new(Writer::open(dir).expect("open writer"));
+        Ctx::with_writer(pool, dir.to_path_buf(), writer)
+    }
+
+    /// The router routes `nark/write` to the write method: the parsed `note`
+    /// markdown is ingested and the success result carries the note id + title.
+    #[tokio::test]
+    async fn write_routes_through_dispatch_and_creates_note() {
+        let dir = std::env::temp_dir().join(format!(
+            "nark-rpc-write-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp vault");
+        drop(crate::db::open_registry(&dir).expect("seed registry"));
+        let ctx = ctx_with_writer(&dir).await;
+
+        let resp = dispatch(
+            &ctx,
+            &request("w1", "nark/write", Some(json!({"note": NOTE}))),
+        )
+        .await;
+        let v = expect_result(resp);
+        assert!(v["id"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(v["title"], "Router Note");
+
+        // The committed note is then readable through the same daemon.
+        let id = v["id"].as_str().unwrap();
+        let read = dispatch(&ctx, &request("r1", "nark/read", Some(json!({"id": id})))).await;
+        let rv = expect_result(read);
+        assert_eq!(rv["body"], "Router body text.");
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `nark/write` with a missing `note` is `-32602 invalid params` (the required
+    /// field guard), not a panic and not a write.
+    #[tokio::test]
+    async fn write_missing_note_is_invalid_params() {
+        let dir = std::env::temp_dir().join(format!(
+            "nark-rpc-write-missing-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp vault");
+        drop(crate::db::open_registry(&dir).expect("seed registry"));
+        let ctx = ctx_with_writer(&dir).await;
+
+        let resp = dispatch(&ctx, &request("w2", "nark/write", Some(json!({})))).await;
+        let err = expect_error(resp);
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        drop(ctx);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

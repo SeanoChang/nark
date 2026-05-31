@@ -33,11 +33,15 @@ mod dpool;
 mod embed_permit;
 mod listener;
 mod methods_read;
+// Phase 6: the WRITE method implementations (`nark/write`, and later
+// `nark/link` / `nark/delete`) that submit their mutations to the single
+// serializing writer queue. Slice 6.2 lands `nark/write`.
+mod methods_write;
 mod peercred;
 mod rpc;
 // Phase 6: the single serializing, off-reactor writer queue the write methods
-// (`nark/write` / `nark/link` / `nark/delete`) will run their mutations on. Slice
-// 6.1 lands the queue primitive; wiring the methods onto it is a later slice.
+// (`nark/write` / `nark/link` / `nark/delete`) run their mutations on. Slice 6.1
+// landed the queue primitive; slice 6.2 wires `nark/write` onto it.
 mod writer;
 
 use std::path::Path;
