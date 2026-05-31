@@ -115,22 +115,27 @@ fn request_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+/// Test-only support shared by this module's tests AND the dual-mode CLI
+/// handler tests (`cli::{peek,read,stats,search,orient}`), which cannot reach
+/// the private `serve::rpc::Ctx` directly. It hands a real running `nark serve`
+/// (its own thread + tokio runtime, so the synchronous client crosses a true
+/// blocking-vs-async boundary) over a seeded vault, plus the seeded note id and
+/// vault dir so a caller can open the SAME vault directly and assert socket-hit
+/// vs direct-open parity. `pub(crate)` and `#[cfg(test)]`, re-exported from
+/// `serve::mod` under test, so it never widens the non-test surface.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
+pub(crate) mod test_support {
     use std::collections::HashMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::Instant;
 
     use super::super::AgentMap;
     use super::super::BoundListener;
     use super::super::rpc::Ctx;
 
-    fn temp_vault_dir() -> PathBuf {
+    pub(crate) fn temp_vault_dir() -> PathBuf {
         std::env::temp_dir().join(format!(
             "nark-client-test-{}-{}",
             std::process::id(),
@@ -139,10 +144,11 @@ mod tests {
     }
 
     /// Seed `dir` as a vault (writer creates/migrates/seeds `registry.db` and
-    /// enables WAL) with one ingested note, then build the read-only [`Ctx`]
-    /// the serve loop dispatches against. The writer connection is dropped
-    /// before the read pool opens. Mirrors the `listener.rs` test harness.
-    async fn seeded_ctx(dir: &Path) -> Arc<Ctx> {
+    /// enables WAL) with one ingested note, returning the note id. The writer
+    /// connection is dropped before any read pool opens. Mirrors the
+    /// `listener.rs` test harness. Reusable by tests that need a seeded vault
+    /// without a server (the direct-open / no-daemon parity case).
+    pub(crate) fn seed_vault(dir: &Path) -> String {
         use crate::registry::write::commit_version;
         use crate::vault::fs::Vault;
 
@@ -164,7 +170,12 @@ Client body text.\n";
         let result = vault.ingest(NOTE, None).expect("ingest note");
         commit_version(&conn, &result).expect("commit version");
         drop(conn);
+        result.note_id
+    }
 
+    /// Build the read-only [`Ctx`] the serve loop dispatches against over an
+    /// already-seeded `dir`.
+    async fn open_ctx(dir: &Path) -> Arc<Ctx> {
         let ctx = Ctx::open(dir).await.expect("open serve ctx");
         Arc::new(ctx)
     }
@@ -173,18 +184,21 @@ Client body text.\n";
     /// synchronous client under test connects to a real blocking-vs-async
     /// boundary). Dropping it signals shutdown and joins the thread, removing
     /// the socket.
-    struct TestServer {
+    pub(crate) struct TestServer {
         dir: PathBuf,
+        note_id: String,
         socket_path: PathBuf,
         shutdown: Option<tokio::sync::oneshot::Sender<()>>,
         handle: Option<thread::JoinHandle<()>>,
     }
 
     impl TestServer {
-        /// Bind + serve with the given uid->agent table. `ready` fires once the
-        /// listener is bound so the client never races the bind.
-        fn start(agents: AgentMap) -> Self {
+        /// Bind + serve with the given uid->agent table over a freshly seeded
+        /// vault. `ready` fires once the listener is bound so the client never
+        /// races the bind.
+        pub(crate) fn start(agents: AgentMap) -> Self {
             let dir = temp_vault_dir();
+            let note_id = seed_vault(&dir);
             let (ready_tx, ready_rx) = mpsc::channel::<PathBuf>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -195,7 +209,7 @@ Client body text.\n";
                     .build()
                     .expect("build runtime");
                 runtime.block_on(async move {
-                    let ctx = seeded_ctx(&dir_for_thread).await;
+                    let ctx = open_ctx(&dir_for_thread).await;
                     let socket_path = dir_for_thread.join("run").join("nark.sock");
                     let bound = BoundListener::bind(&socket_path).expect("bind listener");
                     ready_tx.send(socket_path).expect("signal ready");
@@ -211,14 +225,27 @@ Client body text.\n";
             let socket_path = ready_rx.recv().expect("server bound");
             TestServer {
                 dir,
+                note_id,
                 socket_path,
                 shutdown: Some(shutdown_tx),
                 handle: Some(handle),
             }
         }
 
-        fn socket(&self) -> &Path {
+        pub(crate) fn socket(&self) -> &Path {
             &self.socket_path
+        }
+
+        /// The vault root the server seeded and serves. `default_socket(dir())`
+        /// resolves to this server's socket, so a dual-mode CLI handler given
+        /// `dir()` as its `vault_dir` will hit this live server.
+        pub(crate) fn dir(&self) -> &Path {
+            &self.dir
+        }
+
+        /// The id of the single seeded note.
+        pub(crate) fn note_id(&self) -> &str {
+            &self.note_id
         }
     }
 
@@ -234,12 +261,24 @@ Client body text.\n";
         }
     }
 
-    fn current_uid_agent_map() -> AgentMap {
+    /// A uid->agent map authorizing the current process's uid as `tester`, so a
+    /// test client connecting to the server authenticates (socket HIT).
+    pub(crate) fn current_uid_agent_map() -> AgentMap {
         let me = nix::unistd::getuid().as_raw();
         let mut table = HashMap::new();
         table.insert(me, "tester".to_string());
         AgentMap::new(table)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{TestServer, current_uid_agent_map, temp_vault_dir};
+    use super::*;
+    use serde_json::json;
+    use std::time::Instant;
+
+    use super::super::AgentMap;
 
     /// `default_socket` must agree with the daemon's own path resolution
     /// (`resolve_socket_path(vault, None)` -> `<vault>/run/nark.sock`); the CLI
