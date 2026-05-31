@@ -16,7 +16,9 @@
 //! [`WriteLock`] releases the lock explicitly (`LOCK_UN`) and closes the file
 //! (which would release it anyway).
 //!
-//! This module is standalone and is **not** wired into `open_registry` yet.
+//! As of slice 5.3 this primitive is live: `db::open_registry_guarded` takes
+//! the lock and every mutating CLI command opens through it. `db::open_registry`
+//! (reads/back-compat) and the read-only deadpool never touch this lock.
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;

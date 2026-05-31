@@ -21,7 +21,12 @@ pub fn run(
     from: Option<&str>,
     auto_link: bool,
 ) -> Result<()> {
-    let conn = db::open_registry(vault_dir)?;
+    // Write command: take the advisory write lock for the whole mutation. A
+    // conflicting RW open (another process holds the lock) is refused here with
+    // the plain write-locked error before any work. The handle derefs to the
+    // `Connection`, so the mutation below is unchanged; it is dropped (releasing
+    // the lock) at the end of the function.
+    let conn = db::open_registry_guarded(vault_dir)?;
     let cfg = config::load(vault_dir)?;
 
     // Load template metadata if --from is provided
@@ -170,4 +175,128 @@ fn validate_enum(value: &str, valid: &[&str], field: &str) -> Result<()> {
         bail!("invalid --{}: '{}' (valid: {})", field, value, valid.join(", "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fresh, unique temp vault dir (matches the repo's temp-dir + pid + uuid
+    /// convention; no `tempfile` crate).
+    fn fresh_vault() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nark-jot-lock-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp vault");
+        crate::vault::fs::Vault::new(dir.clone())
+            .init_dirs()
+            .expect("init vault dirs");
+        dir
+    }
+
+    fn note_count(vault_dir: &Path) -> i64 {
+        let conn = db::open_registry(vault_dir).expect("open registry for count");
+        conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+            .expect("count notes")
+    }
+
+    /// Invoke `jot` with an inline body (so it never touches stdin) and the
+    /// minimal flags. Exercises the real command path end to end.
+    fn run_jot(vault_dir: &Path, body: &str) -> Result<()> {
+        run(
+            vault_dir,
+            Some("Lock Test".to_string()),
+            "tester",
+            Some("engineering"),
+            None,
+            None,
+            None,
+            &[],
+            Some(body),
+            None,
+            false,
+        )
+    }
+
+    /// With no lock held, `jot` succeeds (today's behavior) and actually commits
+    /// the note — i.e. the guarded open did not change the success path.
+    #[test]
+    fn jot_succeeds_and_commits_when_unlocked() {
+        let dir = fresh_vault();
+        assert_eq!(note_count(&dir), 0, "fresh vault has no notes");
+
+        run_jot(&dir, "First note body.").expect("jot succeeds when unlocked");
+
+        assert_eq!(
+            note_count(&dir),
+            1,
+            "jot must have committed exactly one note"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When the registry write lock is already held by a separate handle, `jot`
+    /// is refused with the plain write-locked error and must NOT mutate the
+    /// registry (no note committed).
+    #[test]
+    fn jot_refuses_and_does_not_mutate_when_write_locked() {
+        let dir = fresh_vault();
+        // Materialize the db + lock file via a first guarded open, then keep the
+        // lock held for the duration of the jot attempt.
+        let held = db::open_registry_guarded(&dir).expect("pre-hold the write lock");
+        assert_eq!(
+            note_count(&dir),
+            0,
+            "no notes before the locked jot attempt"
+        );
+
+        let err = run_jot(&dir, "Should not be written.")
+            .expect_err("jot must be refused while the write lock is held");
+        let msg = err.to_string();
+        assert_eq!(
+            msg, "registry is write-locked by another process",
+            "conflict must surface the plain honest error"
+        );
+        assert!(
+            !msg.contains("serve"),
+            "safety-net error must not mention serve"
+        );
+
+        assert_eq!(
+            note_count(&dir),
+            0,
+            "a refused jot must not have committed anything"
+        );
+
+        drop(held);
+        // After the lock is released, jot works again.
+        run_jot(&dir, "Now it works.").expect("jot succeeds after lock released");
+        assert_eq!(note_count(&dir), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reads must NEVER be gated by the write lock: while the lock is held, a
+    /// plain `open_registry` (the read path peek/read/etc. use) still opens and
+    /// queries the registry.
+    #[test]
+    fn read_works_while_write_locked() {
+        let dir = fresh_vault();
+        run_jot(&dir, "A readable note.").expect("seed one note");
+
+        let held = db::open_registry_guarded(&dir).expect("hold the write lock");
+
+        // Read path: open_registry (NOT guarded) must succeed and see the note.
+        let conn = db::open_registry(&dir).expect("read open while write-locked");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+            .expect("query while write-locked");
+        assert_eq!(count, 1, "read must see the committed note while locked");
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

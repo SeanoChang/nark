@@ -15,7 +15,11 @@ pub fn run(
     before: Option<String>,
     confirm: bool,
 ) -> Result<()> {
-    let conn = db::open_registry(vault_dir)?;
+    // Write command: hold the advisory write lock for the whole retract. A
+    // conflicting RW open is refused with the plain write-locked error; the
+    // handle derefs to the `Connection` so every mode below is unchanged, and
+    // the lock is released when the handle drops at end of function.
+    let conn = db::open_registry_guarded(vault_dir)?;
 
     let filter = BulkFilter {
         domain,

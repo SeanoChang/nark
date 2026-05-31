@@ -10,15 +10,10 @@ use wlock::WriteLock;
 
 /// Advisory registry write-lock primitive (Phase 5). Wired into
 /// [`open_registry_guarded`] as of slice 5.2: a guarded writer-open takes this
-/// lock before opening a RW connection. `pub` so callers can reason about the
-/// lock; reads (`open_registry` and the read-only deadpool) never touch it.
-///
-/// `allow(dead_code)`: as of this slice (5.2) the lock is exercised by the lib
-/// tests and by [`open_registry_guarded`], but no write-command call site in
-/// the *binary* takes a guarded handle yet, so the bin target still sees these
-/// symbols as unused. The slice that wires the write CLIs onto
-/// `open_registry_guarded` MUST drop this allow.
-#[allow(dead_code)]
+/// lock before opening a RW connection. As of slice 5.3 every mutating CLI
+/// command routes through `open_registry_guarded`, so the lock is now live in
+/// the binary. `pub` so callers can reason about the lock; reads
+/// (`open_registry` and the read-only deadpool) never touch it.
 pub mod wlock;
 
 pub const DEFAULT_AGENT_ID: &str = "noah";
@@ -63,11 +58,6 @@ pub fn open_registry(vault_dir: &Path) -> Result<Connection> {
 /// [`WriteLock`] is private (`_lock`): callers cannot release it early without
 /// dropping the whole handle, which guarantees the lock outlives every write
 /// issued through this connection.
-///
-/// `allow(dead_code)`: exercised by the lib tests this slice, but the binary
-/// has no guarded write-command call site yet (next slice). The wiring slice
-/// MUST drop this allow.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct WriteHandle {
     conn: Connection,
@@ -80,8 +70,10 @@ impl WriteHandle {
     /// Borrow the underlying connection. Equivalent to deref; provided for
     /// call sites that prefer an explicit accessor over auto-deref.
     ///
-    /// `allow(dead_code)`: exercised by the lib tests, but the binary has no
-    /// guarded call site yet (next slice). The wiring slice MUST drop this allow.
+    /// `allow(dead_code)`: the write CLIs use the `Deref` impl (passing `&handle`
+    /// where `&Connection` is expected, or `handle.method(...)` via auto-deref)
+    /// rather than this explicit accessor, so the bin target sees it as unused.
+    /// It is exercised by the lib tests and kept as a documented affordance.
     #[allow(dead_code)]
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -115,11 +107,6 @@ impl DerefMut for WriteHandle {
 /// another process") — see the Phase-5 scope decision: the write CLIs are a
 /// defense-in-depth safety net, not a UX surface, so there is no serve-specific
 /// message and no wait/retry.
-///
-/// `allow(dead_code)`: exercised by the lib tests this slice, but no write
-/// command in the binary calls it yet (next slice). The wiring slice MUST drop
-/// this allow.
-#[allow(dead_code)]
 pub fn open_registry_guarded(vault_dir: &Path) -> Result<WriteHandle> {
     let lock = match wlock::try_acquire(vault_dir)? {
         Some(lock) => lock,
