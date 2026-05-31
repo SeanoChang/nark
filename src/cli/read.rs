@@ -7,16 +7,16 @@ use crate::serve;
 use crate::vault::fs::Vault;
 
 pub fn run(vault_dir: &Path, id: &str) -> Result<()> {
-    // Dual-mode: ask a live `nark serve` first (one round-trip). On a socket hit
-    // we pretty-print the server's result and return; the serve read path is
-    // read-only and side-effect-free, so unlike the direct path it does not bump
-    // access. `try_request` returns `None` on ANY failure (absent/stale socket,
-    // connect timeout, `unauthorized`, error response, malformed JSON, any I/O
-    // error), and we then fall through to the always-correct direct-open path
-    // below, unchanged (including its access bump).
-    let socket = serve::client::default_socket(vault_dir);
+    // Dual-mode: ask a live `nark serve` first (one round-trip via the shared
+    // `try_vault_request` seam). On a socket hit we pretty-print the server's
+    // result and return; the serve read path is read-only and side-effect-free,
+    // so unlike the direct path it does not bump access. The seam returns `None`
+    // on ANY failure (absent/stale socket, connect timeout, `unauthorized`,
+    // error response, malformed JSON, any I/O error), and we then fall through
+    // to the always-correct direct-open path below, unchanged (including its
+    // access bump).
     if let Some(result) =
-        serve::client::try_request(&socket, "nark/read", serde_json::json!({ "id": id }))
+        serve::client::try_vault_request(vault_dir, "nark/read", serde_json::json!({ "id": id }))
     {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
@@ -113,7 +113,7 @@ mod tests {
         );
     }
 
-    /// (b) With NO serve (socket absent), the direct path is taken — `try_request`
+    /// (b) With NO serve (socket absent), the direct path is taken — the seam
     /// returns `None` — and the handler succeeds with the seeded vault's data.
     #[test]
     fn read_no_serve_takes_direct_path() {
@@ -123,12 +123,74 @@ mod tests {
         let socket = default_socket(&dir);
         assert!(!socket.exists(), "precondition: no serve socket");
         assert!(
-            serve::client::try_request(&socket, "nark/read", serde_json::json!({ "id": id }))
+            serve::client::try_vault_request(&dir, "nark/read", serde_json::json!({ "id": id }))
                 .is_none(),
-            "with no serve, try_request must return None so the direct path is taken"
+            "with no serve, the seam must return None so the direct path is taken"
         );
 
         run(&dir, &id).expect("direct-open read with no serve");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PARITY SWEEP (read): the BYTES `run` would print on a socket HIT must be
+    /// byte-identical to the direct path's printed bytes over the same seeded
+    /// vault. Both render via `serde_json::to_string_pretty(..)` + a trailing
+    /// newline.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_socket_vs_direct_output_is_byte_identical() {
+        let server = TestServer::start(current_uid_agent_map());
+
+        let socket_value = serve::client::try_vault_request(
+            server.dir(),
+            "nark/read",
+            serde_json::json!({ "id": server.note_id() }),
+        )
+        .expect("socket hit");
+        let direct_value = direct_read_value(server.dir(), server.note_id());
+
+        let socket_bytes = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&socket_value).expect("render socket")
+        );
+        let direct_bytes = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&direct_value).expect("render direct")
+        );
+        assert_eq!(
+            socket_bytes, direct_bytes,
+            "read output must be byte-identical socket-present vs socket-absent"
+        );
+    }
+
+    /// FALLBACK HARDENING (read): a STALE socket — bound but never accepting —
+    /// must NOT make the read fail. The seam times out, `run` falls back to the
+    /// full direct path, and the decisive proof it took the DIRECT branch (not
+    /// silently the socket) is that the direct path bumps access: `total_reads`
+    /// becomes 1.
+    #[test]
+    fn read_stale_socket_falls_back_to_direct_and_bumps_access() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = temp_vault_dir();
+        let id = seed_vault(&dir);
+        let socket = default_socket(&dir);
+        std::fs::create_dir_all(socket.parent().unwrap()).expect("create run dir");
+        let _listener = UnixListener::bind(&socket).expect("bind stale listener");
+
+        let start = std::time::Instant::now();
+        run(&dir, &id).expect("read must fall back to direct over a stale socket");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "a stale socket must not hang the read"
+        );
+
+        let conn = db::open_registry(&dir).expect("open registry");
+        let s = crate::registry::stats::overview(&conn).expect("stats overview");
+        assert_eq!(
+            s.access.total_reads, 1,
+            "fall-back must run the full direct path, which bumps access"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -109,18 +109,18 @@ pub fn run(
         bail!("--bm25 and --semantic are mutually exclusive");
     }
 
-    // Dual-mode: ask a live `nark serve` first (one round-trip). The socket is
-    // an optimization — `try_request` returns `None` on ANY failure (absent or
-    // stale socket, connect timeout, `unauthorized`, error response, malformed
+    // Dual-mode: ask a live `nark serve` first (one round-trip via the shared
+    // `try_vault_request` seam, which resolves the vault's socket itself). The
+    // socket is an optimization — the seam returns `None` on ANY failure (absent
+    // or stale socket, connect timeout, `unauthorized`, error response, malformed
     // JSON, any I/O error), and we then fall through to the always-correct
     // direct-open path below, unchanged (including every `--bm25`/`--semantic`/
     // filter behavior). The server runs the SAME `registry::search` pipeline, so
     // a socket HIT yields the identical result shape.
-    let socket = serve::client::default_socket(vault_dir);
     let params = search_params_json(
         query, domain, kind, intent, tags, limit, bm25_only, semantic, since, before,
     );
-    if let Some(result) = serve::client::try_request(&socket, "nark/search", params) {
+    if let Some(result) = serve::client::try_vault_request(vault_dir, "nark/search", params) {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -402,7 +402,7 @@ mod tests {
         .expect("dual-mode search over live serve");
     }
 
-    /// (b) With NO serve (socket absent), the direct path is taken — `try_request`
+    /// (b) With NO serve (socket absent), the direct path is taken — the seam
     /// returns `None` — and the handler succeeds with the seeded vault's data.
     /// The `--bm25` flag (the direct path's mode toggle) still works.
     #[test]
@@ -415,8 +415,8 @@ mod tests {
         let params =
             search_params_json("client", None, None, None, &[], 10, true, false, None, None);
         assert!(
-            serve::client::try_request(&socket, "nark/search", params).is_none(),
-            "with no serve, try_request must return None so the direct path is taken"
+            serve::client::try_vault_request(&dir, "nark/search", params).is_none(),
+            "with no serve, the seam must return None so the direct path is taken"
         );
 
         // --bm25 still works on the direct path (mutually exclusive with --semantic
@@ -435,6 +435,80 @@ mod tests {
             None,
         )
         .expect("direct-open search with --bm25 and no serve");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PARITY SWEEP (search): the BYTES `run` would print on a socket HIT must be
+    /// byte-identical to the direct path's printed bytes over the same seeded
+    /// vault for a representative query. Both render via
+    /// `serde_json::to_string_pretty(..)` + a trailing newline.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_socket_vs_direct_output_is_byte_identical() {
+        let server = TestServer::start(current_uid_agent_map());
+
+        let params = search_params_json(
+            "client",
+            None,
+            None,
+            None,
+            &[],
+            10,
+            false,
+            false,
+            None,
+            None,
+        );
+        let socket_value = serve::client::try_vault_request(server.dir(), "nark/search", params)
+            .expect("socket hit");
+        let direct_value = direct_search_value(server.dir(), "client");
+
+        let socket_bytes = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&socket_value).expect("render socket")
+        );
+        let direct_bytes = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&direct_value).expect("render direct")
+        );
+        assert_eq!(
+            socket_bytes, direct_bytes,
+            "search output must be byte-identical socket-present vs socket-absent"
+        );
+    }
+
+    /// FALLBACK HARDENING (search): a STALE socket — bound but never accepting —
+    /// must NOT make the read fail. The seam times out and `run` falls back to
+    /// the correct direct path with no hang.
+    #[test]
+    fn search_stale_socket_falls_back_to_direct() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = temp_vault_dir();
+        let _id = seed_vault(&dir);
+        let socket = default_socket(&dir);
+        std::fs::create_dir_all(socket.parent().unwrap()).expect("create run dir");
+        let _listener = UnixListener::bind(&socket).expect("bind stale listener");
+
+        let start = std::time::Instant::now();
+        run(
+            &dir,
+            "client",
+            None,
+            None,
+            None,
+            &[],
+            10,
+            false,
+            false,
+            None,
+            None,
+        )
+        .expect("search must fall back to direct over a stale socket");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "a stale socket must not hang the search read"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

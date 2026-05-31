@@ -83,20 +83,20 @@ pub fn run(
     since: Option<&str>,
     before: Option<&str>,
 ) -> Result<()> {
-    // Dual-mode: ask a live `nark serve` first (one round-trip). The serve
-    // `orient` result is the briefing markdown as a JSON string; on a socket HIT
-    // we print it RAW via `render_orient_output` (real newlines, unquoted,
-    // unescaped, no trailing newline) so the bytes are IDENTICAL to the
+    // Dual-mode: ask a live `nark serve` first (one round-trip via the shared
+    // `try_vault_request` seam, which resolves the vault's socket itself). The
+    // serve `orient` result is the briefing markdown as a JSON string; on a
+    // socket HIT we print it RAW via `render_orient_output` (real newlines,
+    // unquoted, unescaped, no trailing newline) so the bytes are IDENTICAL to the
     // direct-open path's `print!("{}", md)` — never `to_string_pretty`, which
-    // would quote/escape/one-line the markdown. The socket is
-    // an optimization: `try_request` returns `None` on ANY failure (absent or
-    // stale socket, connect timeout, `unauthorized`, error response, malformed
-    // JSON, any I/O error), and we then fall through to the always-correct
-    // direct-open path below, unchanged (including its per-note access bump,
-    // which the read-only serve path intentionally omits).
-    let socket = serve::client::default_socket(vault_dir);
+    // would quote/escape/one-line the markdown. The socket is an optimization:
+    // the seam returns `None` on ANY failure (absent or stale socket, connect
+    // timeout, `unauthorized`, error response, malformed JSON, any I/O error),
+    // and we then fall through to the always-correct direct-open path below,
+    // unchanged (including its per-note access bump, which the read-only serve
+    // path intentionally omits).
     let params = orient_params_json(query, domain, kind, tag_filters, limit, since, before);
-    if let Some(result) = serve::client::try_request(&socket, "nark/orient", params) {
+    if let Some(result) = serve::client::try_vault_request(vault_dir, "nark/orient", params) {
         print!("{}", render_orient_output(&result)?);
         return Ok(());
     }
@@ -366,7 +366,7 @@ mod tests {
         .expect("dual-mode orient over live serve");
     }
 
-    /// (b) With NO serve (socket absent), the direct path is taken — `try_request`
+    /// (b) With NO serve (socket absent), the direct path is taken — the seam
     /// returns `None` — and the handler succeeds with the seeded vault's data.
     #[test]
     fn orient_no_serve_takes_direct_path() {
@@ -377,12 +377,58 @@ mod tests {
         assert!(!socket.exists(), "precondition: no serve socket");
         let params = orient_params_json(None, Some("engineering"), None, &[], 10, None, None);
         assert!(
-            serve::client::try_request(&socket, "nark/orient", params).is_none(),
-            "with no serve, try_request must return None so the direct path is taken"
+            serve::client::try_vault_request(&dir, "nark/orient", params).is_none(),
+            "with no serve, the seam must return None so the direct path is taken"
         );
 
         run(&dir, None, Some("engineering"), None, &[], 10, None, None)
             .expect("direct-open orient with no serve");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PARITY SWEEP (orient): the BYTES `run` would print on a socket HIT must be
+    /// byte-identical to the direct path's printed bytes over the same seeded
+    /// vault. Orient prints RAW markdown via `print!("{}", md)` (no trailing
+    /// newline, no quoting), so we render the socket result through
+    /// `render_orient_output` — exactly what `run` writes — and compare it to the
+    /// direct path's reconstructed markdown.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn orient_socket_vs_direct_output_is_byte_identical() {
+        let server = TestServer::start(current_uid_agent_map());
+
+        let params = orient_params_json(None, Some("engineering"), None, &[], 10, None, None);
+        let socket_value = serve::client::try_vault_request(server.dir(), "nark/orient", params)
+            .expect("socket hit");
+
+        let socket_bytes = render_orient_output(&socket_value).expect("render socket");
+        let direct_bytes = direct_orient_markdown(server.dir(), "engineering");
+        assert_eq!(
+            socket_bytes, direct_bytes,
+            "orient output must be byte-identical socket-present vs socket-absent"
+        );
+    }
+
+    /// FALLBACK HARDENING (orient): a STALE socket — bound but never accepting —
+    /// must NOT make the read fail. The seam times out and `run` falls back to
+    /// the correct direct path with no hang.
+    #[test]
+    fn orient_stale_socket_falls_back_to_direct() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = temp_vault_dir();
+        let _id = seed_vault(&dir);
+        let socket = default_socket(&dir);
+        std::fs::create_dir_all(socket.parent().unwrap()).expect("create run dir");
+        let _listener = UnixListener::bind(&socket).expect("bind stale listener");
+
+        let start = std::time::Instant::now();
+        run(&dir, None, Some("engineering"), None, &[], 10, None, None)
+            .expect("orient must fall back to direct over a stale socket");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "a stale socket must not hang the orient read"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

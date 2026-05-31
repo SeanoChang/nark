@@ -43,14 +43,19 @@ use serde_json::Value;
 
 use crate::wire::{RPCRequest, RPCResponse};
 
-/// How long to wait for the socket connect / each read / each write before
-/// giving up and falling back to direct-open. Deliberately short: a stale or
-/// wedged socket must never make a read slower than it is today. `std`'s
-/// `UnixStream` has no `connect_timeout`, so the connect itself can in theory
-/// block; in practice a missing socket fails connect immediately (ENOENT /
-/// ECONNREFUSED) and a live local daemon accepts instantly, so the dominant
-/// risk — a stale socket file with no accepting peer — is covered by the
-/// read/write timeouts set immediately after connect.
+/// How long to wait for each read / each write before giving up and falling
+/// back to direct-open. Deliberately short: a stale or wedged socket must never
+/// make a read slower than it is today.
+///
+/// `std`'s `UnixStream` has no `connect_timeout`, but for a Unix-domain stream
+/// socket `connect(2)` does NOT block on the dominant failure modes — it
+/// resolves immediately: a missing socket or a plain file at the path fails
+/// fast (ENOENT / ECONNREFUSED / ENOTSOCK), and connecting to a *bound* socket
+/// is queued in the listener backlog by the kernel whether or not the peer has
+/// called `accept`. So the one residual hang risk — a stale socket file that is
+/// bound but never serviced — surfaces as a stalled *read*, which this timeout
+/// caps at ~300ms before we fall back. (See the `try_request_stale_socket_*`
+/// and `try_request_plain_file_*` tests, which pin both bounds empirically.)
 const TIMEOUT: Duration = Duration::from_millis(300);
 
 /// The default socket path for a vault: `<vault_dir>/run/nark.sock`
@@ -58,6 +63,22 @@ const TIMEOUT: Duration = Duration::from_millis(300);
 /// the path; never hard-coded).
 pub fn default_socket(vault_dir: &Path) -> PathBuf {
     super::resolve_socket_path(vault_dir, None)
+}
+
+/// The one seam every dual-mode read CLI handler shares.
+///
+/// Resolves the vault's socket path ([`default_socket`]) and asks a live
+/// `nark serve` exactly once ([`try_request`]). Returns `Some(result)` on a
+/// clean socket HIT and `None` on ANY failure — so the caller falls through to
+/// its always-correct direct-open path. Folding the `default_socket` +
+/// `try_request` plumbing here means the five handlers (`peek` / `read` /
+/// `stats` / `search` / `orient`) carry no per-command socket logic: each just
+/// builds its params, calls this, and either pretty-prints the server's result
+/// or runs its existing direct-open body. Pure refactor — same connect timeout,
+/// same fall-back rule, same return shape as calling [`try_request`] directly.
+pub fn try_vault_request(vault_dir: &Path, method: &str, params: Value) -> Option<Value> {
+    let socket = default_socket(vault_dir);
+    try_request(&socket, method, params)
 }
 
 /// Try one JSON-RPC request against a live `nark serve` at `socket_path`.
@@ -316,6 +337,106 @@ mod tests {
         // top-level stats keys must be present.
         assert!(result.get("by_domain").is_some());
         assert!(result.get("access").is_some());
+    }
+
+    /// The shared seam `try_vault_request` resolves the vault's socket itself
+    /// and is exactly equivalent to `try_request(default_socket(dir), ..)`. On a
+    /// HIT it must return the SAME `Some(result)` the lower-level call returns
+    /// (the refactor adds no behavior — it only folds the `default_socket`
+    /// plumbing the five handlers used to each repeat).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn try_vault_request_matches_try_request_on_hit() {
+        let server = TestServer::start(current_uid_agent_map());
+
+        let via_seam = try_vault_request(server.dir(), "nark/stats", json!({}))
+            .expect("seam should return Some on an authenticated hit");
+        let via_low = try_request(server.socket(), "nark/stats", json!({}))
+            .expect("low-level call should return Some on an authenticated hit");
+
+        assert_eq!(
+            via_seam, via_low,
+            "the shared seam must be value-equivalent to default_socket + try_request"
+        );
+    }
+
+    /// The shared seam falls back (returns `None`) for a vault with no daemon,
+    /// just as the lower-level call does — and fast, the dominant CLI case.
+    #[test]
+    fn try_vault_request_returns_none_with_no_daemon() {
+        let dir = temp_vault_dir();
+        assert!(
+            !default_socket(&dir).exists(),
+            "precondition: no serve socket for this vault"
+        );
+
+        let start = Instant::now();
+        let result = try_vault_request(&dir, "nark/stats", json!({}));
+        let elapsed = start.elapsed();
+
+        assert!(result.is_none(), "no daemon must yield None via the seam");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the seam must fail fast with no daemon, took {elapsed:?}"
+        );
+    }
+
+    /// FALLBACK HARDENING: a STALE socket — a real bound `UnixListener` that
+    /// never `accept`s (so the kernel queues the connect but no peer ever reads
+    /// or replies) — must still yield `None` and must do so within a bounded
+    /// time (the post-connect read/write `TIMEOUT`, ~300ms), never hanging the
+    /// synchronous CLI. This is the case `std`'s lack of a `connect_timeout`
+    /// could in theory leak; the read timeout set immediately after connect
+    /// covers it. Proven empirically here so the guarantee can't silently
+    /// regress.
+    #[test]
+    fn try_request_stale_socket_falls_back_without_hanging() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = temp_vault_dir();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let socket_path = dir.join("nark.sock");
+        // Bind a listener and intentionally NEVER accept: the connect succeeds
+        // (queued in the backlog) but no peer ever services it.
+        let _listener = UnixListener::bind(&socket_path).expect("bind stale listener");
+
+        let start = Instant::now();
+        let result = try_request(&socket_path, "nark/stats", json!({}));
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_none(),
+            "a stale socket with no accepting peer must fall back (None)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a stale socket must time out and fall back, not hang (took {elapsed:?})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FALLBACK HARDENING: a plain (non-socket) FILE sitting at the socket path
+    /// must fail connect immediately and yield `None` — fast fall-back, no hang.
+    #[test]
+    fn try_request_plain_file_at_socket_path_falls_back() {
+        let dir = temp_vault_dir();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let socket_path = dir.join("nark.sock");
+        std::fs::write(&socket_path, b"not a socket").expect("write plain file");
+
+        let start = Instant::now();
+        let result = try_request(&socket_path, "nark/stats", json!({}));
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_none(),
+            "a plain file at the socket path must fall back (None)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "a plain file must fail connect fast (no hang), took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (2) Against a NONEXISTENT socket path, `try_request` returns `None`

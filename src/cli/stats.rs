@@ -6,13 +6,15 @@ use crate::registry::stats;
 use crate::serve;
 
 pub fn run(vault_dir: &Path) -> Result<()> {
-    // Dual-mode: ask a live `nark serve` first (one round-trip). The socket is
-    // an optimization — `try_request` returns `None` on ANY failure (absent or
-    // stale socket, connect timeout, `unauthorized`, error response, malformed
+    // Dual-mode: ask a live `nark serve` first (one round-trip via the shared
+    // `try_vault_request` seam, which resolves the vault's socket itself). The
+    // socket is an optimization — the seam returns `None` on ANY failure (absent
+    // or stale socket, connect timeout, `unauthorized`, error response, malformed
     // JSON, any I/O error), and we then fall through to the always-correct
     // direct-open path below, unchanged.
-    let socket = serve::client::default_socket(vault_dir);
-    if let Some(result) = serve::client::try_request(&socket, "nark/stats", serde_json::json!({})) {
+    if let Some(result) =
+        serve::client::try_vault_request(vault_dir, "nark/stats", serde_json::json!({}))
+    {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
     }
@@ -124,7 +126,7 @@ mod tests {
         run(server.dir()).expect("dual-mode stats over live serve");
     }
 
-    /// (b) With NO serve (socket absent), the direct path is taken — `try_request`
+    /// (b) With NO serve (socket absent), the direct path is taken — the seam
     /// returns `None` — and the handler succeeds with the seeded vault's data.
     #[test]
     fn stats_no_serve_takes_direct_path() {
@@ -134,11 +136,61 @@ mod tests {
         let socket = default_socket(&dir);
         assert!(!socket.exists(), "precondition: no serve socket");
         assert!(
-            serve::client::try_request(&socket, "nark/stats", serde_json::json!({})).is_none(),
-            "with no serve, try_request must return None so the direct path is taken"
+            serve::client::try_vault_request(&dir, "nark/stats", serde_json::json!({})).is_none(),
+            "with no serve, the seam must return None so the direct path is taken"
         );
 
         run(&dir).expect("direct-open stats with no serve");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PARITY SWEEP (stats): the BYTES `run` would print on a socket HIT must be
+    /// byte-identical to the direct path's printed bytes over the same seeded
+    /// vault. Both render via `serde_json::to_string_pretty(..)` + a trailing
+    /// newline.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stats_socket_vs_direct_output_is_byte_identical() {
+        let server = TestServer::start(current_uid_agent_map());
+
+        let socket_value =
+            serve::client::try_vault_request(server.dir(), "nark/stats", serde_json::json!({}))
+                .expect("socket hit");
+        let direct_value = direct_stats_value(server.dir());
+
+        let socket_bytes = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&socket_value).expect("render socket")
+        );
+        let direct_bytes = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&direct_value).expect("render direct")
+        );
+        assert_eq!(
+            socket_bytes, direct_bytes,
+            "stats output must be byte-identical socket-present vs socket-absent"
+        );
+    }
+
+    /// FALLBACK HARDENING (stats): a STALE socket — bound but never accepting —
+    /// must NOT make the read fail. The seam times out and `run` falls back to
+    /// the correct direct path with no hang.
+    #[test]
+    fn stats_stale_socket_falls_back_to_direct() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = temp_vault_dir();
+        let _id = seed_vault(&dir);
+        let socket = default_socket(&dir);
+        std::fs::create_dir_all(socket.parent().unwrap()).expect("create run dir");
+        let _listener = UnixListener::bind(&socket).expect("bind stale listener");
+
+        let start = std::time::Instant::now();
+        run(&dir).expect("stats must fall back to direct over a stale socket");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "a stale socket must not hang the stats read"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
