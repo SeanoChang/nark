@@ -510,8 +510,15 @@ fn orient_briefing(
 /// 1. a **short** `interact` loads the stored per-note embeddings from the
 ///    registry (the only DB touch here, and it holds a connection only for that
 ///    read — never across inference). An empty result means there are no stored
-///    embeddings, so there is nothing to compare against and we skip cosine,
-///    exactly as the CLI's `embeddings::has_embeddings` gate would;
+///    embeddings to compare against, so we skip cosine. NOTE: this gate is
+///    `get_all_embeddings().is_empty()` (live `ark`, non-retracted notes only),
+///    which is *stronger* than the CLI's `embeddings::has_embeddings` (a raw
+///    `COUNT(*) > 0` over the whole table). The two diverge only when embeddings
+///    exist *exclusively* for retracted / non-`ark` notes: the CLI would still
+///    run the ONNX query embed (then find no usable candidates), whereas we skip
+///    inference early. Ranking results are identical either way (the cosine
+///    candidate query applies the same namespace/status filter downstream); the
+///    serve path just avoids wasted inference;
 /// 2. the **ONNX query embedding** then runs under an embedding permit (bounding
 ///    inference concurrency) via [`with_embed_permit`], on a blocking thread with
 ///    **no** connection held. Both provider init and `embed_query` happen there.
