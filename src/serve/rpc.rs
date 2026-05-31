@@ -14,6 +14,8 @@
 //! * `nark/peek` -> head metadata for `params.id` (see [`methods_read::peek`]),
 //! * `nark/read` -> frontmatter + body for `params.id` ([`methods_read::read`]),
 //! * `nark/stats` -> vault statistics ([`methods_read::stats`]),
+//! * `nark/search` -> ranked hits for the search `params` ([`methods_read::search`]),
+//! * `nark/orient` -> a markdown vault briefing ([`methods_read::orient`]),
 //! * any other method -> JSON-RPC `-32601 method not found`.
 //!
 //! The read methods call the same `registry::*` functions the CLI handlers do
@@ -24,9 +26,17 @@
 use serde_json::{Value, json};
 
 use super::methods_read;
+use super::methods_read::{OrientParams, SearchParams};
 use super::readpool::ReadPool;
 use crate::wire::{RPCRequest, RPCResponse};
 use std::path::{Path, PathBuf};
+
+/// CLI default `--limit` for `nark search` (`cli::mod`), used when
+/// `params.limit` is omitted so the socket path defaults like the command line.
+const SEARCH_DEFAULT_LIMIT: usize = 10;
+/// CLI default `--limit` for `nark orient` (`cli::mod`); orient surfaces fewer
+/// notes than search by default.
+const ORIENT_DEFAULT_LIMIT: usize = 5;
 
 /// JSON-RPC error code: the requested method is not implemented.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -81,8 +91,171 @@ pub fn dispatch(ctx: &Ctx, req: &RPCRequest) -> RPCResponse {
             Err(resp) => resp,
         },
         "nark/stats" => result_or_invalid(req, methods_read::stats(&ctx.pool)),
+        "nark/search" => match search_params(req) {
+            Ok(params) => result_or_invalid(
+                req,
+                methods_read::search(&ctx.pool, &ctx.vault_dir, &params),
+            ),
+            Err(resp) => resp,
+        },
+        "nark/orient" => match orient_params(req) {
+            Ok(params) => result_or_invalid(
+                req,
+                methods_read::orient(&ctx.pool, &ctx.vault_dir, &params),
+            ),
+            Err(resp) => resp,
+        },
         _ => RPCResponse::error(req.id.clone(), METHOD_NOT_FOUND, "method not found", None),
     }
+}
+
+/// Parse the `nark/search` `params` object into [`SearchParams`].
+///
+/// All fields are optional and default exactly as the CLI does: empty `query`,
+/// no pre-filters, `limit` -> [`SEARCH_DEFAULT_LIMIT`], `bm25`/`semantic` off.
+/// A `params` value that is present but not a JSON object, or a field of the
+/// wrong type, yields a `-32602 invalid params` error response.
+fn search_params(req: &RPCRequest) -> Result<SearchParams, RPCResponse> {
+    let obj = params_object(req)?;
+    Ok(SearchParams {
+        query: opt_string(req, obj, "query")?.unwrap_or_default(),
+        domain: opt_string(req, obj, "domain")?,
+        kind: opt_string(req, obj, "kind")?,
+        intent: opt_string(req, obj, "intent")?,
+        tags: opt_string_array(req, obj, "tag")?,
+        limit: opt_limit(req, obj, SEARCH_DEFAULT_LIMIT)?,
+        bm25: opt_bool(req, obj, "bm25")?,
+        semantic: opt_bool(req, obj, "semantic")?,
+        since: opt_string(req, obj, "since")?,
+        before: opt_string(req, obj, "before")?,
+    })
+}
+
+/// Parse the `nark/orient` `params` object into [`OrientParams`].
+///
+/// `orient` accepts `query` or its alias `topic` (query wins if both are given),
+/// the domain/kind/tag filters, `limit` -> [`ORIENT_DEFAULT_LIMIT`], and the
+/// `since`/`before` bounds. All optional; type mismatches yield `-32602`.
+fn orient_params(req: &RPCRequest) -> Result<OrientParams, RPCResponse> {
+    let obj = params_object(req)?;
+    let query = match opt_string(req, obj, "query")? {
+        Some(q) => Some(q),
+        None => opt_string(req, obj, "topic")?,
+    };
+    Ok(OrientParams {
+        query,
+        domain: opt_string(req, obj, "domain")?,
+        kind: opt_string(req, obj, "kind")?,
+        tags: opt_string_array(req, obj, "tag")?,
+        limit: opt_limit(req, obj, ORIENT_DEFAULT_LIMIT)?,
+        since: opt_string(req, obj, "since")?,
+        before: opt_string(req, obj, "before")?,
+    })
+}
+
+/// Borrow `req.params` as a JSON object. A missing `params` is treated as an
+/// empty object (all fields default); a non-object `params` is an error.
+fn params_object(req: &RPCRequest) -> Result<&serde_json::Map<String, Value>, RPCResponse> {
+    static EMPTY: std::sync::OnceLock<serde_json::Map<String, Value>> = std::sync::OnceLock::new();
+    match req.params.as_ref() {
+        None => Ok(EMPTY.get_or_init(serde_json::Map::new)),
+        Some(Value::Object(map)) => Ok(map),
+        Some(_) => Err(invalid(req, "invalid params: expected an object")),
+    }
+}
+
+/// Read an optional string field; `null`/absent -> `None`, non-string -> error.
+fn opt_string(
+    req: &RPCRequest,
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, RPCResponse> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(invalid(
+            req,
+            &format!("invalid params: '{key}' must be a string"),
+        )),
+    }
+}
+
+/// Read an optional string-array field (e.g. `tag`); absent/`null` -> empty vec.
+/// A non-array, or an array element that is not a string, is an error.
+fn opt_string_array(
+    req: &RPCRequest,
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Vec<String>, RPCResponse> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    _ => {
+                        return Err(invalid(
+                            req,
+                            &format!("invalid params: '{key}' must be an array of strings"),
+                        ));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(invalid(
+            req,
+            &format!("invalid params: '{key}' must be an array of strings"),
+        )),
+    }
+}
+
+/// Read an optional boolean flag; absent/`null` -> `false`, non-bool -> error.
+fn opt_bool(
+    req: &RPCRequest,
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<bool, RPCResponse> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(invalid(
+            req,
+            &format!("invalid params: '{key}' must be a boolean"),
+        )),
+    }
+}
+
+/// Read an optional `limit`; absent/`null` -> `default`. Must be a non-negative
+/// integer that fits `usize`; anything else is an error.
+fn opt_limit(
+    req: &RPCRequest,
+    obj: &serde_json::Map<String, Value>,
+    default: usize,
+) -> Result<usize, RPCResponse> {
+    match obj.get("limit") {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Number(n)) => {
+            n.as_u64()
+                .and_then(|u| usize::try_from(u).ok())
+                .ok_or_else(|| {
+                    invalid(
+                        req,
+                        "invalid params: 'limit' must be a non-negative integer",
+                    )
+                })
+        }
+        Some(_) => Err(invalid(
+            req,
+            "invalid params: 'limit' must be a non-negative integer",
+        )),
+    }
+}
+
+/// Build a `-32602 invalid params` error response echoing the request id.
+fn invalid(req: &RPCRequest, message: &str) -> RPCResponse {
+    RPCResponse::error(req.id.clone(), INVALID_PARAMS, message, None)
 }
 
 /// Extract the required string `params.id` for `nark/peek` / `nark/read`.
@@ -253,6 +426,156 @@ Router body text.\n";
         let resp = dispatch(&ctx, &request("10", "nark/peek", None));
         let err = expect_error(resp);
         assert_eq!(err.code, INVALID_PARAMS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn note_doc(title: &str, body: &str) -> String {
+        format!(
+            "---\n\
+title: {title}\n\
+author: tester\n\
+domain: engineering\n\
+intent: reference\n\
+kind: note\n\
+status: active\n\
+tags:\n\
+  - gamma\n\
+---\n\
+{body}\n"
+        )
+    }
+
+    /// Seed a temp vault with a few notes and return a read-only `Ctx`.
+    fn seeded_ctx_multi() -> (Ctx, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "nark-rpc-search-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp vault");
+        let conn = crate::db::open_registry(&dir).expect("open writer registry");
+        let vault = Vault::new(dir.clone());
+        for (title, body) in [
+            ("Rust Ownership", "Borrowing and lifetimes in Rust."),
+            ("Tokio Tasks", "Async tasks on the tokio runtime."),
+        ] {
+            let result = vault.ingest(&note_doc(title, body), None).expect("ingest");
+            commit_version(&conn, &result).expect("commit version");
+        }
+        drop(conn);
+        let pool = ReadPool::open_with_size(&dir, 2).expect("open read pool");
+        (Ctx::new(pool, dir.clone()), dir)
+    }
+
+    #[test]
+    fn search_returns_ranked_hits() {
+        let (ctx, dir) = seeded_ctx_multi();
+        let resp = dispatch(
+            &ctx,
+            &request("11", "nark/search", Some(json!({"query": "tokio"}))),
+        );
+        let v = expect_result(resp);
+        assert_eq!(v["query"], "tokio");
+        assert_eq!(v["mode"], "normal");
+        assert!(v["hits"].as_u64().unwrap() >= 1);
+        assert_eq!(v["results"][0]["title"], "Tokio Tasks");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_bm25_flag_selects_bm25_mode() {
+        let (ctx, dir) = seeded_ctx_multi();
+        let resp = dispatch(
+            &ctx,
+            &request(
+                "12",
+                "nark/search",
+                Some(json!({"query": "rust", "bm25": true})),
+            ),
+        );
+        let v = expect_result(resp);
+        assert_eq!(v["mode"], "bm25");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_with_no_query_and_no_filters_is_invalid_params() {
+        // registry::search bails when there is neither a query nor a filter; the
+        // router maps that Err to -32602 rather than panicking.
+        let (ctx, dir) = seeded_ctx_multi();
+        let resp = dispatch(&ctx, &request("13", "nark/search", Some(json!({}))));
+        let err = expect_error(resp);
+        assert_eq!(err.code, INVALID_PARAMS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_bad_param_type_is_invalid_params() {
+        let (ctx, dir) = seeded_ctx_multi();
+        let resp = dispatch(
+            &ctx,
+            &request("14", "nark/search", Some(json!({"query": 7}))),
+        );
+        let err = expect_error(resp);
+        assert_eq!(err.code, INVALID_PARAMS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orient_returns_markdown_briefing() {
+        let (ctx, dir) = seeded_ctx_multi();
+        let resp = dispatch(
+            &ctx,
+            &request("15", "nark/orient", Some(json!({"query": "rust"}))),
+        );
+        let v = expect_result(resp);
+        let md = v.as_str().expect("orient returns a markdown string");
+        assert!(md.starts_with("# Vault Briefing: rust"));
+        assert!(md.contains("## Key Notes"));
+        assert!(md.contains("## Recent Activity"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orient_accepts_topic_alias_and_omitted_params() {
+        let (ctx, dir) = seeded_ctx_multi();
+        let resp = dispatch(
+            &ctx,
+            &request("16", "nark/orient", Some(json!({"topic": "tokio"}))),
+        );
+        let v = expect_result(resp);
+        let md = v.as_str().unwrap();
+        assert!(
+            md.starts_with("# Vault Briefing: tokio"),
+            "the `topic` alias should feed the query, got: {md}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orient_no_query_no_filter_is_invalid_params() {
+        // Mirrors the CLI: orient with neither a query nor a filter bails in
+        // registry::search; the router maps that to -32602 (not a panic).
+        let (ctx, dir) = seeded_ctx_multi();
+        let resp = dispatch(&ctx, &request("17", "nark/orient", None));
+        let err = expect_error(resp);
+        assert_eq!(err.code, INVALID_PARAMS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn orient_with_filter_and_omitted_query_briefs_vault() {
+        let (ctx, dir) = seeded_ctx_multi();
+        let resp = dispatch(
+            &ctx,
+            &request("18", "nark/orient", Some(json!({"domain": "engineering"}))),
+        );
+        let v = expect_result(resp);
+        let md = v.as_str().unwrap();
+        assert!(
+            md.starts_with("# Vault Briefing: vault"),
+            "omitted query with a filter defaults to a whole-vault briefing, got: {md}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
