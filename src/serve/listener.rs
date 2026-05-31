@@ -234,10 +234,13 @@ impl BoundListener {
     /// (short duration) and the over-size path (small cap) without the production
     /// [`READ_TIMEOUT`] / [`MAX_REQUEST_BYTES`].
     ///
-    /// Each connection's blocking JSON-RPC dispatch runs on a `spawn_blocking`
-    /// thread (see [`handle_authenticated_connection`]) so the pool's blocking
-    /// `Condvar` checkout can never park a tokio worker and starve the accept loop
-    /// / shutdown future (Spec §10).
+    /// Each connection's JSON-RPC dispatch is awaited directly (see
+    /// [`handle_authenticated_connection`]): the cheap methods run their blocking
+    /// SQLite via the deadpool pool's `interact` (own thread) and `get().await`
+    /// backpressures, so a saturated pool can never park a tokio worker and starve
+    /// the accept loop / shutdown future (Spec §10). The hand-rolled `ReadPool`
+    /// still backs `search` / `orient`, which `dispatch` runs via `spawn_blocking`
+    /// until slice 3.5.4 migrates them.
     pub async fn serve_authenticated_until_with_limits<F>(
         &self,
         agents: AgentMap,
@@ -307,7 +310,7 @@ async fn handle_connection(stream: UnixStream, ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
     let response = match serde_json::from_str::<RPCRequest>(line.trim_end()) {
-        Ok(req) => rpc::dispatch(ctx, &req),
+        Ok(req) => rpc::dispatch(ctx, &req).await,
         Err(e) => {
             eprintln!("nark serve: unauthenticated peer sent malformed JSON-RPC: {e}");
             RPCResponse::error("", PARSE_ERROR, "parse error", None)
@@ -333,14 +336,16 @@ async fn handle_connection(stream: UnixStream, ctx: &Ctx) -> Result<()> {
 /// 4. Dispatch via [`rpc::dispatch`] and write the single [`RPCResponse`] as one
 ///    JSON line + newline.
 ///
-/// The synchronous [`rpc::dispatch`] does a *blocking* pool checkout
-/// ([`super::readpool::ReadPool::with_conn`] waits on a `Condvar` when every
-/// connection is busy), so it is run on a [`tokio::task::spawn_blocking`] thread
-/// rather than the async worker. This keeps the accept loop and shutdown future
-/// making progress even when all pool connections are held (Spec §10: reads must
-/// never block the reactor). The owned `req` and a cloned `Arc<Ctx>` move into
-/// the blocking closure; the response is awaited and written back on the async
-/// side.
+/// [`rpc::dispatch`] is now `async`: the cheap methods (`peek` / `read` /
+/// `stats`) check a connection out of the [`deadpool`] pool and run their
+/// blocking SQLite on a managed thread via `conn.interact(...).await`, so this
+/// handler can `await` the dispatch directly — there is no `spawn_blocking`
+/// wrapper around it anymore (slice 3.5.2). The reactor stays free even when the
+/// pool is saturated: `pool.get().await` backpressures and `interact` owns its
+/// own blocking thread, so no tokio worker is parked (Spec §10: reads must never
+/// block the reactor). The embedding-bearing methods (`search` / `orient`) still
+/// run on the hand-rolled `ReadPool`; `dispatch` routes those through
+/// `spawn_blocking` internally (removed in slice 3.5.4).
 ///
 /// The accept loop is unaffected by the per-connection timeout because this runs
 /// inside the spawned per-connection task.
@@ -406,12 +411,12 @@ async fn handle_authenticated_connection(
     // `-32700 parse error` and an empty id (we have no id to echo).
     let response = match serde_json::from_str::<RPCRequest>(line.trim_end()) {
         Ok(req) => {
-            // The pool checkout inside dispatch blocks (Condvar); run it off the
-            // async worker so it cannot park the reactor (Spec §10).
-            let ctx = Arc::clone(&ctx);
-            tokio::task::spawn_blocking(move || rpc::dispatch(&ctx, &req))
-                .await
-                .context("joining dispatch task")?
+            // dispatch is async: cheap methods run their blocking SQLite via
+            // deadpool `interact` (own thread), and `get().await` backpressures —
+            // so awaiting here never parks the reactor (Spec §10). No
+            // `spawn_blocking` wrapper needed (search/orient handle their own
+            // blocking internally until slice 3.5.4).
+            rpc::dispatch(&ctx, &req).await
         }
         Err(e) => {
             eprintln!("nark serve: {agent} (uid {uid}) sent malformed JSON-RPC: {e}");
@@ -472,7 +477,7 @@ mod tests {
     /// enables WAL) with one ingested note, then build the read-only [`Ctx`] the
     /// serve loops dispatch against. Returns `(ctx, note_id)`. The writer
     /// connection is dropped before the read pool opens.
-    fn seeded_ctx(dir: &Path) -> (Arc<Ctx>, String) {
+    async fn seeded_ctx(dir: &Path) -> (Arc<Ctx>, String) {
         use crate::registry::write::commit_version;
         use crate::vault::fs::Vault;
 
@@ -496,7 +501,7 @@ Socket body text.\n";
         let note_id = result.note_id.clone();
         drop(conn);
 
-        let ctx = Ctx::open(dir).expect("open serve ctx");
+        let ctx = Ctx::open(dir).await.expect("open serve ctx");
         (Arc::new(ctx), note_id)
     }
 
@@ -524,7 +529,7 @@ Socket body text.\n";
         let dir = temp_socket_dir();
         let socket_path = dir.join("nark.sock");
         let bound = BoundListener::bind(&socket_path).expect("bind listener");
-        let (ctx, _note_id) = seeded_ctx(&dir);
+        let (ctx, _note_id) = seeded_ctx(&dir).await;
 
         // Register the *test process's own* uid as a known agent so the
         // connecting client (this process) authenticates as "tester".
@@ -576,7 +581,7 @@ Socket body text.\n";
         let dir = temp_socket_dir();
         let socket_path = dir.join("nark.sock");
         let bound = BoundListener::bind(&socket_path).expect("bind listener");
-        let (ctx, note_id) = seeded_ctx(&dir);
+        let (ctx, note_id) = seeded_ctx(&dir).await;
 
         let me = nix::unistd::getuid().as_raw();
         let mut table = HashMap::new();
@@ -667,7 +672,7 @@ Socket body text.\n";
         let dir = temp_socket_dir();
         let socket_path = dir.join("nark.sock");
         let bound = BoundListener::bind(&socket_path).expect("bind listener");
-        let (ctx, note_id) = seeded_ctx(&dir);
+        let (ctx, note_id) = seeded_ctx(&dir).await;
 
         // Map the test process's own uid to a known agent so we authenticate.
         let me = nix::unistd::getuid().as_raw();
@@ -751,7 +756,7 @@ Socket body text.\n";
 
         // Empty map -> the connecting uid is unknown -> rejected at the app layer.
         let agents = AgentMap::default();
-        let (ctx, note_id) = seeded_ctx(&dir);
+        let (ctx, note_id) = seeded_ctx(&dir).await;
 
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -823,7 +828,7 @@ Socket body text.\n";
         let socket_path = dir.join("nark.sock");
         let bound = BoundListener::bind(&socket_path).expect("bind listener");
 
-        let (ctx, _note_id) = seeded_ctx(&dir);
+        let (ctx, _note_id) = seeded_ctx(&dir).await;
         let me = nix::unistd::getuid().as_raw();
         let mut table = HashMap::new();
         table.insert(me, "tester".to_string());
@@ -872,7 +877,7 @@ Socket body text.\n";
         let socket_path = dir.join("nark.sock");
         let bound = BoundListener::bind(&socket_path).expect("bind listener");
 
-        let (ctx, _note_id) = seeded_ctx(&dir);
+        let (ctx, _note_id) = seeded_ctx(&dir).await;
         let me = nix::unistd::getuid().as_raw();
         let mut table = HashMap::new();
         table.insert(me, "tester".to_string());
@@ -921,7 +926,7 @@ Socket body text.\n";
         let agents = AgentMap::default();
         // Ctx is required by the loop signature but never reached: rejection
         // precedes any RPC dispatch.
-        let (ctx, _note_id) = seeded_ctx(&dir);
+        let (ctx, _note_id) = seeded_ctx(&dir).await;
 
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
@@ -985,7 +990,7 @@ Socket body text.\n";
         // Socket file exists once bound.
         assert!(socket_path.exists(), "socket file should exist after bind");
 
-        let (ctx, _note_id) = seeded_ctx(&dir);
+        let (ctx, _note_id) = seeded_ctx(&dir).await;
         let (tx, rx) = oneshot::channel::<()>();
         let serve_path = socket_path.clone();
         let server = tokio::spawn(async move {
@@ -1145,7 +1150,7 @@ Socket body text.\n";
         let mut table = HashMap::new();
         table.insert(me, "tester".to_string());
         let agents = AgentMap::new(table);
-        let (ctx, _note_id) = seeded_ctx(&dir);
+        let (ctx, _note_id) = seeded_ctx(&dir).await;
 
         // Short timeout so the test does not hang.
         let read_timeout = Duration::from_millis(150);
@@ -1177,7 +1182,7 @@ Socket body text.\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---- FIX 1: blocking pool checkout must not park a tokio worker ----
+    // ---- FIX 1: a saturated read pool must not park a tokio worker ----
 
     /// Seed a vault on disk (writer ingests one note, drops) and return its dir.
     /// Used by the saturation test, which then opens its own sized pool.
@@ -1207,24 +1212,33 @@ Saturation body text.\n";
         dir
     }
 
-    /// FIX 1 — when every read-pool connection is held busy, a concurrent
-    /// `ping`-style request still makes progress within a short timeout, proving
-    /// the blocking pool checkout (and the synchronous `dispatch` it sits under)
-    /// runs on a `spawn_blocking` thread rather than parking a tokio worker and
-    /// starving the accept loop. The `dispatch` runs on a worker-limited runtime
-    /// so a parked worker would deadlock the runtime within the test budget.
+    /// FIX 1 (slice 3.5.2 edition) — when every deadpool connection is checked
+    /// out, a concurrent `ping` request still round-trips promptly on a 1-worker
+    /// runtime, proving the migrated cheap-read path keeps the reactor free
+    /// **without** the old `spawn_blocking` wrapper.
+    ///
+    /// The cheap methods now check a connection out of the deadpool pool and run
+    /// their blocking SQLite via `conn.interact(...).await`; `pool.get().await`
+    /// backpressures (async wait) when the pool is saturated rather than blocking.
+    /// So when `nark/stats` is fired against a fully-checked-out pool, its dispatch
+    /// `await`s the checkout and yields the single worker — a concurrent `ping`
+    /// (which needs no connection) is still driven to completion. Under the old
+    /// synchronous dispatch a blocking checkout would have parked the only worker
+    /// and the ping would time out; here it does not, because nothing blocks the
+    /// reactor. Once the held connections are dropped the blocked stats completes.
     #[cfg(target_os = "macos")]
     #[test]
     fn saturated_pool_does_not_block_concurrent_request() {
         use super::super::AgentMap;
+        use super::super::dpool::open_ro_pool;
         use super::super::readpool::ReadPool;
         use std::collections::HashMap;
 
         const N: usize = 2;
 
-        // A 1-worker multi-thread runtime: if the synchronous dispatch ran on the
-        // async worker, a blocking pool checkout would park the only worker and
-        // the concurrent ping could never be driven, tripping the timeout.
+        // A 1-worker multi-thread runtime: if the dispatch blocked the worker on a
+        // saturated checkout, the concurrent ping could never be driven and the
+        // timeout below would trip.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -1236,10 +1250,13 @@ Saturation body text.\n";
             let socket_path = dir.join("nark.sock");
             let bound = BoundListener::bind(&socket_path).expect("bind listener");
 
-            // One pool of N conns, shared between the daemon `Ctx` and this test
-            // (which holds the other handle to occupy every connection).
-            let pool = Arc::new(ReadPool::open_with_size(&dir, N).expect("open read pool"));
-            let ctx = Arc::new(Ctx::new_shared(Arc::clone(&pool), dir.clone()));
+            // One deadpool of N conns, shared between the daemon `Ctx` and this
+            // test (the pool is `Clone`/`Arc`-backed, so the daemon and the test
+            // checkout from the same pool). The `ReadPool` only backs search/orient
+            // this slice; the cheap `nark/stats` below uses the deadpool.
+            let dpool = open_ro_pool(&dir, N).await.expect("open deadpool pool");
+            let ro_pool = ReadPool::open_with_size(&dir, N).expect("open read pool");
+            let ctx = Arc::new(Ctx::new(dpool.clone(), ro_pool, dir.clone()));
 
             let me = nix::unistd::getuid().as_raw();
             let mut table = HashMap::new();
@@ -1256,42 +1273,18 @@ Saturation body text.\n";
                     .expect("serve loop");
             });
 
-            // Occupy ALL N pool connections on blocking threads: each enters
-            // `with_conn`, signals "checked out" via a barrier, then blocks the
-            // blocking thread on a release barrier so the conn stays checked out.
-            // The hold barrier has N+1 parties (the N holders + this task) so we
-            // know every connection is checked out before we fire the ping. The
-            // release barrier (also N+1) is purely synchronous, so the blocking
-            // closure never needs to touch the async runtime.
-            let hold_barrier = Arc::new(std::sync::Barrier::new(N + 1));
-            let release_barrier = Arc::new(std::sync::Barrier::new(N + 1));
-            let mut holders = Vec::new();
+            // Occupy ALL N deadpool connections by checking them out and holding
+            // the `Object`s alive (they return to the pool only on drop). With
+            // every connection held, the daemon's `nark/stats` dispatch must wait
+            // on `pool.get().await` — an async backpressure wait, not a worker park.
+            let mut holders = Vec::with_capacity(N);
             for _ in 0..N {
-                let pool = Arc::clone(&pool);
-                let hold_barrier = Arc::clone(&hold_barrier);
-                let release_barrier = Arc::clone(&release_barrier);
-                holders.push(tokio::task::spawn_blocking(move || {
-                    pool.with_conn(|_conn| {
-                        hold_barrier.wait();
-                        release_barrier.wait();
-                        Ok(())
-                    })
-                    .expect("hold conn");
-                }));
+                holders.push(dpool.get().await.expect("checkout connection"));
             }
-            // Wait (off the async worker) until all N connections are confirmed
-            // checked out, so the pool is fully saturated before the ping.
-            tokio::task::spawn_blocking({
-                let hold_barrier = Arc::clone(&hold_barrier);
-                move || hold_barrier.wait()
-            })
-            .await
-            .expect("barrier join");
 
-            // Fire a pool-NEEDING request (`nark/stats`) while the pool is fully
-            // saturated. Its dispatch must block on the Condvar checkout until a
-            // holder releases. If that dispatch ran on the async worker, it would
-            // park the runtime's only worker — the discriminating condition.
+            // Fire a pool-NEEDING request (`nark/stats`) against the saturated
+            // pool. Its dispatch `await`s the checkout (cannot complete: every
+            // connection is held) and yields the worker.
             let blocked = tokio::spawn({
                 let socket_path = socket_path.clone();
                 async move {
@@ -1307,10 +1300,9 @@ Saturation body text.\n";
                 }
             });
 
-            // Give the blocked stats request time to reach the checkout (it cannot
-            // complete: every connection is held). Then a concurrent `ping` must
-            // STILL round-trip promptly. Under synchronous dispatch the worker is
-            // parked on the stats checkout and this ping would time out.
+            // Give the blocked stats request time to reach the checkout wait. Then
+            // a concurrent `ping` must STILL round-trip promptly. If awaiting the
+            // saturated checkout parked the single worker, this ping would time out.
             tokio::time::sleep(Duration::from_millis(200)).await;
             let ping = async {
                 let mut stream = UnixStream::connect(&socket_path)
@@ -1329,14 +1321,9 @@ Saturation body text.\n";
             assert_eq!(v["id"], "sat");
             assert_eq!(v["result"]["pong"], true);
 
-            // Release the holders (rendezvous on the release barrier off the async
-            // worker); the previously-blocked stats request now completes.
-            tokio::task::spawn_blocking(move || release_barrier.wait())
-                .await
-                .expect("release barrier join");
-            for h in holders {
-                h.await.expect("holder join");
-            }
+            // Release the held connections back to the pool; the previously-blocked
+            // stats request now wins a checkout and completes.
+            drop(holders);
             let stats = tokio::time::timeout(Duration::from_secs(5), blocked)
                 .await
                 .expect("blocked stats must complete once the pool frees up")
@@ -1369,7 +1356,7 @@ Saturation body text.\n";
         let mut table = HashMap::new();
         table.insert(me, "tester".to_string());
         let agents = AgentMap::new(table);
-        let (ctx, _note_id) = seeded_ctx(&dir);
+        let (ctx, _note_id) = seeded_ctx(&dir).await;
 
         // Small injected cap so the test sends a modest over-size payload. Generous
         // read timeout so a hang (not the cap) would be the failure, not a timeout.
@@ -1443,7 +1430,7 @@ Saturation body text.\n";
         let mut table = HashMap::new();
         table.insert(me, "tester".to_string());
         let agents = AgentMap::new(table);
-        let (ctx, _note_id) = seeded_ctx(&dir);
+        let (ctx, _note_id) = seeded_ctx(&dir).await;
 
         // 256-byte cap comfortably fits the ping request line below.
         let max_request_bytes: u64 = 256;

@@ -6,10 +6,15 @@
 //! those commands: same shape, same fields, no behavioural change to the CLI.
 //!
 //! Key differences from the CLI handlers, both forced by the read-only serve
-//! design (slice 3.1's [`ReadPool`](super::readpool::ReadPool)):
+//! design:
 //!
-//! * registry access goes through `ReadPool::with_conn` (a borrowed read-only
-//!   [`rusqlite::Connection`]) instead of a fresh writable `db::open_registry`;
+//! * registry access is read-only — instead of a fresh writable
+//!   `db::open_registry`, the cheap methods ([`peek`] / [`read`] / [`stats`])
+//!   check out a connection from the [`deadpool`]-managed read-only pool
+//!   ([`super::dpool`]) and run their blocking SQLite on a managed thread via
+//!   `conn.interact(...)` (slice 3.5.2); the embedding-bearing methods
+//!   ([`search`] / [`orient`]) still use the hand-rolled
+//!   [`ReadPool`](super::readpool::ReadPool) until slice 3.5.4 migrates them;
 //! * [`read`] does **not** call `access::bump_access` — that is a write, and the
 //!   pool's connection is read-only. The serve read path is side-effect-free; if
 //!   access tracking over the socket is wanted it belongs to a later write-path
@@ -26,6 +31,9 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::{Value, json};
 
+use deadpool::managed::Pool;
+
+use super::dpool::RoManager;
 use super::readpool::ReadPool;
 use crate::cli::search::parse_temporal;
 use crate::cli::util::truncate_at_word;
@@ -76,22 +84,27 @@ pub struct OrientParams {
 /// `intent`, `kind`, `status`, `tags`, `updated_at`, `links_in`, `links_out`.
 /// An unknown or ambiguous id surfaces as the `Err` from [`resolve::get_meta`],
 /// which the router turns into an error response.
-pub fn peek(pool: &ReadPool, id: &str) -> Result<Value> {
-    pool.with_conn(|conn| {
-        let meta = resolve::get_meta(conn, id)?;
-        Ok(json!({
-            "id": meta.note_id,
-            "title": meta.title,
-            "domain": meta.domain,
-            "intent": meta.intent,
-            "kind": meta.kind,
-            "status": meta.status,
-            "tags": meta.tags,
-            "updated_at": meta.updated_at,
-            "links_in": meta.links_in,
-            "links_out": meta.links_out,
-        }))
-    })
+pub async fn peek(pool: &Pool<RoManager>, id: &str) -> Result<Value> {
+    let id = id.to_string();
+    pool.get()
+        .await?
+        .interact(move |conn| {
+            let meta = resolve::get_meta(conn, &id)?;
+            Ok(json!({
+                "id": meta.note_id,
+                "title": meta.title,
+                "domain": meta.domain,
+                "intent": meta.intent,
+                "kind": meta.kind,
+                "status": meta.status,
+                "tags": meta.tags,
+                "updated_at": meta.updated_at,
+                "links_in": meta.links_in,
+                "links_out": meta.links_out,
+            }))
+        })
+        .await
+        .map_err(interact_err)?
 }
 
 /// `nark/read`: resolve `id`, then read the head version's frontmatter and body
@@ -102,24 +115,29 @@ pub fn peek(pool: &ReadPool, id: &str) -> Result<Value> {
 /// the CLI handler this does **not** bump access — the serve read path is
 /// read-only and side-effect-free (see the module docs). A missing note or a
 /// missing CAS object surfaces as an `Err` for the router to map.
-pub fn read(pool: &ReadPool, vault_dir: &Path, id: &str) -> Result<Value> {
+pub async fn read(pool: &Pool<RoManager>, vault_dir: &Path, id: &str) -> Result<Value> {
     let vault = Vault::new(vault_dir.to_path_buf());
-    pool.with_conn(|conn| {
-        let meta = resolve::get_meta(conn, id)?;
-        let refs = resolve::get_ref(conn, &meta.note_id)?;
+    let id = id.to_string();
+    pool.get()
+        .await?
+        .interact(move |conn| {
+            let meta = resolve::get_meta(conn, &id)?;
+            let refs = resolve::get_ref(conn, &meta.note_id)?;
 
-        let fm_raw = vault.read_object("objects/fm", &refs.fm_hash, "yaml")?;
-        let body = vault.read_object("objects/md", &refs.md_hash, "md")?;
+            let fm_raw = vault.read_object("objects/fm", &refs.fm_hash, "yaml")?;
+            let body = vault.read_object("objects/md", &refs.md_hash, "md")?;
 
-        let fm: Value = serde_yaml::from_str(&fm_raw)?;
+            let fm: Value = serde_yaml::from_str(&fm_raw)?;
 
-        Ok(json!({
-            "id": meta.note_id,
-            "title": meta.title,
-            "frontmatter": fm,
-            "body": body,
-        }))
-    })
+            Ok(json!({
+                "id": meta.note_id,
+                "title": meta.title,
+                "frontmatter": fm,
+                "body": body,
+            }))
+        })
+        .await
+        .map_err(interact_err)?
 }
 
 /// `nark/stats`: vault statistics overview, mirroring `cli::stats`.
@@ -127,42 +145,56 @@ pub fn read(pool: &ReadPool, vault_dir: &Path, id: &str) -> Result<Value> {
 /// Returns the same object `cli/stats.rs` prints: `total_notes`,
 /// `total_versions`, `by_domain`/`by_kind` facet lists, the `recent` list, and
 /// the nested `access` block (`total_reads`, `most_accessed`, `never_read`).
-pub fn stats(pool: &ReadPool) -> Result<Value> {
-    pool.with_conn(|conn| {
-        let s = stats::overview(conn)?;
+pub async fn stats(pool: &Pool<RoManager>) -> Result<Value> {
+    pool.get()
+        .await?
+        .interact(|conn| {
+            let s = stats::overview(conn)?;
 
-        let most_accessed = s
-            .access
-            .most_accessed
-            .as_ref()
-            .map(|m| json!({ "title": m.title, "count": m.count }));
+            let most_accessed = s
+                .access
+                .most_accessed
+                .as_ref()
+                .map(|m| json!({ "title": m.title, "count": m.count }));
 
-        Ok(json!({
-            "total_notes": s.total_notes,
-            "total_versions": s.total_versions,
-            "by_domain": s.by_domain.iter().map(|f| {
-                json!({ "domain": f.label, "count": f.count })
-            }).collect::<Vec<_>>(),
-            "by_kind": s.by_kind.iter().map(|f| {
-                json!({ "kind": f.label, "count": f.count })
-            }).collect::<Vec<_>>(),
-            "recent": s.recent.iter().map(|n| {
-                json!({
-                    "id": n.note_id,
-                    "title": n.title,
-                    "domain": n.domain,
-                    "intent": n.intent,
-                    "kind": n.kind,
-                    "updated_at": n.updated_at,
-                })
-            }).collect::<Vec<_>>(),
-            "access": {
-                "total_reads": s.access.total_reads,
-                "most_accessed": most_accessed,
-                "never_read": s.access.never_read,
-            },
-        }))
-    })
+            Ok(json!({
+                "total_notes": s.total_notes,
+                "total_versions": s.total_versions,
+                "by_domain": s.by_domain.iter().map(|f| {
+                    json!({ "domain": f.label, "count": f.count })
+                }).collect::<Vec<_>>(),
+                "by_kind": s.by_kind.iter().map(|f| {
+                    json!({ "kind": f.label, "count": f.count })
+                }).collect::<Vec<_>>(),
+                "recent": s.recent.iter().map(|n| {
+                    json!({
+                        "id": n.note_id,
+                        "title": n.title,
+                        "domain": n.domain,
+                        "intent": n.intent,
+                        "kind": n.kind,
+                        "updated_at": n.updated_at,
+                    })
+                }).collect::<Vec<_>>(),
+                "access": {
+                    "total_reads": s.access.total_reads,
+                    "most_accessed": most_accessed,
+                    "never_read": s.access.never_read,
+                },
+            }))
+        })
+        .await
+        .map_err(interact_err)?
+}
+
+/// Map a [`deadpool_sync::InteractError`] (the wrapper's blocking closure
+/// panicked or was cancelled) to an [`anyhow::Error`]. `InteractError` is `Send`
+/// but not `Sync` (it can carry a panic payload), so it cannot be converted via
+/// `?` into `anyhow::Error` (which requires `Send + Sync + 'static`); we
+/// stringify it instead. A panicked read closure thus surfaces as a clean `Err`
+/// the router maps to an error response, never tearing down the connection.
+fn interact_err(e: deadpool_sync::InteractError) -> anyhow::Error {
+    anyhow::anyhow!("read pool interact failed: {e}")
 }
 
 /// `nark/search`: ranked search over the vault, mirroring `cli::search`.
@@ -516,12 +548,20 @@ This is the body of the test note.\n";
         ReadPool::open_with_size(dir, 2).expect("open read pool")
     }
 
-    #[test]
-    fn peek_returns_same_key_fields_as_cli() {
-        let (dir, note_id) = seeded_vault_with_note();
-        let pool = open_pool(&dir);
+    /// Open the deadpool-managed read-only pool the cheap methods (peek / read /
+    /// stats) now check out from (slice 3.5.2).
+    async fn open_dpool(dir: &Path) -> Pool<RoManager> {
+        super::super::dpool::open_ro_pool(dir, 2)
+            .await
+            .expect("open deadpool read pool")
+    }
 
-        let v = peek(&pool, &note_id).expect("peek should succeed");
+    #[tokio::test]
+    async fn peek_returns_same_key_fields_as_cli() {
+        let (dir, note_id) = seeded_vault_with_note();
+        let pool = open_dpool(&dir).await;
+
+        let v = peek(&pool, &note_id).await.expect("peek should succeed");
         assert_eq!(v["id"], note_id);
         assert_eq!(v["title"], "Test Note");
         assert_eq!(v["domain"], "engineering");
@@ -536,12 +576,14 @@ This is the body of the test note.\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn read_returns_body_and_frontmatter() {
+    #[tokio::test]
+    async fn read_returns_body_and_frontmatter() {
         let (dir, note_id) = seeded_vault_with_note();
-        let pool = open_pool(&dir);
+        let pool = open_dpool(&dir).await;
 
-        let v = read(&pool, &dir, &note_id).expect("read should succeed");
+        let v = read(&pool, &dir, &note_id)
+            .await
+            .expect("read should succeed");
         assert_eq!(v["id"], note_id);
         assert_eq!(v["title"], "Test Note");
         assert_eq!(
@@ -555,12 +597,12 @@ This is the body of the test note.\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn stats_returns_counts() {
+    #[tokio::test]
+    async fn stats_returns_counts() {
         let (dir, note_id) = seeded_vault_with_note();
-        let pool = open_pool(&dir);
+        let pool = open_dpool(&dir).await;
 
-        let v = stats(&pool).expect("stats should succeed");
+        let v = stats(&pool).await.expect("stats should succeed");
         assert_eq!(v["total_notes"], 1, "the one ingested note is counted");
         assert_eq!(v["total_versions"], 1, "one version was committed");
         // The recent list surfaces the note we just wrote.
@@ -573,14 +615,14 @@ This is the body of the test note.\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn peek_unknown_id_is_err_not_panic() {
+    #[tokio::test]
+    async fn peek_unknown_id_is_err_not_panic() {
         let (dir, _note_id) = seeded_vault_with_note();
-        let pool = open_pool(&dir);
+        let pool = open_dpool(&dir).await;
 
         // A well-formed but non-existent id prefix: resolve_id returns an error,
         // which propagates as Err (the router maps it to an error response).
-        let result = peek(&pool, "ffffffff");
+        let result = peek(&pool, "ffffffff").await;
         assert!(
             result.is_err(),
             "unknown id should be an error, not a panic"
@@ -594,13 +636,15 @@ This is the body of the test note.\n";
     /// (`db::open_registry`) connection — the exact JSON `cli/peek.rs` prints.
     /// This proves the serve READ method has not drifted from the registry path
     /// the CLI uses for the same input (the Phase-3 non-breaking guarantee).
-    #[test]
-    fn peek_json_matches_direct_registry_call() {
+    #[tokio::test]
+    async fn peek_json_matches_direct_registry_call() {
         let (dir, note_id) = seeded_vault_with_note();
-        let pool = open_pool(&dir);
+        let pool = open_dpool(&dir).await;
 
         // Serve path: through the read-only pool.
-        let served = peek(&pool, &note_id).expect("serve peek should succeed");
+        let served = peek(&pool, &note_id)
+            .await
+            .expect("serve peek should succeed");
 
         // Registry-direct path: the exact json! block `cli/peek.rs` builds from
         // `resolve::get_meta` over a writer connection.
@@ -633,12 +677,12 @@ This is the body of the test note.\n";
     /// byte-identical to the value built directly from `registry::stats::overview`
     /// — the exact JSON `cli/stats.rs` prints. Mirrors `peek_json_matches_direct_
     /// registry_call` for the no-params overview method.
-    #[test]
-    fn stats_json_matches_direct_registry_call() {
+    #[tokio::test]
+    async fn stats_json_matches_direct_registry_call() {
         let (dir, _note_id) = seeded_vault_with_note();
-        let pool = open_pool(&dir);
+        let pool = open_dpool(&dir).await;
 
-        let served = stats(&pool).expect("serve stats should succeed");
+        let served = stats(&pool).await.expect("serve stats should succeed");
 
         let conn = crate::db::open_registry(&dir).expect("open writer registry");
         let s = stats::overview(&conn).expect("overview");
