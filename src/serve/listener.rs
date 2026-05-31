@@ -35,7 +35,7 @@ use tokio::net::{UnixListener, UnixStream};
 use super::AgentMap;
 use super::authz::guard_preexisting_socket_path;
 use super::peercred::peer_uid;
-use super::rpc;
+use super::rpc::{self, Ctx};
 use crate::wire::{RPCRequest, RPCResponse};
 
 /// JSON-RPC error code: the request line was not valid JSON.
@@ -140,7 +140,7 @@ impl BoundListener {
     /// uses [`Self::serve_authenticated_until`]. It is retained (and exercised
     /// by tests) as the documented pre-auth round-trip primitive.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub async fn serve_until<F>(&self, shutdown: F) -> Result<()>
+    pub async fn serve_until<F>(&self, ctx: Arc<Ctx>, shutdown: F) -> Result<()>
     where
         F: std::future::Future<Output = ()>,
     {
@@ -149,8 +149,9 @@ impl BoundListener {
             tokio::select! {
                 accepted = self.listener.accept() => {
                     let (stream, _addr) = accepted.context("accepting connection")?;
+                    let ctx = Arc::clone(&ctx);
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream).await {
+                        if let Err(e) = handle_connection(stream, &ctx).await {
                             eprintln!("nark serve: connection error: {e:#}");
                         }
                     });
@@ -174,11 +175,16 @@ impl BoundListener {
     /// The per-connection request read is bounded by [`READ_TIMEOUT`]; a peer
     /// that connects and never sends a line is closed rather than parking its
     /// task forever.
-    pub async fn serve_authenticated_until<F>(&self, agents: AgentMap, shutdown: F) -> Result<()>
+    pub async fn serve_authenticated_until<F>(
+        &self,
+        agents: AgentMap,
+        ctx: Arc<Ctx>,
+        shutdown: F,
+    ) -> Result<()>
     where
         F: std::future::Future<Output = ()>,
     {
-        self.serve_authenticated_until_with_timeout(agents, READ_TIMEOUT, shutdown)
+        self.serve_authenticated_until_with_timeout(agents, ctx, READ_TIMEOUT, shutdown)
             .await
     }
 
@@ -188,6 +194,7 @@ impl BoundListener {
     pub async fn serve_authenticated_until_with_timeout<F>(
         &self,
         agents: AgentMap,
+        ctx: Arc<Ctx>,
         read_timeout: Duration,
         shutdown: F,
     ) -> Result<()>
@@ -201,9 +208,11 @@ impl BoundListener {
                 accepted = self.listener.accept() => {
                     let (stream, _addr) = accepted.context("accepting connection")?;
                     let agents = Arc::clone(&agents);
+                    let ctx = Arc::clone(&ctx);
                     tokio::spawn(async move {
                         if let Err(e) =
-                            handle_authenticated_connection(stream, &agents, read_timeout).await
+                            handle_authenticated_connection(stream, &agents, &ctx, read_timeout)
+                                .await
                         {
                             eprintln!("nark serve: connection error: {e:#}");
                         }
@@ -233,7 +242,7 @@ impl Drop for BoundListener {
 /// single protocol on the wire (no dual line/JSON-RPC handling). Malformed JSON
 /// yields a `-32700 parse error` with an empty id.
 #[cfg_attr(not(test), allow(dead_code))]
-async fn handle_connection(stream: UnixStream) -> Result<()> {
+async fn handle_connection(stream: UnixStream, ctx: &Ctx) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -245,7 +254,7 @@ async fn handle_connection(stream: UnixStream) -> Result<()> {
         return Ok(());
     }
     let response = match serde_json::from_str::<RPCRequest>(line.trim_end()) {
-        Ok(req) => rpc::dispatch(&req),
+        Ok(req) => rpc::dispatch(ctx, &req),
         Err(e) => {
             eprintln!("nark serve: unauthenticated peer sent malformed JSON-RPC: {e}");
             RPCResponse::error("", PARSE_ERROR, "parse error", None)
@@ -274,6 +283,7 @@ async fn handle_connection(stream: UnixStream) -> Result<()> {
 async fn handle_authenticated_connection(
     stream: UnixStream,
     agents: &AgentMap,
+    ctx: &Ctx,
     read_timeout: Duration,
 ) -> Result<()> {
     let uid = peer_uid(&stream).context("extracting peer uid")?;
@@ -316,7 +326,7 @@ async fn handle_authenticated_connection(
     // Parse the one request line as JSON-RPC; malformed JSON is reported with a
     // `-32700 parse error` and an empty id (we have no id to echo).
     let response = match serde_json::from_str::<RPCRequest>(line.trim_end()) {
-        Ok(req) => rpc::dispatch(&req),
+        Ok(req) => rpc::dispatch(ctx, &req),
         Err(e) => {
             eprintln!("nark serve: {agent} (uid {uid}) sent malformed JSON-RPC: {e}");
             RPCResponse::error("", PARSE_ERROR, "parse error", None)
@@ -372,6 +382,38 @@ mod tests {
         assert_eq!(resolved, Path::new("/run/custom.sock"));
     }
 
+    /// Seed `dir` as a vault (writer creates/migrates/seeds `registry.db` and
+    /// enables WAL) with one ingested note, then build the read-only [`Ctx`] the
+    /// serve loops dispatch against. Returns `(ctx, note_id)`. The writer
+    /// connection is dropped before the read pool opens.
+    fn seeded_ctx(dir: &Path) -> (Arc<Ctx>, String) {
+        use crate::registry::write::commit_version;
+        use crate::vault::fs::Vault;
+
+        const NOTE: &str = "---\n\
+title: Socket Note\n\
+author: tester\n\
+domain: engineering\n\
+intent: reference\n\
+kind: note\n\
+status: active\n\
+tags:\n\
+  - delta\n\
+---\n\
+Socket body text.\n";
+
+        std::fs::create_dir_all(dir).expect("create vault dir");
+        let conn = crate::db::open_registry(dir).expect("open writer registry");
+        let vault = Vault::new(dir.to_path_buf());
+        let result = vault.ingest(NOTE, None).expect("ingest note");
+        commit_version(&conn, &result).expect("commit version");
+        let note_id = result.note_id.clone();
+        drop(conn);
+
+        let ctx = Ctx::open(dir).expect("open serve ctx");
+        (Arc::new(ctx), note_id)
+    }
+
     /// Read one newline-terminated line from `stream` and parse it as JSON.
     /// Shared by the JSON-RPC round-trip tests.
     async fn read_json_line(stream: UnixStream) -> serde_json::Value {
@@ -396,6 +438,7 @@ mod tests {
         let dir = temp_socket_dir();
         let socket_path = dir.join("nark.sock");
         let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        let (ctx, _note_id) = seeded_ctx(&dir);
 
         // Register the *test process's own* uid as a known agent so the
         // connecting client (this process) authenticates as "tester".
@@ -407,7 +450,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             bound
-                .serve_authenticated_until(agents, async {
+                .serve_authenticated_until(agents, ctx, async {
                     let _ = rx.await;
                 })
                 .await
@@ -434,6 +477,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Phase 3 slice 3.3 exit: the three READ methods (`nark/peek`, `nark/read`,
+    /// `nark/stats`) round-trip over the socket against a seeded note, and a bad
+    /// id returns a clean error response (not a panic / dropped connection).
+    /// One request per connection, so each method opens a fresh connection.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn authenticated_read_methods_round_trip_over_socket() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        let (ctx, note_id) = seeded_ctx(&dir);
+
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        // Helper: one request line -> one parsed JSON response over a fresh conn.
+        async fn round_trip(socket_path: &Path, line: &str) -> serde_json::Value {
+            let mut stream = UnixStream::connect(socket_path)
+                .await
+                .expect("connect to socket");
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .expect("write request");
+            stream.flush().await.expect("flush request");
+            read_json_line(stream).await
+        }
+
+        // nark/peek
+        let peek = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"p\",\"method\":\"nark/peek\",\"params\":{{\"id\":\"{note_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(peek["id"], "p");
+        assert_eq!(peek["result"]["id"], note_id);
+        assert_eq!(peek["result"]["title"], "Socket Note");
+
+        // nark/read
+        let read = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"r\",\"method\":\"nark/read\",\"params\":{{\"id\":\"{note_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(read["result"]["body"], "Socket body text.");
+        assert_eq!(read["result"]["frontmatter"]["title"], "Socket Note");
+
+        // nark/stats
+        let stats = round_trip(&socket_path, "{\"id\":\"s\",\"method\":\"nark/stats\"}\n").await;
+        assert_eq!(stats["result"]["total_notes"], 1);
+        assert_eq!(stats["result"]["total_versions"], 1);
+
+        // Bad id -> clean error response, connection stays well-behaved.
+        let bad = round_trip(
+            &socket_path,
+            "{\"id\":\"b\",\"method\":\"nark/peek\",\"params\":{\"id\":\"ffffffff\"}}\n",
+        )
+        .await;
+        assert_eq!(bad["id"], "b");
+        assert_eq!(
+            bad["error"]["code"], -32602,
+            "bad id is invalid-params, not a panic"
+        );
+        assert!(bad.get("result").is_none());
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An authenticated unknown method returns a JSON-RPC `-32601` error echoing
     /// the request id.
     #[cfg(target_os = "macos")]
@@ -446,6 +579,7 @@ mod tests {
         let socket_path = dir.join("nark.sock");
         let bound = BoundListener::bind(&socket_path).expect("bind listener");
 
+        let (ctx, _note_id) = seeded_ctx(&dir);
         let me = nix::unistd::getuid().as_raw();
         let mut table = HashMap::new();
         table.insert(me, "tester".to_string());
@@ -454,7 +588,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             bound
-                .serve_authenticated_until(agents, async {
+                .serve_authenticated_until(agents, ctx, async {
                     let _ = rx.await;
                 })
                 .await
@@ -494,6 +628,7 @@ mod tests {
         let socket_path = dir.join("nark.sock");
         let bound = BoundListener::bind(&socket_path).expect("bind listener");
 
+        let (ctx, _note_id) = seeded_ctx(&dir);
         let me = nix::unistd::getuid().as_raw();
         let mut table = HashMap::new();
         table.insert(me, "tester".to_string());
@@ -502,7 +637,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             bound
-                .serve_authenticated_until(agents, async {
+                .serve_authenticated_until(agents, ctx, async {
                     let _ = rx.await;
                 })
                 .await
@@ -540,11 +675,14 @@ mod tests {
 
         // Empty map: the connecting uid is unknown -> rejected at app layer.
         let agents = AgentMap::default();
+        // Ctx is required by the loop signature but never reached: rejection
+        // precedes any RPC dispatch.
+        let (ctx, _note_id) = seeded_ctx(&dir);
 
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             bound
-                .serve_authenticated_until(agents, async {
+                .serve_authenticated_until(agents, ctx, async {
                     let _ = rx.await;
                 })
                 .await
@@ -603,11 +741,12 @@ mod tests {
         // Socket file exists once bound.
         assert!(socket_path.exists(), "socket file should exist after bind");
 
+        let (ctx, _note_id) = seeded_ctx(&dir);
         let (tx, rx) = oneshot::channel::<()>();
         let serve_path = socket_path.clone();
         let server = tokio::spawn(async move {
             bound
-                .serve_until(async {
+                .serve_until(ctx, async {
                     let _ = rx.await;
                 })
                 .await
@@ -762,6 +901,7 @@ mod tests {
         let mut table = HashMap::new();
         table.insert(me, "tester".to_string());
         let agents = AgentMap::new(table);
+        let (ctx, _note_id) = seeded_ctx(&dir);
 
         // Short timeout so the test does not hang.
         let read_timeout = Duration::from_millis(150);
@@ -769,7 +909,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             bound
-                .serve_authenticated_until_with_timeout(agents, read_timeout, async {
+                .serve_authenticated_until_with_timeout(agents, ctx, read_timeout, async {
                     let _ = rx.await;
                 })
                 .await
