@@ -15,6 +15,15 @@ path = "src/lib.rs"
 anyhow = "1.0.101"
 blake3 = "1.8.3"
 chrono = "0.4.43"
+# Read-only registry connection pool for `nark serve` (Phase 3.5). We do NOT use
+# deadpool-sqlite: its built-in Manager hardcodes `Connection::open()` =
+# READ_WRITE|CREATE with no OpenFlags hook (verified deadpool-sqlite 0.13.0),
+# which would violate serve's read-only guarantee. Instead we pair deadpool's
+# generic managed pool with deadpool-sync's `SyncWrapper` and a custom
+# read-only `Manager` (see `src/serve/dpool.rs`). `rt_tokio_1` wires the
+# `Runtime::Tokio1` used to run blocking SQLite on a managed thread.
+deadpool = { version = "0.13", features = ["managed", "rt_tokio_1"] }
+deadpool-sync = "0.2"
 regex = "1"
 clap = { version = "4.5.60", features = ["derive"] }
 dirs = "6.0.0"

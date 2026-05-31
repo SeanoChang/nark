@@ -23,11 +23,14 @@
 //! object, or a missing CAS object produces a clean JSON-RPC error response
 //! (`-32602 invalid params`) echoing the request id — never a panic.
 
+use deadpool::managed::Pool;
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 
+use super::dpool::{self, RoManager};
+use super::embed_permit;
 use super::methods_read;
 use super::methods_read::{OrientParams, SearchParams};
-use super::readpool::ReadPool;
 use crate::wire::{RPCRequest, RPCResponse};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -45,16 +48,32 @@ const METHOD_NOT_FOUND: i64 = -32601;
 /// requested note could not be resolved/read (a 404-style application error).
 const INVALID_PARAMS: i64 = -32602;
 
-/// Per-daemon context the router hands to the read methods: a read-only
-/// connection pool over `<vault_dir>/registry.db` plus the vault root (needed by
-/// `nark/read` to resolve CAS object paths).
+/// Per-daemon context the router hands to the read methods plus the vault root
+/// (needed by `nark/read` to resolve CAS object paths).
 ///
-/// The pool is held behind an [`Arc`] so the whole [`Ctx`] can be cloned into a
-/// [`tokio::task::spawn_blocking`] closure (the connection handler runs the
-/// blocking `dispatch` off the async worker — see `listener`) and so tests can
-/// hold a second handle to the same pool to drive contention.
+/// As of Phase 3.5 the whole read path runs over a single [`deadpool`]-managed,
+/// strictly read-only pool against `<vault_dir>/registry.db`, with the embedding
+/// work split out under a permit. `Ctx` therefore holds exactly two things — the
+/// pool and the permit semaphore — plus the vault dir:
+///
+/// * `dpool` — the [`deadpool`]-managed pool ([`super::dpool`]), the **only**
+///   connection pool. **Every** read method (`peek` / `read` / `stats` /
+///   `search` / `orient`) checks a connection out of it and runs its blocking
+///   SQLite on a managed thread via `conn.interact(...)`; `get()` backpressures
+///   when every connection is busy. It is [`Clone`] (internally `Arc`-based), so
+///   tests can hold a second handle to drive contention. The Phase-3 hand-rolled
+///   read pool is gone (retired in slice 3.5.5) — there is no second pool.
+///
+/// * `embed_sem` — the bounded embedding-worker semaphore: an `Arc<Semaphore>`
+///   with [`embed_permit::DEFAULT_EMBED_PERMITS`] permits that caps how many ONNX
+///   inferences run concurrently. The `search` method's inference step runs
+///   through [`embed_permit::with_embed_permit`] using it — the embedding work
+///   happens under a permit and **outside** any DB checkout (the 2B payoff), so a
+///   burst of `search` load cannot hold a connection across inference and stall
+///   the cheap reads (no head-of-line blocking).
 pub struct Ctx {
-    pool: Arc<ReadPool>,
+    dpool: Pool<RoManager>,
+    embed_sem: Arc<Semaphore>,
     vault_dir: PathBuf,
 }
 
@@ -62,30 +81,27 @@ impl Ctx {
     /// Build a context, opening the read-only pool against `vault_dir`.
     ///
     /// The registry must already exist (the writer owns creation/migration); the
-    /// pool opens it read-only. Used by the serve daemon path.
-    pub fn open(vault_dir: &Path) -> anyhow::Result<Self> {
+    /// pool opens it read-only. Async because the [`deadpool`] pool is built on
+    /// the tokio runtime. Used by the serve daemon path.
+    pub async fn open(vault_dir: &Path) -> anyhow::Result<Self> {
         Ok(Self {
-            pool: Arc::new(ReadPool::open(vault_dir)?),
+            dpool: dpool::open_ro_pool(vault_dir, dpool::DEFAULT_POOL_SIZE).await?,
+            embed_sem: embed_permit::default_embed_semaphore(),
             vault_dir: vault_dir.to_path_buf(),
         })
     }
 
     /// Build a context from an already-open pool and vault dir. Lets tests inject
-    /// a sized pool without re-opening.
-    #[cfg(test)]
-    pub fn new(pool: ReadPool, vault_dir: PathBuf) -> Self {
-        Self {
-            pool: Arc::new(pool),
-            vault_dir,
-        }
-    }
-
-    /// Build a context from an already-`Arc`-wrapped pool. Lets a test keep a
-    /// second handle to the same pool (to occupy every connection) while the
+    /// a sized pool without re-opening. The [`deadpool`] pool is [`Clone`], so a
+    /// test can keep a second handle (to occupy every connection) while the
     /// daemon dispatches against it.
     #[cfg(test)]
-    pub fn new_shared(pool: Arc<ReadPool>, vault_dir: PathBuf) -> Self {
-        Self { pool, vault_dir }
+    pub fn new(dpool: Pool<RoManager>, vault_dir: PathBuf) -> Self {
+        Self {
+            dpool,
+            embed_sem: embed_permit::default_embed_semaphore(),
+            vault_dir,
+        }
     }
 }
 
@@ -96,37 +112,45 @@ impl Ctx {
 /// whose params are missing/invalid or whose note cannot be resolved/read
 /// produces `-32602 invalid params`. Every path echoes the request id, so a
 /// client always gets exactly one response per request and never a panic.
-pub fn dispatch(ctx: &Ctx, req: &RPCRequest) -> RPCResponse {
+///
+/// `dispatch` is `async`: **every** read method (`peek` / `read` / `stats` /
+/// `search` / `orient`) checks a connection out of the [`deadpool`] pool and runs
+/// its blocking SQLite on a managed thread via `conn.interact(...).await`, so
+/// none ever parks a tokio worker (the listener awaits this directly — no
+/// `spawn_blocking` wrapper). For `search`, the ONNX query embedding runs under
+/// an embedding permit and **outside** the DB checkout (slice 3.5.4), so a burst
+/// of `search` load cannot hold a connection across inference and stall the cheap
+/// reads (no head-of-line blocking).
+pub async fn dispatch(ctx: &Ctx, req: &RPCRequest) -> RPCResponse {
     match req.method.as_str() {
         "ping" => RPCResponse::result(req.id.clone(), json!({"pong": true})),
-        "nark/peek" => run(req, id_param(req), |id| methods_read::peek(&ctx.pool, &id)),
-        "nark/read" => run(req, id_param(req), |id| {
-            methods_read::read(&ctx.pool, &ctx.vault_dir, &id)
-        }),
-        "nark/stats" => result_or_invalid(req, methods_read::stats(&ctx.pool)),
-        "nark/search" => run(req, search_params(req), |p| {
-            methods_read::search(&ctx.pool, &ctx.vault_dir, &p)
-        }),
-        "nark/orient" => run(req, orient_params(req), |p| {
-            methods_read::orient(&ctx.pool, &ctx.vault_dir, &p)
-        }),
+        "nark/peek" => match id_param(req) {
+            Ok(id) => result_or_invalid(req, methods_read::peek(&ctx.dpool, &id).await),
+            Err(resp) => resp,
+        },
+        "nark/read" => match id_param(req) {
+            Ok(id) => result_or_invalid(
+                req,
+                methods_read::read(&ctx.dpool, &ctx.vault_dir, &id).await,
+            ),
+            Err(resp) => resp,
+        },
+        "nark/stats" => result_or_invalid(req, methods_read::stats(&ctx.dpool).await),
+        "nark/search" => match search_params(req) {
+            Ok(params) => result_or_invalid(
+                req,
+                methods_read::search(&ctx.dpool, &ctx.embed_sem, &ctx.vault_dir, &params).await,
+            ),
+            Err(resp) => resp,
+        },
+        "nark/orient" => match orient_params(req) {
+            Ok(params) => result_or_invalid(
+                req,
+                methods_read::orient(&ctx.dpool, &ctx.vault_dir, &params).await,
+            ),
+            Err(resp) => resp,
+        },
         _ => RPCResponse::error(req.id.clone(), METHOD_NOT_FOUND, "method not found", None),
-    }
-}
-
-/// Run a parsed-params method: if `parsed` is the ready-made `-32602` error from
-/// a params parse failure, return it as-is; otherwise call `method` with the
-/// parsed value and wrap its `Result<Value>` via [`result_or_invalid`]. This
-/// collapses the otherwise-repeated `match parse { Ok => result_or_invalid(..),
-/// Err(resp) => resp }` arm shared by every params-taking READ method.
-fn run<P>(
-    req: &RPCRequest,
-    parsed: Result<P, RPCResponse>,
-    method: impl FnOnce(P) -> anyhow::Result<Value>,
-) -> RPCResponse {
-    match parsed {
-        Ok(params) => result_or_invalid(req, method(params)),
-        Err(resp) => resp,
     }
 }
 
@@ -330,9 +354,19 @@ tags:\n\
 ---\n\
 Router body text.\n";
 
+    /// Build a [`Ctx`] over `dir`'s seeded registry: the single deadpool pool
+    /// every read method (cheap reads plus `search`/`orient`) checks out from as
+    /// of slice 3.5.4. Async because the deadpool pool is built on the runtime.
+    async fn ctx_for(dir: &std::path::Path) -> Ctx {
+        let dpool = dpool::open_ro_pool(dir, 2)
+            .await
+            .expect("open deadpool pool");
+        Ctx::new(dpool, dir.to_path_buf())
+    }
+
     /// Seed a temp vault with one note (writer creates/migrates/seeds), drop the
-    /// writer, and return a `Ctx` (read-only pool) plus the note id.
-    fn seeded_ctx() -> (Ctx, String, std::path::PathBuf) {
+    /// writer, and return a `Ctx` (read-only pools) plus the note id.
+    async fn seeded_ctx() -> (Ctx, String, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "nark-rpc-read-test-{}-{}",
             std::process::id(),
@@ -346,8 +380,8 @@ Router body text.\n";
         let note_id = result.note_id.clone();
         drop(conn);
 
-        let pool = ReadPool::open_with_size(&dir, 2).expect("open read pool");
-        (Ctx::new(pool, dir.clone()), note_id, dir)
+        let ctx = ctx_for(&dir).await;
+        (ctx, note_id, dir)
     }
 
     fn request(id: &str, method: &str, params: Option<Value>) -> RPCRequest {
@@ -372,10 +406,10 @@ Router body text.\n";
         }
     }
 
-    #[test]
-    fn ping_returns_pong_with_matching_id() {
-        let (ctx, _id, dir) = seeded_ctx();
-        let resp = dispatch(&ctx, &request("42", "ping", None));
+    #[tokio::test]
+    async fn ping_returns_pong_with_matching_id() {
+        let (ctx, _id, dir) = seeded_ctx().await;
+        let resp = dispatch(&ctx, &request("42", "ping", None)).await;
         match resp {
             RPCResponse::Result(r) => {
                 assert_eq!(r.id, "42");
@@ -386,10 +420,10 @@ Router body text.\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn unknown_method_is_method_not_found() {
-        let (ctx, _id, dir) = seeded_ctx();
-        let resp = dispatch(&ctx, &request("7", "no-such-method", None));
+    #[tokio::test]
+    async fn unknown_method_is_method_not_found() {
+        let (ctx, _id, dir) = seeded_ctx().await;
+        let resp = dispatch(&ctx, &request("7", "no-such-method", None)).await;
         let err = expect_error(resp);
         assert_eq!(err.code, METHOD_NOT_FOUND);
         assert_eq!(err.message, "method not found");
@@ -397,10 +431,10 @@ Router body text.\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn peek_returns_meta_fields() {
-        let (ctx, id, dir) = seeded_ctx();
-        let resp = dispatch(&ctx, &request("1", "nark/peek", Some(json!({"id": id}))));
+    #[tokio::test]
+    async fn peek_returns_meta_fields() {
+        let (ctx, id, dir) = seeded_ctx().await;
+        let resp = dispatch(&ctx, &request("1", "nark/peek", Some(json!({"id": id})))).await;
         let v = expect_result(resp);
         assert_eq!(v["id"], id);
         assert_eq!(v["title"], "Router Note");
@@ -409,42 +443,43 @@ Router body text.\n";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn read_returns_body() {
-        let (ctx, id, dir) = seeded_ctx();
-        let resp = dispatch(&ctx, &request("2", "nark/read", Some(json!({"id": id}))));
+    #[tokio::test]
+    async fn read_returns_body() {
+        let (ctx, id, dir) = seeded_ctx().await;
+        let resp = dispatch(&ctx, &request("2", "nark/read", Some(json!({"id": id})))).await;
         let v = expect_result(resp);
         assert_eq!(v["body"], "Router body text.");
         assert_eq!(v["frontmatter"]["title"], "Router Note");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn stats_returns_counts() {
-        let (ctx, _id, dir) = seeded_ctx();
-        let resp = dispatch(&ctx, &request("3", "nark/stats", None));
+    #[tokio::test]
+    async fn stats_returns_counts() {
+        let (ctx, _id, dir) = seeded_ctx().await;
+        let resp = dispatch(&ctx, &request("3", "nark/stats", None)).await;
         let v = expect_result(resp);
         assert_eq!(v["total_notes"], 1);
         assert_eq!(v["total_versions"], 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn bad_id_returns_invalid_params_not_panic() {
-        let (ctx, _id, dir) = seeded_ctx();
+    #[tokio::test]
+    async fn bad_id_returns_invalid_params_not_panic() {
+        let (ctx, _id, dir) = seeded_ctx().await;
         let resp = dispatch(
             &ctx,
             &request("9", "nark/peek", Some(json!({"id": "ffffffff"}))),
-        );
+        )
+        .await;
         let err = expect_error(resp);
         assert_eq!(err.code, INVALID_PARAMS);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn missing_params_returns_invalid_params() {
-        let (ctx, _id, dir) = seeded_ctx();
-        let resp = dispatch(&ctx, &request("10", "nark/peek", None));
+    #[tokio::test]
+    async fn missing_params_returns_invalid_params() {
+        let (ctx, _id, dir) = seeded_ctx().await;
+        let resp = dispatch(&ctx, &request("10", "nark/peek", None)).await;
         let err = expect_error(resp);
         assert_eq!(err.code, INVALID_PARAMS);
         let _ = std::fs::remove_dir_all(&dir);
@@ -467,7 +502,7 @@ tags:\n\
     }
 
     /// Seed a temp vault with a few notes and return a read-only `Ctx`.
-    fn seeded_ctx_multi() -> (Ctx, std::path::PathBuf) {
+    async fn seeded_ctx_multi() -> (Ctx, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "nark-rpc-search-test-{}-{}",
             std::process::id(),
@@ -484,17 +519,18 @@ tags:\n\
             commit_version(&conn, &result).expect("commit version");
         }
         drop(conn);
-        let pool = ReadPool::open_with_size(&dir, 2).expect("open read pool");
-        (Ctx::new(pool, dir.clone()), dir)
+        let ctx = ctx_for(&dir).await;
+        (ctx, dir)
     }
 
-    #[test]
-    fn search_returns_ranked_hits() {
-        let (ctx, dir) = seeded_ctx_multi();
+    #[tokio::test]
+    async fn search_returns_ranked_hits() {
+        let (ctx, dir) = seeded_ctx_multi().await;
         let resp = dispatch(
             &ctx,
             &request("11", "nark/search", Some(json!({"query": "tokio"}))),
-        );
+        )
+        .await;
         let v = expect_result(resp);
         assert_eq!(v["query"], "tokio");
         assert_eq!(v["mode"], "normal");
@@ -503,9 +539,9 @@ tags:\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn search_bm25_flag_selects_bm25_mode() {
-        let (ctx, dir) = seeded_ctx_multi();
+    #[tokio::test]
+    async fn search_bm25_flag_selects_bm25_mode() {
+        let (ctx, dir) = seeded_ctx_multi().await;
         let resp = dispatch(
             &ctx,
             &request(
@@ -513,42 +549,45 @@ tags:\n\
                 "nark/search",
                 Some(json!({"query": "rust", "bm25": true})),
             ),
-        );
+        )
+        .await;
         let v = expect_result(resp);
         assert_eq!(v["mode"], "bm25");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn search_with_no_query_and_no_filters_is_invalid_params() {
+    #[tokio::test]
+    async fn search_with_no_query_and_no_filters_is_invalid_params() {
         // registry::search bails when there is neither a query nor a filter; the
         // router maps that Err to -32602 rather than panicking.
-        let (ctx, dir) = seeded_ctx_multi();
-        let resp = dispatch(&ctx, &request("13", "nark/search", Some(json!({}))));
+        let (ctx, dir) = seeded_ctx_multi().await;
+        let resp = dispatch(&ctx, &request("13", "nark/search", Some(json!({})))).await;
         let err = expect_error(resp);
         assert_eq!(err.code, INVALID_PARAMS);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn search_bad_param_type_is_invalid_params() {
-        let (ctx, dir) = seeded_ctx_multi();
+    #[tokio::test]
+    async fn search_bad_param_type_is_invalid_params() {
+        let (ctx, dir) = seeded_ctx_multi().await;
         let resp = dispatch(
             &ctx,
             &request("14", "nark/search", Some(json!({"query": 7}))),
-        );
+        )
+        .await;
         let err = expect_error(resp);
         assert_eq!(err.code, INVALID_PARAMS);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn orient_returns_markdown_briefing() {
-        let (ctx, dir) = seeded_ctx_multi();
+    #[tokio::test]
+    async fn orient_returns_markdown_briefing() {
+        let (ctx, dir) = seeded_ctx_multi().await;
         let resp = dispatch(
             &ctx,
             &request("15", "nark/orient", Some(json!({"query": "rust"}))),
-        );
+        )
+        .await;
         let v = expect_result(resp);
         let md = v.as_str().expect("orient returns a markdown string");
         assert!(md.starts_with("# Vault Briefing: rust"));
@@ -557,13 +596,14 @@ tags:\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn orient_accepts_topic_alias_and_omitted_params() {
-        let (ctx, dir) = seeded_ctx_multi();
+    #[tokio::test]
+    async fn orient_accepts_topic_alias_and_omitted_params() {
+        let (ctx, dir) = seeded_ctx_multi().await;
         let resp = dispatch(
             &ctx,
             &request("16", "nark/orient", Some(json!({"topic": "tokio"}))),
-        );
+        )
+        .await;
         let v = expect_result(resp);
         let md = v.as_str().unwrap();
         assert!(
@@ -573,24 +613,25 @@ tags:\n\
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn orient_no_query_no_filter_is_invalid_params() {
+    #[tokio::test]
+    async fn orient_no_query_no_filter_is_invalid_params() {
         // Mirrors the CLI: orient with neither a query nor a filter bails in
         // registry::search; the router maps that to -32602 (not a panic).
-        let (ctx, dir) = seeded_ctx_multi();
-        let resp = dispatch(&ctx, &request("17", "nark/orient", None));
+        let (ctx, dir) = seeded_ctx_multi().await;
+        let resp = dispatch(&ctx, &request("17", "nark/orient", None)).await;
         let err = expect_error(resp);
         assert_eq!(err.code, INVALID_PARAMS);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn orient_with_filter_and_omitted_query_briefs_vault() {
-        let (ctx, dir) = seeded_ctx_multi();
+    #[tokio::test]
+    async fn orient_with_filter_and_omitted_query_briefs_vault() {
+        let (ctx, dir) = seeded_ctx_multi().await;
         let resp = dispatch(
             &ctx,
             &request("18", "nark/orient", Some(json!({"domain": "engineering"}))),
-        );
+        )
+        .await;
         let v = expect_result(resp);
         let md = v.as_str().unwrap();
         assert!(
