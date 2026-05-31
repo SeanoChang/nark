@@ -28,6 +28,12 @@ regex = "1"
 clap = { version = "4.5.60", features = ["derive"] }
 dirs = "6.0.0"
 flate2 = "1"
+# Advisory file lock (flock wrapper) for the registry write-lock (Phase 5). We
+# flock a dedicated `<vault>/registry.write.lock` file — never `registry.db`
+# itself (SQLite owns that). flock is a per-process advisory lock that the OS
+# auto-releases when the holding process exits/crashes, so a crashed writer
+# never wedges the registry; no manual stale-lock reaping is needed.
+fs2 = "0.4"
 include_dir = "0.7.4"
 indicatif = "0.17"
 # Both "user" AND "socket" are required for getpeereid on macOS: nix gates

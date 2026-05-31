@@ -5,6 +5,16 @@ use anyhow::Result;
 use std::sync::LazyLock;
 use include_dir::{include_dir, Dir};
 
+/// Advisory registry write-lock primitive (Phase 5). Standalone for now — not
+/// yet wired into `open_registry`. `pub` so write-command call sites in a later
+/// slice can take the lock; reads never touch it.
+///
+/// `allow(dead_code)`: this slice (5.1) ships the primitive unwired, so the
+/// binary crate sees no callers yet. The next slice wires `try_acquire` into
+/// the write-command path and MUST drop this allow.
+#[allow(dead_code)]
+pub mod wlock;
+
 pub const DEFAULT_AGENT_ID: &str = "noah";
 pub const DEFAULT_CLIENT_ID: &str = "cli_default";
 
