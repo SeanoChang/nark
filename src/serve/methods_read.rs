@@ -12,10 +12,10 @@
 //!   `db::open_registry`, every method ([`peek`] / [`read`] / [`stats`] /
 //!   [`search`] / [`orient`]) checks out a connection from the
 //!   [`deadpool`]-managed read-only pool ([`super::dpool`]) and runs its blocking
-//!   SQLite on a managed thread via `conn.interact(...)`. As of slice 3.5.4 the
-//!   embedding-bearing methods ([`search`] / [`orient`]) are migrated onto the
-//!   same pool — the hand-rolled [`ReadPool`](super::readpool::ReadPool) no
-//!   longer backs them;
+//!   SQLite on a managed thread via `conn.interact(...)`. The embedding-bearing
+//!   methods ([`search`] / [`orient`]) run over the **same** pool — there is one
+//!   read pool, the deadpool one (the Phase-3 hand-rolled pool was retired in
+//!   slice 3.5.5);
 //! * the embedding work in [`search`] / [`orient`] (the ONNX query embedding) is
 //!   computed **outside** any DB checkout (slice 3.5.4, the 2B payoff): the
 //!   method first acquires an embedding permit (bounding inference concurrency)
@@ -343,8 +343,8 @@ pub async fn search(
 /// pool's connection is read-only; see the module docs). The returned `Value` is
 /// the briefing markdown as a JSON string.
 ///
-/// Slice 3.5.4: migrated off the hand-rolled [`ReadPool`] onto the
-/// [`deadpool`]-managed pool, running its blocking SQLite on a managed thread via
+/// Like every read method, `orient` runs over the single [`deadpool`]-managed
+/// pool ([`super::dpool`]), running its blocking SQLite on a managed thread via
 /// `conn.interact(...)`. `orient` passes no cosine context to [`search::search`]
 /// (same as the CLI and Phase 3), so there is no ONNX inference to lift out of
 /// the checkout here — the connection is held only for the (cheap) query and

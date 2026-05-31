@@ -1,13 +1,13 @@
 //! Deadpool-managed read-only connection pool for the `nark serve` daemon.
 //!
-//! Phase 3.5 (slice 3.5.1) of the Ark comm protocol. The Phase-3 read path uses
-//! a hand-rolled [`super::readpool::ReadPool`] (`Mutex<Vec<Connection>>` +
-//! `Condvar`) consumed synchronously via `spawn_blocking`. This module lands the
-//! replacement: a [`deadpool`]-managed pool whose connections are still strictly
-//! **read-only**, but whose checkout (`pool.get().await`) and blocking SQLite
+//! Phase 3.5 of the Ark comm protocol. This is **the** read-path connection
+//! pool: a [`deadpool`]-managed pool whose connections are strictly
+//! **read-only**, and whose checkout (`pool.get().await`) and blocking SQLite
 //! work (`conn.interact(...).await`) are async-native — backpressure when every
 //! connection is busy, and blocking queries run on a managed thread rather than
-//! holding a worker.
+//! holding a worker. It replaced the Phase-3 hand-rolled read pool (a
+//! `Mutex<Vec<Connection>>` + `Condvar` consumed synchronously via
+//! `spawn_blocking`), which slice 3.5.5 retired.
 //!
 //! Why not `deadpool-sqlite`? Its built-in `Config`/`Manager` hardcode
 //! `Connection::open()` (= `SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_CREATE`) with no
@@ -20,13 +20,6 @@
 //! [`OpenFlags::SQLITE_OPEN_READ_ONLY`] | [`OpenFlags::SQLITE_OPEN_NO_MUTEX`] and
 //! no `SQLITE_OPEN_CREATE`. Any write through a pooled connection fails at the
 //! SQLite layer (`SQLITE_READONLY`), which is the intended guarantee.
-//!
-//! Slice 3.5.1 lands the manager + pool **in parallel**: nothing here is wired
-//! into the router yet (that is a later slice), so the public surface reads as
-//! dead code in the binary target until then. The lib/test target exercises all
-//! of it, so the module carries a scoped `dead_code` allow rather than leaving
-//! the new code un-plumbed-but-warned.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

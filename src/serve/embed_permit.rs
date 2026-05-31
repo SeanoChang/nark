@@ -17,16 +17,10 @@
 //! Embedding compute is **not** a deadpool connection op — it does not touch the
 //! registry — so [`with_embed_permit`] runs the closure on
 //! [`tokio::task::spawn_blocking`] (a blocking-pool thread), never on a pooled
-//! SQLite connection's `interact` thread. Slice 3.5.4 restructures
-//! `search`/`orient` to acquire a permit for the inference step and a separate
-//! connection for the query step; this slice only lands and tests the primitive.
-//!
-//! Slice 3.5.3 lands [`with_embed_permit`] **in parallel**: it is not yet called
-//! from the router (slice 3.5.4 does that), so its public surface reads as dead
-//! code in the binary target until then. The lib/test target exercises all of
-//! it, so the module carries a scoped `dead_code` allow rather than leaving the
-//! new primitive un-plumbed-but-warned.
-#![allow(dead_code)]
+//! SQLite connection's `interact` thread. `search`'s `build_cosine_context`
+//! (`super::methods_read`) acquires a permit for the ONNX inference step and a
+//! separate deadpool connection for the query step, so a connection is never
+//! held across inference.
 
 use std::sync::Arc;
 

@@ -52,23 +52,25 @@ const INVALID_PARAMS: i64 = -32602;
 /// (needed by `nark/read` to resolve CAS object paths).
 ///
 /// As of Phase 3.5 the whole read path runs over a single [`deadpool`]-managed,
-/// strictly read-only pool against `<vault_dir>/registry.db`:
+/// strictly read-only pool against `<vault_dir>/registry.db`, with the embedding
+/// work split out under a permit. `Ctx` therefore holds exactly two things — the
+/// pool and the permit semaphore — plus the vault dir:
 ///
-/// * `dpool` — the [`deadpool`]-managed pool ([`super::dpool`]). **Every** read
-///   method (`peek` / `read` / `stats` / `search` / `orient`) checks a connection
-///   out of it and runs its blocking SQLite on a managed thread via
-///   `conn.interact(...)`; `get()` backpressures when every connection is busy.
-///   It is [`Clone`] (internally `Arc`-based), so tests can hold a second handle
-///   to drive contention. Slice 3.5.4 migrated `search`/`orient` onto it (off the
-///   hand-rolled `ReadPool`), so there is no second pool any more.
+/// * `dpool` — the [`deadpool`]-managed pool ([`super::dpool`]), the **only**
+///   connection pool. **Every** read method (`peek` / `read` / `stats` /
+///   `search` / `orient`) checks a connection out of it and runs its blocking
+///   SQLite on a managed thread via `conn.interact(...)`; `get()` backpressures
+///   when every connection is busy. It is [`Clone`] (internally `Arc`-based), so
+///   tests can hold a second handle to drive contention. The Phase-3 hand-rolled
+///   read pool is gone (retired in slice 3.5.5) — there is no second pool.
 ///
-/// `embed_sem` is the bounded embedding-worker semaphore (slice 3.5.3): an
-/// `Arc<Semaphore>` with [`embed_permit::DEFAULT_EMBED_PERMITS`] permits that
-/// caps how many ONNX inferences run concurrently. As of slice 3.5.4 the
-/// `search` method's inference step runs through
-/// [`embed_permit::with_embed_permit`] using it — the embedding work happens
-/// under a permit and **outside** any DB checkout (the 2B payoff), so a burst of
-/// `search` load cannot hold a connection across inference and stall cheap reads.
+/// * `embed_sem` — the bounded embedding-worker semaphore: an `Arc<Semaphore>`
+///   with [`embed_permit::DEFAULT_EMBED_PERMITS`] permits that caps how many ONNX
+///   inferences run concurrently. The `search` method's inference step runs
+///   through [`embed_permit::with_embed_permit`] using it — the embedding work
+///   happens under a permit and **outside** any DB checkout (the 2B payoff), so a
+///   burst of `search` load cannot hold a connection across inference and stall
+///   the cheap reads (no head-of-line blocking).
 pub struct Ctx {
     dpool: Pool<RoManager>,
     embed_sem: Arc<Semaphore>,

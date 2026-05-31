@@ -412,11 +412,11 @@ async fn handle_authenticated_connection(
     // `-32700 parse error` and an empty id (we have no id to echo).
     let response = match serde_json::from_str::<RPCRequest>(line.trim_end()) {
         Ok(req) => {
-            // dispatch is async: cheap methods run their blocking SQLite via
+            // dispatch is async: every read method runs its blocking SQLite via
             // deadpool `interact` (own thread), and `get().await` backpressures —
             // so awaiting here never parks the reactor (Spec §10). No
-            // `spawn_blocking` wrapper needed (search/orient handle their own
-            // blocking internally until slice 3.5.4).
+            // `spawn_blocking` wrapper needed; `search`'s ONNX inference runs
+            // under an embedding permit outside the DB checkout.
             rpc::dispatch(&ctx, &req).await
         }
         Err(e) => {
