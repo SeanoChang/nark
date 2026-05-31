@@ -25,6 +25,10 @@
 //!   head-of-line blocking).
 
 mod authz;
+// Phase 4: the blocking serve client the dual-mode CLI handlers will use to ask
+// a live `nark serve` (try-or-fallback). Public so `cli::*` can call
+// `serve::client::try_request`. Slice 4.1 lands the client; wiring is later.
+pub mod client;
 mod dpool;
 mod embed_permit;
 mod listener;

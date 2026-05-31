@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use chrono::Utc;
 use regex::Regex;
 use std::path::Path;
@@ -7,15 +7,73 @@ use crate::cli::util::truncate_at_word;
 use crate::config;
 use crate::db;
 use crate::embed;
-use crate::registry::{embeddings, resolve, search::{self, CosineContext, SearchFilters, SearchMode}};
+use crate::registry::{
+    embeddings, resolve,
+    search::{self, CosineContext, SearchFilters, SearchMode},
+};
+use crate::serve;
 use crate::vault::fs::Vault;
+
+/// Build the `nark/search` JSON-RPC params object, mapping the CLI args onto the
+/// exact field names the Phase-3 server's `search_params` parser expects (see
+/// `serve::rpc`): `query`, `domain`, `kind`, `intent` (strings), `tag` (array),
+/// `limit` (number), `bm25`/`semantic` (bools), `since`/`before` (strings).
+/// Absent/`None`/`false`-default fields are omitted, so the server defaults them
+/// the same way clap does on the direct path (the parser treats absent as the
+/// default). `query` and `limit` are always sent (they are positional/has a
+/// default on the CLI), matching what the direct path uses.
+#[allow(clippy::too_many_arguments)]
+fn search_params_json(
+    query: &str,
+    domain: Option<&str>,
+    kind: Option<&str>,
+    intent: Option<&str>,
+    tags: &[String],
+    limit: usize,
+    bm25_only: bool,
+    semantic: bool,
+    since: Option<&str>,
+    before: Option<&str>,
+) -> serde_json::Value {
+    let mut params = serde_json::Map::new();
+    params.insert("query".into(), serde_json::json!(query));
+    if let Some(d) = domain {
+        params.insert("domain".into(), serde_json::json!(d));
+    }
+    if let Some(k) = kind {
+        params.insert("kind".into(), serde_json::json!(k));
+    }
+    if let Some(i) = intent {
+        params.insert("intent".into(), serde_json::json!(i));
+    }
+    if !tags.is_empty() {
+        params.insert("tag".into(), serde_json::json!(tags));
+    }
+    params.insert("limit".into(), serde_json::json!(limit));
+    if bm25_only {
+        params.insert("bm25".into(), serde_json::json!(true));
+    }
+    if semantic {
+        params.insert("semantic".into(), serde_json::json!(true));
+    }
+    if let Some(s) = since {
+        params.insert("since".into(), serde_json::json!(s));
+    }
+    if let Some(b) = before {
+        params.insert("before".into(), serde_json::json!(b));
+    }
+    serde_json::Value::Object(params)
+}
 
 /// Parse a relative temporal shorthand (e.g. "1d", "7d", "24h", "1w", "1mo")
 /// into an ISO 8601 timestamp string.
 pub fn parse_temporal(input: &str) -> Result<String> {
     let re = Regex::new(r"^(\d+)(h|d|w|mo)$").unwrap();
     let caps = re.captures(input).ok_or_else(|| {
-        anyhow::anyhow!("invalid temporal format '{}'. Use: 1d, 7d, 24h, 1w, 1mo", input)
+        anyhow::anyhow!(
+            "invalid temporal format '{}'. Use: 1d, 7d, 24h, 1w, 1mo",
+            input
+        )
     })?;
     let n: i64 = caps[1].parse()?;
     let unit = &caps[2];
@@ -30,6 +88,10 @@ pub fn parse_temporal(input: &str) -> Result<String> {
     Ok(ts.to_rfc3339())
 }
 
+// The argument list mirrors the `nark search` CLI flags 1:1 (clap dispatch in
+// `main.rs`); collapsing them into a struct would change that public call site,
+// which is out of scope for the dual-mode slice — so the lint is allowed here.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     vault_dir: &Path,
     query: &str,
@@ -45,6 +107,22 @@ pub fn run(
 ) -> Result<()> {
     if bm25_only && semantic {
         bail!("--bm25 and --semantic are mutually exclusive");
+    }
+
+    // Dual-mode: ask a live `nark serve` first (one round-trip via the shared
+    // `try_vault_request` seam, which resolves the vault's socket itself). The
+    // socket is an optimization — the seam returns `None` on ANY failure (absent
+    // or stale socket, connect timeout, `unauthorized`, error response, malformed
+    // JSON, any I/O error), and we then fall through to the always-correct
+    // direct-open path below, unchanged (including every `--bm25`/`--semantic`/
+    // filter behavior). The server runs the SAME `registry::search` pipeline, so
+    // a socket HIT yields the identical result shape.
+    let params = search_params_json(
+        query, domain, kind, intent, tags, limit, bm25_only, semantic, since, before,
+    );
+    if let Some(result) = serve::client::try_vault_request(vault_dir, "nark/search", params) {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
     }
 
     let conn = db::open_registry(vault_dir)?;
@@ -73,29 +151,40 @@ pub fn run(
 
     // Build cosine context if embeddings are available and there's a query.
     // Skip for BM25-only mode (doesn't use cosine).
-    let cosine_ctx = if mode != SearchMode::Bm25Only && !query.is_empty() && embeddings::has_embeddings(&conn) {
-        build_cosine_context(vault_dir, &cfg, &conn, query)
-    } else {
-        None
-    };
+    let cosine_ctx =
+        if mode != SearchMode::Bm25Only && !query.is_empty() && embeddings::has_embeddings(&conn) {
+            build_cosine_context(vault_dir, &cfg, &conn, query)
+        } else {
+            None
+        };
 
-    let mut hits = search::search(&conn, query, &filters, &cfg.search, cosine_ctx.as_ref(), mode)?;
+    let mut hits = search::search(
+        &conn,
+        query,
+        &filters,
+        &cfg.search,
+        cosine_ctx.as_ref(),
+        mode,
+    )?;
 
     let vault = Vault::new(vault_dir.to_path_buf());
     fill_missing_snippets(&conn, &vault, query, &mut hits);
 
-    let results: Vec<serde_json::Value> = hits.iter().map(|h| {
-        serde_json::json!({
-            "id": h.note_id,
-            "title": h.title,
-            "domain": h.domain,
-            "kind": h.kind,
-            "snippet": h.snippet,
-            "rank": h.rank,
-            "links_in": h.links_in,
-            "links_out": h.links_out,
+    let results: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "id": h.note_id,
+                "title": h.title,
+                "domain": h.domain,
+                "kind": h.kind,
+                "snippet": h.snippet,
+                "rank": h.rank,
+                "links_in": h.links_in,
+                "links_out": h.links_out,
+            })
         })
-    }).collect();
+        .collect();
 
     let out = serde_json::json!({
         "query": query,
@@ -125,18 +214,22 @@ fn build_cosine_context(
 
     // Guard: skip cosine if stored embeddings have different dimensions than the query
     // (e.g. provider changed from local/768 to openai/1536 without re-embedding)
-    if let Some((_, first_vec)) = all.first() {
-        if first_vec.len() != query_embedding.len() {
-            eprintln!(
-                "Warning: embedding dimension mismatch (query={}, stored={}). Run `nark embed build` to re-embed.",
-                query_embedding.len(), first_vec.len()
-            );
-            return None;
-        }
+    if let Some((_, first_vec)) = all.first()
+        && first_vec.len() != query_embedding.len()
+    {
+        eprintln!(
+            "Warning: embedding dimension mismatch (query={}, stored={}). Run `nark embed build` to re-embed.",
+            query_embedding.len(),
+            first_vec.len()
+        );
+        return None;
     }
 
     let note_embeddings = all.into_iter().collect();
-    Some(CosineContext { query_embedding, note_embeddings })
+    Some(CosineContext {
+        query_embedding,
+        note_embeddings,
+    })
 }
 
 /// For search hits with empty snippets, try FTS5 snippet with the original query,
@@ -153,26 +246,33 @@ fn fill_missing_snippets(
         }
 
         // Try FTS5 snippet if we have a query
-        if !query.is_empty() {
-            if let Ok(snippet) = try_fts_snippet(conn, query, &hit.note_id) {
-                hit.snippet = snippet;
-                continue;
-            }
+        if !query.is_empty()
+            && let Ok(snippet) = try_fts_snippet(conn, query, &hit.note_id)
+        {
+            hit.snippet = snippet;
+            continue;
         }
 
         // Fallback: first 150 chars of body from vault
         match read_body_preview(conn, vault, &hit.note_id) {
             Ok(body) => hit.snippet = body,
-            Err(e) => eprintln!("Warning: failed to read body preview for {}: {}", hit.note_id, e),
+            Err(e) => eprintln!(
+                "Warning: failed to read body preview for {}: {}",
+                hit.note_id, e
+            ),
         }
     }
 }
 
-fn try_fts_snippet(conn: &rusqlite::Connection, query: &str, note_id: &str) -> anyhow::Result<String> {
+fn try_fts_snippet(
+    conn: &rusqlite::Connection,
+    query: &str,
+    note_id: &str,
+) -> anyhow::Result<String> {
     let mut stmt = conn.prepare(
         "SELECT snippet(note_text, 2, '[', ']', '...', 32)
          FROM note_text
-         WHERE note_text MATCH ?1 AND note_id = ?2"
+         WHERE note_text MATCH ?1 AND note_id = ?2",
     )?;
     let snippet: String = stmt.query_row(rusqlite::params![query, note_id], |row| row.get(0))?;
     if snippet.is_empty() {
@@ -181,7 +281,11 @@ fn try_fts_snippet(conn: &rusqlite::Connection, query: &str, note_id: &str) -> a
     Ok(snippet)
 }
 
-fn read_body_preview(conn: &rusqlite::Connection, vault: &Vault, note_id: &str) -> anyhow::Result<String> {
+fn read_body_preview(
+    conn: &rusqlite::Connection,
+    vault: &Vault,
+    note_id: &str,
+) -> anyhow::Result<String> {
     let refs = resolve::get_ref(conn, note_id)?;
     let body = vault.read_object("objects/md", &refs.md_hash, "md")?;
     Ok(truncate_at_word(&body, 150).trim().to_string())
@@ -190,6 +294,341 @@ fn read_body_preview(conn: &rusqlite::Connection, vault: &Vault, note_id: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::client::default_socket;
+    use crate::serve::client::test_support::{
+        TestServer, current_uid_agent_map, seed_vault, temp_vault_dir,
+    };
+
+    /// The direct-open path's search JSON for a query over a seeded vault —
+    /// exactly the `out` object `run` builds before printing, in `Normal` mode
+    /// with no filters. Used to assert socket-hit == direct-open parity at the
+    /// value level (both pretty-print through `serde_json::to_string_pretty`, so
+    /// equal values mean byte-identical output).
+    fn direct_search_value(vault_dir: &Path, query: &str) -> serde_json::Value {
+        let conn = db::open_registry(vault_dir).expect("open registry");
+        let cfg = config::load(vault_dir).expect("load config");
+        let filters = SearchFilters {
+            domain: None,
+            kind: None,
+            intent: None,
+            tags: &[],
+            since: None,
+            before: None,
+            limit: 10,
+        };
+        let mut hits = search::search(
+            &conn,
+            query,
+            &filters,
+            &cfg.search,
+            None,
+            SearchMode::Normal,
+        )
+        .expect("registry search");
+        let vault = Vault::new(vault_dir.to_path_buf());
+        fill_missing_snippets(&conn, &vault, query, &mut hits);
+        let results: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "id": h.note_id,
+                    "title": h.title,
+                    "domain": h.domain,
+                    "kind": h.kind,
+                    "snippet": h.snippet,
+                    "rank": h.rank,
+                    "links_in": h.links_in,
+                    "links_out": h.links_out,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "query": query,
+            "domain": serde_json::Value::Null,
+            "mode": "normal",
+            "hits": results.len(),
+            "results": results,
+        })
+    }
+
+    /// The direct-open path's search JSON for a FILTERED query over a seeded
+    /// vault — exactly the `out` object `run` builds before printing, in `Normal`
+    /// mode, with the given `domain`/`tags` filters applied. Mirrors
+    /// `direct_search_value` but exercises the filter fields the dual-mode handler
+    /// forwards over the socket (`domain`, `tag`); the risk this closes is a future
+    /// rename of a filter param silently returning wrong results on a socket HIT.
+    /// The `"domain"` echo field matches the real `run` direct path exactly: it
+    /// emits `serde_json::json!(domain)` (the `Option<&str>` filter), which for
+    /// `Some("engineering")` serializes to the JSON string `"engineering"`.
+    fn direct_search_value_filtered(
+        vault_dir: &Path,
+        query: &str,
+        domain: Option<&str>,
+        tags: &[String],
+    ) -> serde_json::Value {
+        let conn = db::open_registry(vault_dir).expect("open registry");
+        let cfg = config::load(vault_dir).expect("load config");
+        let filters = SearchFilters {
+            domain,
+            kind: None,
+            intent: None,
+            tags,
+            since: None,
+            before: None,
+            limit: 10,
+        };
+        let mut hits = search::search(
+            &conn,
+            query,
+            &filters,
+            &cfg.search,
+            None,
+            SearchMode::Normal,
+        )
+        .expect("registry search");
+        let vault = Vault::new(vault_dir.to_path_buf());
+        fill_missing_snippets(&conn, &vault, query, &mut hits);
+        let results: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "id": h.note_id,
+                    "title": h.title,
+                    "domain": h.domain,
+                    "kind": h.kind,
+                    "snippet": h.snippet,
+                    "rank": h.rank,
+                    "links_in": h.links_in,
+                    "links_out": h.links_out,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "query": query,
+            "domain": serde_json::json!(domain),
+            "mode": "normal",
+            "hits": results.len(),
+            "results": results,
+        })
+    }
+
+    /// (a) With a live serve + a mapped uid, the dual-mode search path returns the
+    /// SERVER's result, byte-identical (value-equal) to the direct-open path over
+    /// the same seeded vault for a representative query that matches the note.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_socket_hit_matches_direct_path() {
+        let server = TestServer::start(current_uid_agent_map());
+
+        // "client" matches the seeded note's title/body.
+        let socket = default_socket(server.dir());
+        let params = search_params_json(
+            "client",
+            None,
+            None,
+            None,
+            &[],
+            10,
+            false,
+            false,
+            None,
+            None,
+        );
+        let from_socket = serve::client::try_request(&socket, "nark/search", params)
+            .expect("authenticated nark/search should return Some(result)");
+
+        let from_direct = direct_search_value(server.dir(), "client");
+        assert_eq!(
+            from_socket, from_direct,
+            "socket-hit search must match the direct-open path byte-for-byte"
+        );
+        assert!(
+            from_socket["hits"].as_u64().unwrap() >= 1,
+            "the 'client' query should hit the seeded note"
+        );
+
+        run(
+            server.dir(),
+            "client",
+            None,
+            None,
+            None,
+            &[],
+            10,
+            false,
+            false,
+            None,
+            None,
+        )
+        .expect("dual-mode search over live serve");
+    }
+
+    /// (a') FILTERED parity: with a live serve + a mapped uid, the dual-mode search
+    /// path forwards the `domain`/`tag` FILTERS over the socket and returns the
+    /// SERVER's result byte-identical (value-equal) to the direct-open path applying
+    /// the SAME filters. Closes the review gap: a bare-query parity test would not
+    /// catch a future rename of a filter param (`tag`/`domain`/`since`) silently
+    /// returning wrong results on a socket HIT. The seeded note matches all three
+    /// of `domain=engineering`, `tag=delta`, and the `"client"` query, so the
+    /// `hits >= 1` assertion makes an empty result unable to pass parity vacuously.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_socket_hit_matches_direct_path_with_filters() {
+        let server = TestServer::start(current_uid_agent_map());
+
+        let tags = vec!["delta".to_string()];
+        let socket = default_socket(server.dir());
+        let params = search_params_json(
+            "client",
+            Some("engineering"),
+            None,
+            None,
+            &tags,
+            10,
+            false,
+            false,
+            None,
+            None,
+        );
+        let from_socket = serve::client::try_request(&socket, "nark/search", params)
+            .expect("authenticated filtered nark/search should return Some(result)");
+
+        let from_direct =
+            direct_search_value_filtered(server.dir(), "client", Some("engineering"), &tags);
+        assert_eq!(
+            from_socket, from_direct,
+            "socket-hit filtered search must match the direct-open path byte-for-byte"
+        );
+        assert!(
+            from_socket["hits"].as_u64().unwrap() >= 1,
+            "domain=engineering + tag=delta + 'client' should hit the seeded note (a filter regression would empty this)"
+        );
+
+        run(
+            server.dir(),
+            "client",
+            Some("engineering"),
+            None,
+            None,
+            &tags,
+            10,
+            false,
+            false,
+            None,
+            None,
+        )
+        .expect("dual-mode filtered search over live serve");
+    }
+
+    /// (b) With NO serve (socket absent), the direct path is taken — the seam
+    /// returns `None` — and the handler succeeds with the seeded vault's data.
+    /// The `--bm25` flag (the direct path's mode toggle) still works.
+    #[test]
+    fn search_no_serve_takes_direct_path_with_bm25_flag() {
+        let dir = temp_vault_dir();
+        let _id = seed_vault(&dir);
+
+        let socket = default_socket(&dir);
+        assert!(!socket.exists(), "precondition: no serve socket");
+        let params =
+            search_params_json("client", None, None, None, &[], 10, true, false, None, None);
+        assert!(
+            serve::client::try_vault_request(&dir, "nark/search", params).is_none(),
+            "with no serve, the seam must return None so the direct path is taken"
+        );
+
+        // --bm25 still works on the direct path (mutually exclusive with --semantic
+        // upheld; the direct path selects Bm25Only mode and returns hits).
+        run(
+            &dir,
+            "client",
+            None,
+            None,
+            None,
+            &[],
+            10,
+            /*bm25*/ true,
+            false,
+            None,
+            None,
+        )
+        .expect("direct-open search with --bm25 and no serve");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PARITY SWEEP (search): the BYTES `run` would print on a socket HIT must be
+    /// byte-identical to the direct path's printed bytes over the same seeded
+    /// vault for a representative query. Both render via
+    /// `serde_json::to_string_pretty(..)` + a trailing newline.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_socket_vs_direct_output_is_byte_identical() {
+        let server = TestServer::start(current_uid_agent_map());
+
+        let params = search_params_json(
+            "client",
+            None,
+            None,
+            None,
+            &[],
+            10,
+            false,
+            false,
+            None,
+            None,
+        );
+        let socket_value = serve::client::try_vault_request(server.dir(), "nark/search", params)
+            .expect("socket hit");
+        let direct_value = direct_search_value(server.dir(), "client");
+
+        let socket_bytes = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&socket_value).expect("render socket")
+        );
+        let direct_bytes = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&direct_value).expect("render direct")
+        );
+        assert_eq!(
+            socket_bytes, direct_bytes,
+            "search output must be byte-identical socket-present vs socket-absent"
+        );
+    }
+
+    /// FALLBACK HARDENING (search): a STALE socket — bound but never accepting —
+    /// must NOT make the read fail. The seam times out and `run` falls back to
+    /// the correct direct path with no hang.
+    #[test]
+    fn search_stale_socket_falls_back_to_direct() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = temp_vault_dir();
+        let _id = seed_vault(&dir);
+        let socket = default_socket(&dir);
+        std::fs::create_dir_all(socket.parent().unwrap()).expect("create run dir");
+        let _listener = UnixListener::bind(&socket).expect("bind stale listener");
+
+        let start = std::time::Instant::now();
+        run(
+            &dir,
+            "client",
+            None,
+            None,
+            None,
+            &[],
+            10,
+            false,
+            false,
+            None,
+            None,
+        )
+        .expect("search must fall back to direct over a stale socket");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "a stale socket must not hang the search read"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_parse_temporal_valid_hours() {
@@ -225,7 +664,7 @@ mod tests {
         assert!(parse_temporal("abc").is_err());
         assert!(parse_temporal("").is_err());
         assert!(parse_temporal("1D").is_err()); // case sensitive
-        assert!(parse_temporal("d").is_err());  // missing number
+        assert!(parse_temporal("d").is_err()); // missing number
         assert!(parse_temporal("last tuesday").is_err());
         assert!(parse_temporal("2026-01-01").is_err());
     }
