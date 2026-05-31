@@ -308,6 +308,108 @@ mod tests {
         md
     }
 
+    /// Rebuild the briefing markdown the direct-open path produces for a
+    /// domain + tag-filtered orient over a seeded vault, WITHOUT the per-note
+    /// access bump. Mirrors `direct_orient_markdown` but applies a `tag` filter to
+    /// BOTH the search pre-filter AND the recent-activity COUNT (the same `EXISTS`
+    /// clause `run` appends per tag, alongside the domain clause), and uses the
+    /// "(matching filters)" scope suffix since filters are present. This is the
+    /// parity baseline for a socket HIT that forwards `domain` + `tag` filters.
+    fn direct_orient_markdown_with_tag(vault_dir: &Path, domain: &str, tags: &[String]) -> String {
+        let conn = db::open_registry(vault_dir).expect("open registry");
+        let vault = Vault::new(vault_dir.to_path_buf());
+        let cfg = config::load(vault_dir).expect("load config");
+
+        let filters = search::SearchFilters {
+            domain: Some(domain),
+            kind: None,
+            intent: None,
+            tags,
+            since: None,
+            before: None,
+            limit: 10,
+        };
+        let hits = search::search(
+            &conn,
+            "",
+            &filters,
+            &cfg.search,
+            None,
+            search::SearchMode::Normal,
+        )
+        .expect("registry search");
+
+        let mut md = String::new();
+        md.push_str("# Vault Briefing: vault\n\n");
+        md.push_str(&format!("## Key Notes ({} most relevant)\n\n", hits.len()));
+
+        let mut all_tags = BTreeSet::new();
+        for hit in &hits {
+            let refs = resolve::get_ref(&conn, &hit.note_id).expect("get ref");
+            let body = vault
+                .read_object("objects/md", &refs.md_hash, "md")
+                .expect("read body");
+            let preview = truncate_at_word(&body, 300);
+            let preview = preview.trim();
+            let updated_at: String = conn
+                .query_row(
+                    "SELECT COALESCE(updated_at, '') FROM current_notes WHERE note_id = ?1",
+                    [&hit.note_id],
+                    |row| row.get(0),
+                )
+                .expect("updated_at");
+            let date = updated_at.split('T').next().unwrap_or(&updated_at);
+            md.push_str(&format!("### {}\n", hit.title));
+            md.push_str(&format!("- Domain: {} | Kind: {}\n", hit.domain, hit.kind));
+            md.push_str(&format!("- Updated: {}\n", date));
+            md.push_str(&format!("> {}\n\n", preview.replace('\n', "\n> ")));
+            if let Ok(note_tags) = tags::get_tags(&conn, &hit.note_id) {
+                for t in note_tags {
+                    all_tags.insert(t);
+                }
+            }
+        }
+
+        if !all_tags.is_empty() {
+            md.push_str("## Active Tags\n");
+            let tag_list: Vec<&str> = all_tags.iter().map(|s| s.as_str()).collect();
+            md.push_str(&tag_list.join(", "));
+            md.push_str("\n\n");
+        }
+
+        // Recent-activity COUNT scoped to domain + each tag, exactly as `run`
+        // assembles it (domain clause at ?2, then one EXISTS clause per tag).
+        let seven_days_ago = parse_temporal("7d").expect("7d");
+        let mut sql = String::from(
+            "SELECT COUNT(*) FROM current_notes cn WHERE cn.updated_at >= ?1 AND cn.status != 'retracted'",
+        );
+        let mut bound: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(seven_days_ago)];
+        let mut pi = 2usize;
+        sql.push_str(&format!(" AND cn.domain = ?{}", pi));
+        bound.push(Box::new(domain.to_string()));
+        pi += 1;
+        for t in tags {
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM note_tags nt JOIN tags tg ON nt.tag_id = tg.tag_id WHERE nt.note_id = cn.note_id AND tg.name = ?{})",
+                pi
+            ));
+            bound.push(Box::new(t.clone()));
+            pi += 1;
+        }
+        let _ = pi;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            bound.iter().map(|p| p.as_ref()).collect();
+        let recent_count: i64 = conn
+            .query_row(&sql, param_refs.as_slice(), |row| row.get(0))
+            .expect("recent count");
+        md.push_str("## Recent Activity\n");
+        md.push_str(&format!(
+            "{} notes updated in last 7 days (matching filters)\n",
+            recent_count
+        ));
+        md
+    }
+
     /// (a) With a live serve + a mapped uid, the dual-mode orient path returns the
     /// SERVER's result for a domain query. The server returns the briefing as a
     /// JSON string equal (value-for-value) to the markdown the direct path builds.
@@ -364,6 +466,58 @@ mod tests {
             None,
         )
         .expect("dual-mode orient over live serve");
+    }
+
+    /// (a') FILTERED parity: with a live serve + a mapped uid, the dual-mode orient
+    /// path forwards a `domain` + `tag` filter over the socket and returns the
+    /// SERVER's briefing markdown byte-identical to the direct-open path applying
+    /// the SAME filters. Closes the review gap: a domain-only parity test would not
+    /// catch a future rename of the `tag` filter param silently returning wrong
+    /// results on a socket HIT. The seeded note carries `tag=delta` in
+    /// `domain=engineering`, so the `### Client Note` assertion makes a dropped
+    /// filter (which would empty the briefing) unable to pass parity vacuously.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn orient_socket_hit_matches_direct_path_with_tag_filter() {
+        let server = TestServer::start(current_uid_agent_map());
+
+        let tags = vec!["delta".to_string()];
+        let socket = default_socket(server.dir());
+        let params = orient_params_json(None, Some("engineering"), None, &tags, 10, None, None);
+        let from_socket = serve::client::try_request(&socket, "nark/orient", params)
+            .expect("authenticated filtered nark/orient should return Some(result)");
+
+        let served_md = from_socket
+            .as_str()
+            .expect("orient result is the briefing markdown as a JSON string");
+        let direct_md = direct_orient_markdown_with_tag(server.dir(), "engineering", &tags);
+        assert_eq!(
+            served_md, direct_md,
+            "socket-hit filtered orient briefing must match the direct-open path's markdown"
+        );
+        assert!(
+            served_md.contains("### Client Note"),
+            "the seeded note (domain=engineering, tag=delta) should survive the tag filter, got: {served_md}"
+        );
+
+        // The PRINTED BYTES must be byte-identical between the two paths.
+        let printed = render_orient_output(&from_socket).expect("render socket orient output");
+        assert_eq!(
+            printed, direct_md,
+            "socket-hit filtered orient must print the SAME raw markdown bytes as the direct path"
+        );
+
+        run(
+            server.dir(),
+            None,
+            Some("engineering"),
+            None,
+            &tags,
+            10,
+            None,
+            None,
+        )
+        .expect("dual-mode filtered orient over live serve");
     }
 
     /// (b) With NO serve (socket absent), the direct path is taken — the seam

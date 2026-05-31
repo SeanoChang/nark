@@ -27,12 +27,10 @@
 //! * an `error` JSON-RPC response,
 //! * malformed JSON or an empty read.
 //!
-//! Slice 4.1 lands this client and the helper; wiring it into the handlers is
-//! a later slice — so under the non-test build nothing calls these yet. The
-//! tests exercise the full path today; the same "lands now, wired later"
-//! allowance the rest of the serve module carries (see `peercred` / `authz`)
-//! keeps the non-test build warning-free until the CLI slice wires it in.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Slice 4.1 landed this client and the `try_request` helper; the dual-mode
+//! slices (4.2–4.4) wire it into all five read handlers
+//! (`peek`/`read`/`stats`/`search`/`orient`), so it is reachable in the non-test
+//! build — no `dead_code` allowance is needed.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;

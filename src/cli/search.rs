@@ -351,6 +351,67 @@ mod tests {
         })
     }
 
+    /// The direct-open path's search JSON for a FILTERED query over a seeded
+    /// vault — exactly the `out` object `run` builds before printing, in `Normal`
+    /// mode, with the given `domain`/`tags` filters applied. Mirrors
+    /// `direct_search_value` but exercises the filter fields the dual-mode handler
+    /// forwards over the socket (`domain`, `tag`); the risk this closes is a future
+    /// rename of a filter param silently returning wrong results on a socket HIT.
+    /// The `"domain"` echo field matches the real `run` direct path exactly: it
+    /// emits `serde_json::json!(domain)` (the `Option<&str>` filter), which for
+    /// `Some("engineering")` serializes to the JSON string `"engineering"`.
+    fn direct_search_value_filtered(
+        vault_dir: &Path,
+        query: &str,
+        domain: Option<&str>,
+        tags: &[String],
+    ) -> serde_json::Value {
+        let conn = db::open_registry(vault_dir).expect("open registry");
+        let cfg = config::load(vault_dir).expect("load config");
+        let filters = SearchFilters {
+            domain,
+            kind: None,
+            intent: None,
+            tags,
+            since: None,
+            before: None,
+            limit: 10,
+        };
+        let mut hits = search::search(
+            &conn,
+            query,
+            &filters,
+            &cfg.search,
+            None,
+            SearchMode::Normal,
+        )
+        .expect("registry search");
+        let vault = Vault::new(vault_dir.to_path_buf());
+        fill_missing_snippets(&conn, &vault, query, &mut hits);
+        let results: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "id": h.note_id,
+                    "title": h.title,
+                    "domain": h.domain,
+                    "kind": h.kind,
+                    "snippet": h.snippet,
+                    "rank": h.rank,
+                    "links_in": h.links_in,
+                    "links_out": h.links_out,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "query": query,
+            "domain": serde_json::json!(domain),
+            "mode": "normal",
+            "hits": results.len(),
+            "results": results,
+        })
+    }
+
     /// (a) With a live serve + a mapped uid, the dual-mode search path returns the
     /// SERVER's result, byte-identical (value-equal) to the direct-open path over
     /// the same seeded vault for a representative query that matches the note.
@@ -400,6 +461,63 @@ mod tests {
             None,
         )
         .expect("dual-mode search over live serve");
+    }
+
+    /// (a') FILTERED parity: with a live serve + a mapped uid, the dual-mode search
+    /// path forwards the `domain`/`tag` FILTERS over the socket and returns the
+    /// SERVER's result byte-identical (value-equal) to the direct-open path applying
+    /// the SAME filters. Closes the review gap: a bare-query parity test would not
+    /// catch a future rename of a filter param (`tag`/`domain`/`since`) silently
+    /// returning wrong results on a socket HIT. The seeded note matches all three
+    /// of `domain=engineering`, `tag=delta`, and the `"client"` query, so the
+    /// `hits >= 1` assertion makes an empty result unable to pass parity vacuously.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn search_socket_hit_matches_direct_path_with_filters() {
+        let server = TestServer::start(current_uid_agent_map());
+
+        let tags = vec!["delta".to_string()];
+        let socket = default_socket(server.dir());
+        let params = search_params_json(
+            "client",
+            Some("engineering"),
+            None,
+            None,
+            &tags,
+            10,
+            false,
+            false,
+            None,
+            None,
+        );
+        let from_socket = serve::client::try_request(&socket, "nark/search", params)
+            .expect("authenticated filtered nark/search should return Some(result)");
+
+        let from_direct =
+            direct_search_value_filtered(server.dir(), "client", Some("engineering"), &tags);
+        assert_eq!(
+            from_socket, from_direct,
+            "socket-hit filtered search must match the direct-open path byte-for-byte"
+        );
+        assert!(
+            from_socket["hits"].as_u64().unwrap() >= 1,
+            "domain=engineering + tag=delta + 'client' should hit the seeded note (a filter regression would empty this)"
+        );
+
+        run(
+            server.dir(),
+            "client",
+            Some("engineering"),
+            None,
+            None,
+            &tags,
+            10,
+            false,
+            false,
+            None,
+            None,
+        )
+        .expect("dual-mode filtered search over live serve");
     }
 
     /// (b) With NO serve (socket absent), the direct path is taken — the seam
