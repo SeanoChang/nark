@@ -6,9 +6,15 @@
 //!
 //! Slice 2.5 assembles the authenticated path: each connection's peer uid is
 //! extracted ([`super::peercred::peer_uid`]), resolved to an agent via the
-//! injected [`AgentMap`], and only known agents are served `ping`->`pong`.
-//! Unknown / forged uids get an `unauthorized` line and the connection is
-//! closed (fail closed).
+//! injected [`AgentMap`], and only known agents are served. Unknown / forged
+//! uids get an `unauthorized` line and the connection is closed (fail closed).
+//!
+//! Slice 3.2 replaces the line protocol with one JSON-RPC request per
+//! connection: after auth, the handler reads one [`crate::wire::RPCRequest`]
+//! line, dispatches it via [`super::rpc::dispatch`], and writes one
+//! [`crate::wire::RPCResponse`] line. `ping` is now a JSON-RPC method
+//! (`{"pong": true}`); unknown methods return `-32601`, malformed JSON returns
+//! `-32700`. The unknown-uid rejection still precedes any RPC parsing.
 //!
 //! Before binding, a pre-bind lstat guard ([`guard_preexisting_socket_path`])
 //! refuses to serve if a symlink or a foreign-owned file already sits at the
@@ -29,6 +35,11 @@ use tokio::net::{UnixListener, UnixStream};
 use super::AgentMap;
 use super::authz::guard_preexisting_socket_path;
 use super::peercred::peer_uid;
+use super::rpc;
+use crate::wire::{RPCRequest, RPCResponse};
+
+/// JSON-RPC error code: the request line was not valid JSON.
+const PARSE_ERROR: i64 = -32700;
 
 /// How long to wait for an authenticated peer to send its request line before
 /// the connection is logged and closed. A peer that connects and never sends a
@@ -123,11 +134,11 @@ impl BoundListener {
     }
 
     /// Accept-loop until `shutdown` resolves. Each connection is handled by
-    /// reading a single line and replying `pong\n` to `ping`.
+    /// reading a single JSON-RPC request line and writing its response.
     ///
     /// This is the unauthenticated baseline from slice 2.2; the daemon path now
     /// uses [`Self::serve_authenticated_until`]. It is retained (and exercised
-    /// by tests) as the documented pre-auth ping/pong primitive.
+    /// by tests) as the documented pre-auth round-trip primitive.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn serve_until<F>(&self, shutdown: F) -> Result<()>
     where
@@ -155,9 +166,10 @@ impl BoundListener {
     /// Authenticated accept-loop until `shutdown` resolves.
     ///
     /// For each connection the peer's uid is extracted and resolved against
-    /// `agents`. Known uids are served `ping`->`pong`; unknown / forged uids
-    /// receive an `unauthorized` line and the connection is closed (fail
-    /// closed). This is the assembled Phase 2 serve path.
+    /// `agents`. Known uids are served one JSON-RPC request/response round-trip;
+    /// unknown / forged uids receive an `unauthorized` line and the connection is
+    /// closed (fail closed) before any RPC parsing. This is the Phase 3 serve
+    /// path built on the Phase 2 authenticated accept loop.
     ///
     /// The per-connection request read is bounded by [`READ_TIMEOUT`]; a peer
     /// that connects and never sends a line is closed rather than parking its
@@ -212,10 +224,14 @@ impl Drop for BoundListener {
     }
 }
 
-/// Handle a single connection: read one line, answer `ping` with `pong`.
+/// Handle a single connection: read one JSON-RPC request line and write its
+/// response.
 ///
 /// Unauthenticated baseline from slice 2.2, superseded on the daemon path by
-/// [`handle_authenticated_connection`]; retained as a tested primitive.
+/// [`handle_authenticated_connection`]; retained as a tested primitive. Phase 3
+/// moves it to the same JSON-RPC framing as the authenticated path so there is a
+/// single protocol on the wire (no dual line/JSON-RPC handling). Malformed JSON
+/// yields a `-32700 parse error` with an empty id.
 #[cfg_attr(not(test), allow(dead_code))]
 async fn handle_connection(stream: UnixStream) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
@@ -228,26 +244,33 @@ async fn handle_connection(stream: UnixStream) -> Result<()> {
     if n == 0 {
         return Ok(());
     }
-    if line.trim_end() == "ping" {
-        write_half
-            .write_all(b"pong\n")
-            .await
-            .context("writing pong")?;
-        write_half.flush().await.context("flushing pong")?;
-    }
-    Ok(())
+    let response = match serde_json::from_str::<RPCRequest>(line.trim_end()) {
+        Ok(req) => rpc::dispatch(&req),
+        Err(e) => {
+            eprintln!("nark serve: unauthenticated peer sent malformed JSON-RPC: {e}");
+            RPCResponse::error("", PARSE_ERROR, "parse error", None)
+        }
+    };
+    write_response(&mut write_half, &response).await
 }
 
-/// Handle a single connection with peer authentication.
+/// Handle a single connection with peer authentication, then one JSON-RPC
+/// request/response round-trip.
 ///
-/// Extracts the peer uid, resolves it to an agent via `agents`, and only then
-/// serves `ping`->`pong`. Unknown uids get an `unauthorized` line and the
-/// connection is closed without serving anything (fail closed).
+/// Order, fail-closed:
+/// 1. Extract the peer uid and resolve it to an agent via `agents`. Unknown
+///    uids get an `unauthorized` line and the connection is closed *before any
+///    RPC parsing* (the unknown-uid rejection precedes everything else).
+/// 2. Read exactly one line, bounded by `read_timeout`: a peer that
+///    authenticates but never sends a request is logged and closed instead of
+///    parking the spawned task forever.
+/// 3. Parse the line as a [`RPCRequest`]. Malformed JSON yields a JSON-RPC
+///    `-32700 parse error` with an empty id (there is no id to echo).
+/// 4. Dispatch via [`rpc::dispatch`] and write the single [`RPCResponse`] as one
+///    JSON line + newline.
 ///
-/// The request read is bounded by `read_timeout`: a peer that authenticates but
-/// never sends a request line is logged and the connection closed, instead of
-/// parking the spawned task forever. The accept loop is unaffected because this
-/// runs inside the per-connection task.
+/// The accept loop is unaffected by the per-connection timeout because this runs
+/// inside the spawned per-connection task.
 async fn handle_authenticated_connection(
     stream: UnixStream,
     agents: &AgentMap,
@@ -289,13 +312,32 @@ async fn handle_authenticated_connection(
     if n == 0 {
         return Ok(());
     }
-    if line.trim_end() == "ping" {
-        write_half
-            .write_all(b"pong\n")
-            .await
-            .context("writing pong")?;
-        write_half.flush().await.context("flushing pong")?;
-    }
+
+    // Parse the one request line as JSON-RPC; malformed JSON is reported with a
+    // `-32700 parse error` and an empty id (we have no id to echo).
+    let response = match serde_json::from_str::<RPCRequest>(line.trim_end()) {
+        Ok(req) => rpc::dispatch(&req),
+        Err(e) => {
+            eprintln!("nark serve: {agent} (uid {uid}) sent malformed JSON-RPC: {e}");
+            RPCResponse::error("", PARSE_ERROR, "parse error", None)
+        }
+    };
+
+    write_response(&mut write_half, &response).await
+}
+
+/// Serialize a [`RPCResponse`] to one JSON line + newline and flush it.
+async fn write_response<W>(write_half: &mut W, response: &RPCResponse) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut bytes = serde_json::to_vec(response).context("serializing RPC response")?;
+    bytes.push(b'\n');
+    write_half
+        .write_all(&bytes)
+        .await
+        .context("writing RPC response")?;
+    write_half.flush().await.context("flushing RPC response")?;
     Ok(())
 }
 
@@ -330,9 +372,21 @@ mod tests {
         assert_eq!(resolved, Path::new("/run/custom.sock"));
     }
 
-    /// End-to-end Phase 2 exit: an authenticated `ping` round-trips to `pong`
-    /// when the connecting uid is a known agent, and an unknown uid is rejected
-    /// at the application layer with an `unauthorized` line.
+    /// Read one newline-terminated line from `stream` and parse it as JSON.
+    /// Shared by the JSON-RPC round-trip tests.
+    async fn read_json_line(stream: UnixStream) -> serde_json::Value {
+        let mut reply = String::new();
+        let mut reader = BufReader::new(stream);
+        reader
+            .read_line(&mut reply)
+            .await
+            .expect("read response line");
+        serde_json::from_str(reply.trim_end()).expect("response is valid JSON")
+    }
+
+    /// Phase 3 exit: an authenticated JSON-RPC `ping` request round-trips to a
+    /// `{"pong": true}` result whose id echoes the request id, when the
+    /// connecting uid is a known agent.
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn authenticated_ping_known_uid_gets_pong() {
@@ -363,12 +417,111 @@ mod tests {
         let mut stream = UnixStream::connect(&socket_path)
             .await
             .expect("connect to socket");
-        stream.write_all(b"ping\n").await.expect("write ping");
-        stream.flush().await.expect("flush ping");
+        stream
+            .write_all(b"{\"id\":\"abc\",\"method\":\"ping\"}\n")
+            .await
+            .expect("write ping request");
+        stream.flush().await.expect("flush ping request");
 
-        let mut buf = [0u8; 5];
-        stream.read_exact(&mut buf).await.expect("read pong");
-        assert_eq!(&buf, b"pong\n", "known uid should get pong");
+        let v = read_json_line(stream).await;
+        assert_eq!(v["id"], "abc", "response id should echo request id");
+        assert_eq!(v["result"]["pong"], true, "ping should yield pong=true");
+        assert!(v.get("error").is_none(), "ping should not be an error");
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An authenticated unknown method returns a JSON-RPC `-32601` error echoing
+    /// the request id.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn authenticated_unknown_method_returns_32601() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        let mut stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to socket");
+        stream
+            .write_all(b"{\"id\":\"7\",\"method\":\"nope\"}\n")
+            .await
+            .expect("write request");
+        stream.flush().await.expect("flush request");
+
+        let v = read_json_line(stream).await;
+        assert_eq!(v["id"], "7", "error response should echo request id");
+        assert_eq!(v["error"]["code"], -32601, "unknown method is -32601");
+        assert_eq!(v["error"]["message"], "method not found");
+        assert!(v.get("result").is_none(), "error has no result");
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Malformed JSON on an authenticated connection returns a JSON-RPC
+    /// `-32700 parse error` with an empty id.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn authenticated_malformed_json_returns_32700() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        let mut stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to socket");
+        stream
+            .write_all(b"this is not json\n")
+            .await
+            .expect("write garbage");
+        stream.flush().await.expect("flush garbage");
+
+        let v = read_json_line(stream).await;
+        assert_eq!(v["id"], "", "parse error carries an empty id");
+        assert_eq!(v["error"]["code"], -32700, "malformed JSON is -32700");
+        assert_eq!(v["error"]["message"], "parse error");
 
         tx.send(()).expect("send shutdown");
         server.await.expect("server task join");
@@ -463,16 +616,19 @@ mod tests {
             drop(serve_path);
         });
 
-        // Connect and exercise ping -> pong.
+        // Connect and exercise a JSON-RPC ping -> pong round-trip.
         let mut stream = UnixStream::connect(&socket_path)
             .await
             .expect("connect to socket");
-        stream.write_all(b"ping\n").await.expect("write ping");
-        stream.flush().await.expect("flush ping");
+        stream
+            .write_all(b"{\"id\":\"life\",\"method\":\"ping\"}\n")
+            .await
+            .expect("write ping request");
+        stream.flush().await.expect("flush ping request");
 
-        let mut buf = [0u8; 5];
-        stream.read_exact(&mut buf).await.expect("read pong");
-        assert_eq!(&buf, b"pong\n");
+        let v = read_json_line(stream).await;
+        assert_eq!(v["id"], "life", "response id should echo request id");
+        assert_eq!(v["result"]["pong"], true, "ping should yield pong=true");
 
         // Trigger shutdown and wait for the server task to finish.
         tx.send(()).expect("send shutdown");

@@ -1,5 +1,15 @@
 use serde::{Deserialize, Serialize};
 
+mod rpc;
+
+// Full JSON-RPC surface. The `nark serve` bin uses only `RPCRequest`/
+// `RPCResponse` directly (the success/error variants carry `ResultResponse`/
+// `ErrorResponse`/`RPCError`), but these are the module's public types and are
+// part of the library surface, so re-export them all rather than narrowing the
+// API to what one consumer needs today.
+#[allow(unused_imports)]
+pub use rpc::{ErrorResponse, RPCError, RPCRequest, RPCResponse, ResultResponse};
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
