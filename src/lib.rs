@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod embed;
 pub mod registry;
+pub mod serve;
 pub mod types;
 pub mod vault;
 pub mod wire;

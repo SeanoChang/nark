@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 
 pub const BUILTIN_KINDS: &[&str] = &[
@@ -13,6 +14,20 @@ pub struct Config {
     pub search: SearchConfig,
     pub taxonomy: TaxonomyConfig,
     pub embedding: EmbeddingConfig,
+    pub serve: ServeConfig,
+}
+
+/// `nark serve` daemon configuration.
+///
+/// `agents` is an optional `[serve.agents]` table mapping a peer uid (written
+/// as a string TOML key, e.g. `"501"`) to a logical agent name. Absent in dev,
+/// it yields an empty map; the serve authz layer parses it into an `AgentMap`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ServeConfig {
+    /// uid-string -> agent name. TOML keys must be strings, so uids are stored
+    /// as their decimal string form and parsed to `u32` by the authz layer.
+    pub agents: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

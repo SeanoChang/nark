@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod embed;
 mod registry;
+mod serve;
 mod types;
 mod vault;
 
@@ -33,7 +34,8 @@ use crate::cli::Commands::{
     Stats,
     Reset,
     Retract,
-    Update
+    Update,
+    Serve
 };
 use cli::init::run;
 
@@ -79,5 +81,6 @@ fn main() -> Result<()> {
         Reset { confirm } => cli::reset::run(&vault_dir, confirm),
         Retract { ids, domain, kind, tag, since, before, confirm } => cli::retract::run(&vault_dir, ids, domain, kind, tag, since, before, confirm),
         Update => cli::update::run(),
+        Serve { socket } => serve::run(&vault_dir, socket),
     }
 }
