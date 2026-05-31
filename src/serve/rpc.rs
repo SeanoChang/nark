@@ -263,10 +263,13 @@ fn orient_params(req: &RPCRequest) -> Result<OrientParams, RPCResponse> {
 /// `note` is **required** — the full note markdown document (frontmatter + body)
 /// `vault.ingest` consumes, exactly what `nark write` reads from a file/stdin. A
 /// missing or non-string `note` is `-32602 invalid params`. `auto_link` is an
-/// optional boolean (default `false`), mirroring `nark write --auto-link`. A
-/// missing `params`, or a `params` that is not an object, is an error (unlike the
-/// read methods, `write` has a required field, so an empty object is rejected too
-/// via the missing `note`).
+/// optional boolean (default `false`), mirroring `nark write --auto-link`.
+/// `idempotency_key` is an optional string (Phase 6, slice 6.3): when present the
+/// single serializing writer applies the write at most once for that key and
+/// returns the cached result on a retry; absent -> the write always applies. A
+/// non-string `idempotency_key` is `-32602`. A missing `params`, or a `params`
+/// that is not an object, is an error (unlike the read methods, `write` has a
+/// required field, so an empty object is rejected too via the missing `note`).
 fn write_params(req: &RPCRequest) -> Result<WriteParams, RPCResponse> {
     let obj = params_object(req)?;
     let note = match opt_string(req, obj, "note")? {
@@ -281,6 +284,7 @@ fn write_params(req: &RPCRequest) -> Result<WriteParams, RPCResponse> {
     Ok(WriteParams {
         note,
         auto_link: opt_bool(req, obj, "auto_link")?,
+        idempotency_key: opt_string(req, obj, "idempotency_key")?,
     })
 }
 
@@ -762,6 +766,41 @@ tags:\n\
         let read = dispatch(&ctx, &request("r1", "nark/read", Some(json!({"id": id})))).await;
         let rv = expect_result(read);
         assert_eq!(rv["body"], "Router body text.");
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two `nark/write` requests carrying the SAME `idempotency_key` route through
+    /// the writer's dedup: exactly one note/version is created and the second
+    /// response is the identical cached result (same id). A retried write over the
+    /// wire is idempotent.
+    #[tokio::test]
+    async fn write_same_idempotency_key_dedups_through_dispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "nark-rpc-write-idem-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp vault");
+        drop(crate::db::open_registry(&dir).expect("seed registry"));
+        let ctx = ctx_with_writer(&dir).await;
+
+        let params = json!({ "note": NOTE, "idempotency_key": "wire-key" });
+        let first =
+            expect_result(dispatch(&ctx, &request("i1", "nark/write", Some(params.clone()))).await);
+        let second =
+            expect_result(dispatch(&ctx, &request("i2", "nark/write", Some(params))).await);
+
+        assert_eq!(
+            first, second,
+            "the retried write returns the identical cached result"
+        );
+
+        // Exactly one note + one version exist despite two write requests.
+        let stats = expect_result(dispatch(&ctx, &request("s1", "nark/stats", None)).await);
+        assert_eq!(stats["total_notes"], 1, "same key => one note");
+        assert_eq!(stats["total_versions"], 1, "same key => one version");
 
         drop(ctx);
         let _ = std::fs::remove_dir_all(&dir);

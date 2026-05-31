@@ -54,6 +54,13 @@ pub struct WriteParams {
     pub note: String,
     /// Whether to create auto-link edges from similarity suggestions.
     pub auto_link: bool,
+    /// Optional caller-supplied idempotency key (Phase 6, slice 6.3). When set,
+    /// the single serializing writer applies this write at most once for the key
+    /// and returns the cached result on a repeat — so a client that retries
+    /// (e.g. after a dropped connection) never commits a second version. Absent
+    /// -> never deduped (the write always applies). The key scope is **global**
+    /// across the daemon's write methods; see [`super::writer`] for the bound.
+    pub idempotency_key: Option<String>,
 }
 
 /// `nark/write`: ingest one note markdown document, mirroring `cli::write` /
@@ -80,7 +87,15 @@ pub struct WriteParams {
 ///
 /// The reactor is never blocked: the blocking SQLite + CAS I/O run on the
 /// writer thread and this `await`s the job's oneshot reply. When the writer queue
-/// is full, [`Writer::submit`] returns a clean backpressure `Err` (no hang).
+/// is full, [`Writer::submit_idempotent`] returns a clean backpressure `Err` (no
+/// hang).
+///
+/// When `params.idempotency_key` is set, the write is submitted through
+/// [`Writer::submit_idempotent`]: the single writer applies it at most once for
+/// the key and returns the cached `{ "id", "title", ... }` result on a retry, so
+/// a re-sent write commits no second version. An absent key always applies (no
+/// dedup). The dedup check/cache is atomic on the one writer thread — see
+/// [`super::writer`].
 pub async fn write(ctx: &Ctx, params: WriteParams) -> Result<Value> {
     let writer = ctx
         .writer()
@@ -91,10 +106,14 @@ pub async fn write(ctx: &Ctx, params: WriteParams) -> Result<Value> {
     // job (on the writer thread) so all blocking work — ONNX init/inference and
     // SQLite — stays off the reactor and on the single writer thread.
     let vault_dir = ctx.vault_dir().to_path_buf();
-    let WriteParams { note, auto_link } = params;
+    let WriteParams {
+        note,
+        auto_link,
+        idempotency_key,
+    } = params;
 
     writer
-        .submit(move |conn| {
+        .submit_idempotent(idempotency_key, move |conn| {
             let cfg = config::load(&vault_dir)?;
 
             let vault = Vault::new(vault_dir.clone());
@@ -217,6 +236,7 @@ Written body text.\n";
             WriteParams {
                 note: NOTE.to_string(),
                 auto_link: false,
+                idempotency_key: None,
             },
         )
         .await
@@ -258,6 +278,7 @@ Written body text.\n";
             WriteParams {
                 note: NOTE.to_string(),
                 auto_link: false,
+                idempotency_key: None,
             },
         )
         .await
@@ -313,6 +334,7 @@ Written body text.\n";
             WriteParams {
                 note: "no frontmatter here".to_string(),
                 auto_link: false,
+                idempotency_key: None,
             },
         )
         .await;
@@ -328,5 +350,154 @@ Written body text.\n";
     /// tiny test shim rather than widening the public `Ctx` surface.
     fn ctx_pool(ctx: &Ctx) -> &deadpool::managed::Pool<RoManager> {
         ctx.dpool_for_test()
+    }
+
+    /// Total notes and total versions in the vault — the dedup invariant for the
+    /// idempotency tests (a retried write must not bump either count).
+    async fn counts(ctx: &Ctx) -> (i64, i64) {
+        let stats = methods_read::stats(ctx_pool(ctx))
+            .await
+            .expect("stats should succeed");
+        (
+            stats["total_notes"].as_i64().expect("total_notes"),
+            stats["total_versions"].as_i64().expect("total_versions"),
+        )
+    }
+
+    /// Two `nark/write` with the SAME `idempotency_key` create exactly ONE
+    /// note/version, and the second call returns the IDENTICAL cached result (same
+    /// id) without re-applying — a retried write is idempotent.
+    #[tokio::test]
+    async fn same_idempotency_key_writes_once_returns_cached() {
+        let dir = fresh_vault();
+        let ctx = ctx_with_writer(&dir).await;
+
+        let first = write(
+            &ctx,
+            WriteParams {
+                note: NOTE.to_string(),
+                auto_link: false,
+                idempotency_key: Some("retry-key-1".to_string()),
+            },
+        )
+        .await
+        .expect("first write ok");
+        let (notes_after_first, versions_after_first) = counts(&ctx).await;
+        assert_eq!(notes_after_first, 1, "first write creates one note");
+        assert_eq!(versions_after_first, 1, "first write creates one version");
+
+        // The retry: same key, same note. Must NOT create a second note/version,
+        // and must return the identical cached result.
+        let second = write(
+            &ctx,
+            WriteParams {
+                note: NOTE.to_string(),
+                auto_link: false,
+                idempotency_key: Some("retry-key-1".to_string()),
+            },
+        )
+        .await
+        .expect("retry write ok (served from cache)");
+
+        let (notes_after_retry, versions_after_retry) = counts(&ctx).await;
+        assert_eq!(
+            notes_after_retry, 1,
+            "a retried write with the same key must not create a second note"
+        );
+        assert_eq!(
+            versions_after_retry, 1,
+            "a retried write with the same key must not create a second version"
+        );
+        assert_eq!(
+            first, second,
+            "the retry must return the identical cached result (same id + title)"
+        );
+        assert_eq!(
+            first["id"], second["id"],
+            "the cached result carries the same note id"
+        );
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two `nark/write` with DIFFERENT idempotency keys create TWO notes/versions
+    /// (no cross-key dedup), each with its own id.
+    #[tokio::test]
+    async fn different_idempotency_keys_write_twice() {
+        let dir = fresh_vault();
+        let ctx = ctx_with_writer(&dir).await;
+
+        let a = write(
+            &ctx,
+            WriteParams {
+                note: NOTE.to_string(),
+                auto_link: false,
+                idempotency_key: Some("key-a".to_string()),
+            },
+        )
+        .await
+        .expect("write a ok");
+        let b = write(
+            &ctx,
+            WriteParams {
+                note: NOTE.to_string(),
+                auto_link: false,
+                idempotency_key: Some("key-b".to_string()),
+            },
+        )
+        .await
+        .expect("write b ok");
+
+        let (notes, versions) = counts(&ctx).await;
+        assert_eq!(notes, 2, "two distinct keys create two notes");
+        assert_eq!(versions, 2, "two distinct keys create two versions");
+        assert_ne!(
+            a["id"], b["id"],
+            "two distinct keys produce two distinct notes"
+        );
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two `nark/write` with NO idempotency key create TWO notes/versions — an
+    /// absent key is never deduped.
+    #[tokio::test]
+    async fn absent_idempotency_key_writes_twice() {
+        let dir = fresh_vault();
+        let ctx = ctx_with_writer(&dir).await;
+
+        let a = write(
+            &ctx,
+            WriteParams {
+                note: NOTE.to_string(),
+                auto_link: false,
+                idempotency_key: None,
+            },
+        )
+        .await
+        .expect("keyless write a ok");
+        let b = write(
+            &ctx,
+            WriteParams {
+                note: NOTE.to_string(),
+                auto_link: false,
+                idempotency_key: None,
+            },
+        )
+        .await
+        .expect("keyless write b ok");
+
+        let (notes, versions) = counts(&ctx).await;
+        assert_eq!(notes, 2, "two keyless writes create two notes");
+        assert_eq!(versions, 2, "two keyless writes create two versions");
+        assert_ne!(
+            a["id"], b["id"],
+            "keyless writes never dedup: two distinct notes"
+        );
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
