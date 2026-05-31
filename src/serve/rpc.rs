@@ -31,6 +31,7 @@ use super::dpool::{self, RoManager};
 use super::embed_permit;
 use super::methods_read;
 use super::methods_read::{OrientParams, SearchParams};
+use super::writer::Writer;
 use crate::wire::{RPCRequest, RPCResponse};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,25 +76,41 @@ pub struct Ctx {
     dpool: Pool<RoManager>,
     embed_sem: Arc<Semaphore>,
     vault_dir: PathBuf,
+    /// The single serializing, off-reactor writer (Phase 6). `Ctx::open` (the
+    /// daemon path) builds one; the read-path test injector [`Ctx::new`] leaves it
+    /// `None` because reads never touch it. Held as `Option<Arc<Writer>>` so the
+    /// writer can be shared and so read-only tests need not stand one up. The
+    /// write methods (later slice) will route mutations through it; it is
+    /// currently constructed but not yet dispatched against.
+    #[allow(dead_code)]
+    writer: Option<Arc<Writer>>,
 }
 
 impl Ctx {
-    /// Build a context, opening the read-only pool against `vault_dir`.
+    /// Build a context, opening the read-only pool against `vault_dir` and the
+    /// single read-write [`Writer`] (Phase 6).
     ///
     /// The registry must already exist (the writer owns creation/migration); the
-    /// pool opens it read-only. Async because the [`deadpool`] pool is built on
-    /// the tokio runtime. Used by the serve daemon path.
+    /// read pool opens it read-only and the [`Writer`] opens one read-write
+    /// connection via the shared inner path. Async because the [`deadpool`] pool
+    /// is built on the tokio runtime. Used by the serve daemon path.
+    ///
+    /// Serve already holds the advisory write lock for its lifetime (see
+    /// [`super::run_until`]), so the [`Writer`] opens an *unlocked* connection and
+    /// does NOT take a second lock.
     pub async fn open(vault_dir: &Path) -> anyhow::Result<Self> {
         Ok(Self {
             dpool: dpool::open_ro_pool(vault_dir, dpool::DEFAULT_POOL_SIZE).await?,
             embed_sem: embed_permit::default_embed_semaphore(),
             vault_dir: vault_dir.to_path_buf(),
+            writer: Some(Arc::new(Writer::open(vault_dir)?)),
         })
     }
 
-    /// Build a context from an already-open pool and vault dir. Lets tests inject
-    /// a sized pool without re-opening. The [`deadpool`] pool is [`Clone`], so a
-    /// test can keep a second handle (to occupy every connection) while the
+    /// Build a read-only context from an already-open pool and vault dir, with no
+    /// writer. Lets the read-path tests inject a sized pool without re-opening (or
+    /// standing up a writer they do not use). The [`deadpool`] pool is [`Clone`],
+    /// so a test can keep a second handle (to occupy every connection) while the
     /// daemon dispatches against it.
     #[cfg(test)]
     pub fn new(dpool: Pool<RoManager>, vault_dir: PathBuf) -> Self {
@@ -101,6 +118,7 @@ impl Ctx {
             dpool,
             embed_sem: embed_permit::default_embed_semaphore(),
             vault_dir,
+            writer: None,
         }
     }
 }

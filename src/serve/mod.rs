@@ -35,6 +35,10 @@ mod listener;
 mod methods_read;
 mod peercred;
 mod rpc;
+// Phase 6: the single serializing, off-reactor writer queue the write methods
+// (`nark/write` / `nark/link` / `nark/delete`) will run their mutations on. Slice
+// 6.1 lands the queue primitive; wiring the methods onto it is a later slice.
+mod writer;
 
 use std::path::Path;
 use std::sync::Arc;
