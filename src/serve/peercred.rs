@@ -40,14 +40,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn peer_uid_matches_current_user() {
+        use super::super::client::test_support::short_socket_dir;
         use super::peer_uid;
         use tokio::net::{UnixListener, UnixStream};
 
-        let dir = std::env::temp_dir().join(format!(
-            "nark-peercred-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        // Short dir name so `<dir>/peer.sock` fits `sun_path` (104 on macOS) even
+        // under the long real `$TMPDIR`. See `short_socket_dir`.
+        let dir = short_socket_dir();
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let socket_path = dir.join("peer.sock");
 

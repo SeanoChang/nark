@@ -450,14 +450,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
 
+    /// A fresh, unique temp dir whose socket (`<dir>/nark.sock`, and the
+    /// `<dir>/run/...` layout in some tests) must fit `sun_path` (104 bytes on
+    /// macOS) under the long real `$TMPDIR`, so it routes through the shared
+    /// short-path helper rather than the usual long `nark-<module>-test-...`
+    /// name. See `serve::client::test_support::short_socket_dir`.
     fn temp_socket_dir() -> PathBuf {
-        let base = std::env::temp_dir();
-        let unique = format!(
-            "nark-serve-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        );
-        base.join(unique)
+        super::super::client::test_support::short_socket_dir()
     }
 
     #[test]

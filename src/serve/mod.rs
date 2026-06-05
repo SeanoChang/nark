@@ -147,13 +147,13 @@ mod tests {
 
     /// Create a fresh, unique temp vault directory with a migrated+seeded
     /// `registry.db` (the writer owns creation; serve only reads + owns the
-    /// lock). Matches the repo's `std::env::temp_dir()` + pid + uuid convention.
+    /// lock). The lock test below has `serve` bind `<dir>/run/nark.sock`, so the
+    /// dir must stay short enough to fit `sun_path` (104 bytes on macOS) under
+    /// the long real `$TMPDIR` — hence the shared short-path helper rather than
+    /// the usual long `nark-<module>-test-...` name. See
+    /// `client::test_support::short_socket_dir`.
     fn seeded_vault() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "nark-serve-wlock-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let dir = crate::serve::client::test_support::short_socket_dir();
         std::fs::create_dir_all(&dir).expect("create temp vault");
         // Create + migrate + seed the registry via the plain (unlocked) writer
         // open, then drop it so no lock is held going into the test.

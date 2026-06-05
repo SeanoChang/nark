@@ -147,6 +147,7 @@ pub(crate) mod test_support {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
     use std::thread;
 
@@ -154,12 +155,36 @@ pub(crate) mod test_support {
     use super::super::BoundListener;
     use super::super::rpc::Ctx;
 
+    /// THE shared short-socket-path helper for every `serve::*` test that binds
+    /// or connects a Unix domain socket. Returns a fresh, unique directory under
+    /// [`std::env::temp_dir`] whose name is just `nk-<8 hex>`.
+    ///
+    /// macOS caps a `sockaddr_un.sun_path` at 104 bytes. The repo's usual
+    /// `nark-<module>-test-{pid}-{uuid}` dir names (~50 bytes) plus a real
+    /// `$TMPDIR` like `/var/folders/.../T/` (~49 bytes) plus `/run/nark.sock`
+    /// blow past that limit, so UDS binds fail with `path must be shorter than
+    /// SUN_LEN` on a stock Mac (they only pass when `$TMPDIR=/tmp`). Keeping the
+    /// dir name to ~11 bytes leaves comfortable headroom even on the long real
+    /// `$TMPDIR`. The 8-hex suffix mixes the process id's low bits with a
+    /// per-process atomic counter so concurrently-run tests never collide while
+    /// the path stays short (no uuid, which would reintroduce the overflow).
+    pub(crate) fn short_socket_dir() -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        // Counter occupies the low 16 bits (65_535 distinct dirs per process,
+        // far more than the suite uses) and the process id's low bits sit above
+        // it, so two tests in one process never collide and two processes very
+        // rarely do. Shifts drop the spilled high bits without panicking.
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed) & 0xFFFF;
+        let unique = (std::process::id() << 16) ^ n;
+        std::env::temp_dir().join(format!("nk-{unique:08x}"))
+    }
+
+    /// A temp vault dir for the client tests. Because the client's
+    /// socket-binding tests derive the socket from this dir
+    /// (`<dir>/run/nark.sock` and `<dir>/nark.sock`), it must stay short enough
+    /// to fit `sun_path` — so it routes through [`short_socket_dir`].
     pub(crate) fn temp_vault_dir() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "nark-client-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ))
+        short_socket_dir()
     }
 
     /// Seed `dir` as a vault (writer creates/migrates/seeds `registry.db` and
