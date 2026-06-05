@@ -375,16 +375,54 @@ impl Drop for Writer {
 /// The idempotency-key [`DedupStore`] is owned here, by this one thread, so the
 /// check / apply / cache for an [`Msg::Idempotent`] job is atomic with the writes
 /// themselves — no lock, no second writer, no race.
+///
+/// ## Panic isolation (slice 6.6)
+///
+/// Each per-job invocation runs inside [`std::panic::catch_unwind`] so a panicking
+/// job (an overflow, an `unwrap` on `None`, a violated invariant) CANNOT unwind
+/// this dedicated thread and permanently wedge the daemon — every later
+/// [`Writer::submit`] would otherwise see a dead channel (`writer is shut down`).
+/// On a caught panic we log a concise warning and CONTINUE the loop; the
+/// panicking caller still gets a clean `Err` because its oneshot reply was never
+/// sent (its receiver resolves to `writer dropped the job before replying`). The
+/// key property is that the writer THREAD SURVIVES.
+///
+/// `&Connection` is not [`std::panic::UnwindSafe`], so [`AssertUnwindSafe`] is
+/// required — and is SOUND here because the only mutation path that opens a
+/// transaction (`registry::write::commit_version`) uses
+/// `conn.unchecked_transaction()`, an RAII `Transaction` that ROLLS BACK on drop.
+/// A panic mid-write therefore rolls the transaction back during unwinding, so
+/// the reused connection is left clean (never half-committed, never poisoned) and
+/// the next job sees a consistent connection.
 fn run_loop(conn: Connection, mut rx: mpsc::Receiver<Msg>) {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
     let mut dedup = DedupStore::new();
     while let Some(msg) = rx.blocking_recv() {
         // Messages run strictly one at a time on this single thread =>
         // single-writer serialization (and serialized dedup-store access).
-        match msg {
+        //
+        // `AssertUnwindSafe` is justified by the RAII-rollback guarantee above:
+        // any in-flight transaction rolls back as the stack unwinds, so the
+        // connection (and the dedup store, which we only mutate AFTER a job
+        // returns Ok inside `apply_idempotent`) cannot be left in a torn state.
+        let outcome = catch_unwind(AssertUnwindSafe(|| match msg {
             // A plain job is fully responsible for sending its own result back
             // over the oneshot it captured; we just hand it the connection.
             Msg::Plain(job) => job(&conn),
             Msg::Idempotent(job) => apply_idempotent(&conn, &mut dedup, job),
+        }));
+
+        if outcome.is_err() {
+            // A job panicked. The default panic hook has already printed the
+            // backtrace/message to stderr; we add a concise, recoverable note.
+            // We deliberately do NOT propagate: the loop continues so the writer
+            // thread survives. The panicking caller already gets a clean `Err`
+            // because its oneshot reply was dropped (never sent) during unwind.
+            eprintln!(
+                "nark-writer: a write job panicked; rolled back and continuing (the caller \
+                 receives an error)"
+            );
         }
     }
     // Channel closed: all senders dropped. Returning drops `conn`, closing the
@@ -857,6 +895,117 @@ mod tests {
             runs.load(std::sync::atomic::Ordering::SeqCst),
             before + 1,
             "an evicted key must re-apply (the bounded store dropped it)"
+        );
+
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job that PANICS must not wedge the writer: the panicking submit resolves
+    /// to an `Err` in bounded time (not a hang), and a SUBSEQUENT normal job
+    /// through the SAME writer still succeeds — proving the writer thread survived
+    /// the panic and the channel is still live.
+    ///
+    /// This test deliberately panics inside a job, so the default panic hook will
+    /// print "thread '<unnamed>' panicked ..." to stderr. That noise is EXPECTED;
+    /// the assertions below are on the writer's RECOVERY, not on the absence of
+    /// stderr. (We do not touch the process-global panic hook here, since other
+    /// tests run concurrently in the same process.)
+    #[tokio::test]
+    async fn panicking_job_does_not_wedge_the_writer() {
+        let dir = fresh_vault();
+        let writer = Writer::open(&dir).expect("open writer");
+
+        // Submit a job that panics. The oneshot reply is never sent (the closure
+        // unwinds before `submit`'s wrapper can send it), so the future resolves
+        // to an Err — promptly, not a hang.
+        let panicked = tokio::time::timeout(
+            Duration::from_secs(5),
+            writer.submit(|_conn| -> Result<()> {
+                panic!("boom from inside a write job");
+            }),
+        )
+        .await
+        .expect("a panicking submit must resolve promptly, not hang");
+        assert!(
+            panicked.is_err(),
+            "a panicking job must surface an Err to the caller, not a value"
+        );
+
+        // The writer thread must have SURVIVED: a subsequent normal job succeeds.
+        let after: i64 = tokio::time::timeout(
+            Duration::from_secs(5),
+            writer.submit(|conn| {
+                conn.query_row("SELECT 42", [], |row| row.get::<_, i64>(0))
+                    .map_err(Into::into)
+            }),
+        )
+        .await
+        .expect("the post-panic submit must complete (writer not wedged)")
+        .expect("the post-panic submit must succeed");
+        assert_eq!(
+            after, 42,
+            "a normal write after a panicking job must still run on the surviving writer"
+        );
+
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job that opens a transaction, writes a row, then PANICS before committing
+    /// must leave NO partial row: the RAII `Transaction` rolls back during unwind,
+    /// so the reused connection is clean (not poisoned). A subsequent read on the
+    /// same writer sees zero rows from the aborted write.
+    ///
+    /// Like the test above, this emits EXPECTED panic-hook noise on stderr; the
+    /// assertions are on the rollback + connection reuse, not on stderr.
+    #[tokio::test]
+    async fn panic_mid_transaction_rolls_back_no_partial_row() {
+        let dir = fresh_vault();
+        let writer = Writer::open(&dir).expect("open writer");
+
+        // Job: open an RAII transaction (the SAME shape `commit_version` uses),
+        // INSERT a sentinel agent row, then panic BEFORE committing. The
+        // `Transaction` drops during the unwind and rolls the INSERT back.
+        let panicked = tokio::time::timeout(
+            Duration::from_secs(5),
+            writer.submit(|conn| -> Result<()> {
+                let tx = conn.unchecked_transaction()?;
+                tx.execute(
+                    "INSERT INTO agents (agent_id, name, namespace, role, registered_at)
+                     VALUES ('panic-rollback-probe', 'p', 'ns', 'agent', '2026-05-31T00:00:00Z')",
+                    [],
+                )?;
+                // Panic with the transaction still open and uncommitted.
+                panic!("panic mid-transaction before commit");
+            }),
+        )
+        .await
+        .expect("the panicking transactional submit must resolve promptly");
+        assert!(
+            panicked.is_err(),
+            "the panicking transactional job must surface an Err"
+        );
+
+        // The reused connection must be CLEAN: the aborted INSERT left no row.
+        let count: i64 = tokio::time::timeout(
+            Duration::from_secs(5),
+            writer.submit(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM agents WHERE agent_id = 'panic-rollback-probe'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+            }),
+        )
+        .await
+        .expect("the read-back submit must complete (connection not poisoned)")
+        .expect("the read-back submit must succeed");
+        assert_eq!(
+            count, 0,
+            "a panic mid-transaction must roll back: no partial row may persist, and the \
+             reused connection must remain usable"
         );
 
         drop(writer);
