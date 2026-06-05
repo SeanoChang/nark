@@ -49,6 +49,12 @@
 //! The store is **bounded** — at most [`DEDUP_CAPACITY`] entries with a
 //! [`DEDUP_TTL`] time bound — and evicts the oldest insert when full, so it can
 //! never grow without limit (an evicted or expired key simply re-applies).
+//!
+//! **Collision caveat:** dedup is purely at-most-once *by key*. If two genuinely
+//! different writes reuse the same key (a buggy/colliding client), the second is
+//! NOT applied and the caller receives the FIRST write's result verbatim, with no
+//! error or marker. Committed state is never corrupted — but the colliding write
+//! is silently dropped. Key uniqueness is the caller's responsibility.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -133,7 +139,9 @@ enum Msg {
 /// is atomic w.r.t. the writer with no locking. Bounded two ways: at most
 /// [`DEDUP_CAPACITY`] entries (oldest-insert eviction) and a [`DEDUP_TTL`] age
 /// bound (a stale hit is a miss). An `order` queue records insertion order for
-/// O(1) FIFO eviction.
+/// FIFO eviction — amortized O(1); worst case O(stale-prefix) when a run of
+/// front entries was already dropped by an earlier expiry (the evict loop skips
+/// them). Still strictly bounded: it terminates and the store never grows.
 struct DedupStore {
     entries: HashMap<String, (Instant, Value)>,
     order: VecDeque<String>,
