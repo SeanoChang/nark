@@ -450,14 +450,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
 
+    /// A fresh, unique temp dir whose socket (`<dir>/nark.sock`, and the
+    /// `<dir>/run/...` layout in some tests) must fit `sun_path` (104 bytes on
+    /// macOS) under the long real `$TMPDIR`, so it routes through the shared
+    /// short-path helper rather than the usual long `nark-<module>-test-...`
+    /// name. See `serve::client::test_support::short_socket_dir`.
     fn temp_socket_dir() -> PathBuf {
-        let base = std::env::temp_dir();
-        let unique = format!(
-            "nark-serve-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        );
-        base.join(unique)
+        super::super::client::test_support::short_socket_dir()
     }
 
     #[test]
@@ -813,6 +812,159 @@ Socket body text.\n";
 
         tx.send(()).expect("send shutdown");
         server.await.expect("server task join");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 6 slice 6.2 exit: an authenticated client issues `nark/write` over
+    /// the socket and the daemon creates the note via the single serializing
+    /// writer queue; a follow-up `nark/read` over a fresh connection returns it.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn authenticated_write_then_read_round_trip_over_socket() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        const DOC: &str = "---\\ntitle: Wire Note\\nauthor: tester\\ndomain: engineering\\nintent: reference\\nkind: note\\nstatus: active\\ntags:\\n  - omega\\n---\\nWire body text.\\n";
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        // `seeded_ctx` uses `Ctx::open`, which stands up the real writer queue.
+        let (ctx, _seed_id) = seeded_ctx(&dir).await;
+
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        async fn round_trip(socket_path: &Path, line: &str) -> serde_json::Value {
+            let mut stream = UnixStream::connect(socket_path)
+                .await
+                .expect("connect to socket");
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .expect("write request");
+            stream.flush().await.expect("flush request");
+            read_json_line(stream).await
+        }
+
+        // nark/write over its own one-shot connection.
+        let write = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"w\",\"method\":\"nark/write\",\"params\":{{\"note\":\"{DOC}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(write["id"], "w");
+        assert_eq!(write["result"]["title"], "Wire Note");
+        let new_id = write["result"]["id"]
+            .as_str()
+            .expect("write returns a note id")
+            .to_string();
+        assert!(write.get("error").is_none(), "write should not be an error");
+
+        // nark/read of the just-written note over a fresh connection.
+        let read = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"r\",\"method\":\"nark/read\",\"params\":{{\"id\":\"{new_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(read["result"]["title"], "Wire Note");
+        assert_eq!(read["result"]["body"], "Wire body text.");
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Auth still gates writes: an unknown uid that sends a well-formed
+    /// `nark/write` gets the plain `unauthorized` line and the connection closes
+    /// before the write runs — nothing is committed (note count stays at the seed).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn unknown_uid_cannot_write_nothing_committed() {
+        use super::super::AgentMap;
+
+        const DOC: &str = "---\\ntitle: Forbidden\\nauthor: tester\\ndomain: engineering\\nintent: reference\\nkind: note\\nstatus: active\\ntags:\\n  - omega\\n---\\nMust not be written.\\n";
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        // Seed exactly one note; the rejected write must not change this count.
+        let (ctx, _seed_id) = seeded_ctx(&dir).await;
+
+        fn note_count(vault_dir: &Path) -> i64 {
+            let conn = crate::db::open_registry(vault_dir).expect("open registry for count");
+            conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))
+                .expect("count notes")
+        }
+        assert_eq!(
+            note_count(&dir),
+            1,
+            "the seed note is present before the attempt"
+        );
+
+        // Empty map -> the connecting uid is unknown -> rejected before dispatch.
+        let agents = AgentMap::default();
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        let mut stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to socket");
+        let request = format!(
+            "{{\"id\":\"x\",\"method\":\"nark/write\",\"params\":{{\"note\":\"{DOC}\"}}}}\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write nark/write request");
+        stream.flush().await.expect("flush request");
+
+        // The first line back must be the plain rejection, not a JSON-RPC reply.
+        let mut reply = String::new();
+        let mut reader = BufReader::new(stream);
+        reader
+            .read_line(&mut reply)
+            .await
+            .expect("read rejection line");
+        assert_eq!(
+            reply, "unauthorized\n",
+            "unknown uid must be rejected before nark/write runs"
+        );
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+
+        // The write never ran: the note count is unchanged.
+        assert_eq!(
+            note_count(&dir),
+            1,
+            "a rejected write must not commit anything"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1464,6 +1616,259 @@ Saturation body text.\n";
         assert_eq!(v["id"], "ok");
         assert_eq!(v["result"]["pong"], true);
         assert!(v.get("error").is_none());
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Phase 6 slice 6.5: the full write surface, assembled + durable ----
+
+    /// Phase 6 slice 6.5 exit: the WHOLE write surface round-trips over ONE live
+    /// serve. An authenticated client does `nark/write` -> `nark/read` (read-back)
+    /// -> `nark/link` -> `nark/delete`, each over its own one-shot connection, all
+    /// against a single running daemon whose three write methods share the one
+    /// serializing writer. This proves write/link/delete are all assembled onto the
+    /// same authoritative writer and that a write is immediately durable to the
+    /// read-only pool (WAL), the read path, and the later mutators.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn full_write_surface_round_trips_over_one_serve() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        // Two notes: a "subject" the link/delete target, and a "src" linked to it.
+        const SUBJECT: &str = "---\\ntitle: Subject\\nauthor: tester\\ndomain: engineering\\nintent: reference\\nkind: note\\nstatus: active\\ntags:\\n  - omega\\n---\\nSubject body.\\n";
+        const SRC: &str = "---\\ntitle: Linker\\nauthor: tester\\ndomain: engineering\\nintent: reference\\nkind: note\\nstatus: active\\ntags:\\n  - omega\\n---\\nLinker body.\\n";
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        // `seeded_ctx` uses `Ctx::open`, which stands up the real writer queue
+        // shared by all three write methods.
+        let (ctx, _seed_id) = seeded_ctx(&dir).await;
+
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        async fn round_trip(socket_path: &Path, line: &str) -> serde_json::Value {
+            let mut stream = UnixStream::connect(socket_path)
+                .await
+                .expect("connect to socket");
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .expect("write request");
+            stream.flush().await.expect("flush request");
+            read_json_line(stream).await
+        }
+
+        // 1) nark/write the subject note.
+        let subject = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"w1\",\"method\":\"nark/write\",\"params\":{{\"note\":\"{SUBJECT}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(subject["result"]["title"], "Subject");
+        let subject_id = subject["result"]["id"]
+            .as_str()
+            .expect("write returns a note id")
+            .to_string();
+        assert!(subject.get("error").is_none(), "write must not error");
+
+        // 2) nark/read the just-written note back — the write is durable to the
+        //    read-only pool through WAL, over a fresh connection.
+        let read = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"r1\",\"method\":\"nark/read\",\"params\":{{\"id\":\"{subject_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(read["result"]["title"], "Subject");
+        assert_eq!(read["result"]["body"], "Subject body.");
+
+        // 3) nark/write a second note, then nark/link it to the subject.
+        let src = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"w2\",\"method\":\"nark/write\",\"params\":{{\"note\":\"{SRC}\"}}}}\n"
+            ),
+        )
+        .await;
+        let src_id = src["result"]["id"]
+            .as_str()
+            .expect("write returns a note id")
+            .to_string();
+
+        let link = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"l1\",\"method\":\"nark/link\",\"params\":{{\"sources\":[\"{src_id}\"],\"target\":\"{subject_id}\",\"rel\":\"depends-on\"}}}}\n"
+            ),
+        )
+        .await;
+        assert!(link.get("error").is_none(), "link must not error");
+        assert_eq!(link["result"]["target"], subject_id);
+        assert_eq!(link["result"]["rel"], "depends-on");
+        assert_eq!(link["result"]["linked"], 1, "one source was linked");
+
+        // The link is durable to the read path: peeking the target shows the
+        // incoming link over a fresh connection.
+        let peek = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"p1\",\"method\":\"nark/peek\",\"params\":{{\"id\":\"{subject_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert!(
+            peek["result"]["links_in"].as_i64().unwrap() >= 1,
+            "the linked target shows an incoming link"
+        );
+
+        // 4) nark/delete (soft) the subject — the third write method over the same
+        //    serve. A follow-up read shows it retracted.
+        let delete = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"d1\",\"method\":\"nark/delete\",\"params\":{{\"ids\":[\"{subject_id}\"]}}}}\n"
+            ),
+        )
+        .await;
+        assert!(delete.get("error").is_none(), "delete must not error");
+        assert_eq!(delete["result"]["deleted"], 1);
+        assert_eq!(delete["result"]["mode"], "retract");
+
+        let after = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"p2\",\"method\":\"nark/peek\",\"params\":{{\"id\":\"{subject_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(
+            after["result"]["status"], "retracted",
+            "the soft-deleted note is retracted, visible to the read path"
+        );
+
+        tx.send(()).expect("send shutdown");
+        server.await.expect("server task join");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Phase 6 slice 6.5: a write job that ERRORS (a malformed note that fails
+    /// `vault.ingest`) returns a clean error response to that caller and does NOT
+    /// wedge the single writer — a SUBSEQUENT good write over the same serve still
+    /// succeeds. Proves a failed job neither poisons the writer thread nor the
+    /// queue (the next job is applied normally).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn failing_write_does_not_wedge_subsequent_write() {
+        use super::super::AgentMap;
+        use std::collections::HashMap;
+
+        // A note with NO frontmatter: `vault.ingest` rejects it, so the write job
+        // returns Err — but the writer thread must keep running.
+        const BAD: &str = "no frontmatter here, just text";
+        const GOOD: &str = "---\\ntitle: After Failure\\nauthor: tester\\ndomain: engineering\\nintent: reference\\nkind: note\\nstatus: active\\ntags:\\n  - omega\\n---\\nGood body text.\\n";
+
+        let dir = temp_socket_dir();
+        let socket_path = dir.join("nark.sock");
+        let bound = BoundListener::bind(&socket_path).expect("bind listener");
+        let (ctx, _seed_id) = seeded_ctx(&dir).await;
+
+        let me = nix::unistd::getuid().as_raw();
+        let mut table = HashMap::new();
+        table.insert(me, "tester".to_string());
+        let agents = AgentMap::new(table);
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            bound
+                .serve_authenticated_until(agents, ctx, async {
+                    let _ = rx.await;
+                })
+                .await
+                .expect("serve loop");
+        });
+
+        async fn round_trip(socket_path: &Path, line: &str) -> serde_json::Value {
+            let mut stream = UnixStream::connect(socket_path)
+                .await
+                .expect("connect to socket");
+            stream
+                .write_all(line.as_bytes())
+                .await
+                .expect("write request");
+            stream.flush().await.expect("flush request");
+            read_json_line(stream).await
+        }
+
+        // 1) The failing write: a clean JSON-RPC error, not a panic or a dropped
+        //    connection.
+        let failed = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"bad\",\"method\":\"nark/write\",\"params\":{{\"note\":\"{BAD}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(failed["id"], "bad");
+        assert!(
+            failed.get("result").is_none(),
+            "a malformed note must not produce a result"
+        );
+        assert_eq!(
+            failed["error"]["code"], -32602,
+            "a failed write maps to invalid-params, not a panic"
+        );
+
+        // 2) The writer is NOT wedged: a subsequent good write over the same serve
+        //    still succeeds and is readable. The failed job poisoned neither the
+        //    writer thread nor the queue.
+        let good = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"good\",\"method\":\"nark/write\",\"params\":{{\"note\":\"{GOOD}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert!(
+            good.get("error").is_none(),
+            "the write after a failure must succeed (writer not wedged), got: {good}"
+        );
+        assert_eq!(good["result"]["title"], "After Failure");
+        let good_id = good["result"]["id"]
+            .as_str()
+            .expect("the good write returns a note id")
+            .to_string();
+
+        let read = round_trip(
+            &socket_path,
+            &format!(
+                "{{\"id\":\"r\",\"method\":\"nark/read\",\"params\":{{\"id\":\"{good_id}\"}}}}\n"
+            ),
+        )
+        .await;
+        assert_eq!(
+            read["result"]["body"], "Good body text.",
+            "the post-failure write is durably committed"
+        );
 
         tx.send(()).expect("send shutdown");
         server.await.expect("server task join");

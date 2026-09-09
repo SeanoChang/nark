@@ -16,6 +16,12 @@
 //! * `nark/stats` -> vault statistics ([`methods_read::stats`]),
 //! * `nark/search` -> ranked hits for the search `params` ([`methods_read::search`]),
 //! * `nark/orient` -> a markdown vault briefing ([`methods_read::orient`]),
+//! * `nark/write` -> ingest a note via the single serializing writer queue, the
+//!   first WRITE method (see [`methods_write::write`]),
+//! * `nark/link` -> create typed edges from sources to a target via the writer
+//!   queue (see [`methods_write::link`]),
+//! * `nark/delete` -> soft-retract / hard-delete / purge notes via the writer
+//!   queue (see [`methods_write::delete`]),
 //! * any other method -> JSON-RPC `-32601 method not found`.
 //!
 //! The read methods call the same `registry::*` functions the CLI handlers do
@@ -31,6 +37,9 @@ use super::dpool::{self, RoManager};
 use super::embed_permit;
 use super::methods_read;
 use super::methods_read::{OrientParams, SearchParams};
+use super::methods_write;
+use super::methods_write::{DeleteParams, LinkParams, WriteParams};
+use super::writer::Writer;
 use crate::wire::{RPCRequest, RPCResponse};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -75,25 +84,40 @@ pub struct Ctx {
     dpool: Pool<RoManager>,
     embed_sem: Arc<Semaphore>,
     vault_dir: PathBuf,
+    /// The single serializing, off-reactor writer (Phase 6). `Ctx::open` (the
+    /// daemon path) builds one; the read-path test injector [`Ctx::new`] leaves it
+    /// `None` because reads never touch it. Held as `Option<Arc<Writer>>` so the
+    /// writer can be shared and so read-only tests need not stand one up. The
+    /// write methods (`nark/write`, slice 6.2 onward) route mutations through it
+    /// via [`Ctx::writer`].
+    writer: Option<Arc<Writer>>,
 }
 
 impl Ctx {
-    /// Build a context, opening the read-only pool against `vault_dir`.
+    /// Build a context, opening the read-only pool against `vault_dir` and the
+    /// single read-write [`Writer`] (Phase 6).
     ///
     /// The registry must already exist (the writer owns creation/migration); the
-    /// pool opens it read-only. Async because the [`deadpool`] pool is built on
-    /// the tokio runtime. Used by the serve daemon path.
+    /// read pool opens it read-only and the [`Writer`] opens one read-write
+    /// connection via the shared inner path. Async because the [`deadpool`] pool
+    /// is built on the tokio runtime. Used by the serve daemon path.
+    ///
+    /// Serve already holds the advisory write lock for its lifetime (see
+    /// [`super::run_until`]), so the [`Writer`] opens an *unlocked* connection and
+    /// does NOT take a second lock.
     pub async fn open(vault_dir: &Path) -> anyhow::Result<Self> {
         Ok(Self {
             dpool: dpool::open_ro_pool(vault_dir, dpool::DEFAULT_POOL_SIZE).await?,
             embed_sem: embed_permit::default_embed_semaphore(),
             vault_dir: vault_dir.to_path_buf(),
+            writer: Some(Arc::new(Writer::open(vault_dir)?)),
         })
     }
 
-    /// Build a context from an already-open pool and vault dir. Lets tests inject
-    /// a sized pool without re-opening. The [`deadpool`] pool is [`Clone`], so a
-    /// test can keep a second handle (to occupy every connection) while the
+    /// Build a read-only context from an already-open pool and vault dir, with no
+    /// writer. Lets the read-path tests inject a sized pool without re-opening (or
+    /// standing up a writer they do not use). The [`deadpool`] pool is [`Clone`],
+    /// so a test can keep a second handle (to occupy every connection) while the
     /// daemon dispatches against it.
     #[cfg(test)]
     pub fn new(dpool: Pool<RoManager>, vault_dir: PathBuf) -> Self {
@@ -101,7 +125,43 @@ impl Ctx {
             dpool,
             embed_sem: embed_permit::default_embed_semaphore(),
             vault_dir,
+            writer: None,
         }
+    }
+
+    /// Build a context from an already-open pool and vault dir **with** a
+    /// [`Writer`], for the write-method tests (`nark/write`). Mirrors [`Ctx::new`]
+    /// but stands up the single serializing writer so a test can drive a write
+    /// without binding a socket or owning the runtime that [`Ctx::open`] needs.
+    #[cfg(test)]
+    pub fn with_writer(dpool: Pool<RoManager>, vault_dir: PathBuf, writer: Arc<Writer>) -> Self {
+        Self {
+            dpool,
+            embed_sem: embed_permit::default_embed_semaphore(),
+            vault_dir,
+            writer: Some(writer),
+        }
+    }
+
+    /// The single serializing [`Writer`] the write methods submit jobs to, or
+    /// `None` for a read-only context (the read-path test injector). The daemon
+    /// path ([`Ctx::open`]) always has one.
+    pub fn writer(&self) -> Option<&Arc<Writer>> {
+        self.writer.as_ref()
+    }
+
+    /// The vault root, needed by the write methods to load config and build the
+    /// [`Vault`](crate::vault::fs::Vault) for ingest.
+    pub fn vault_dir(&self) -> &Path {
+        &self.vault_dir
+    }
+
+    /// Borrow the read-only pool, for the write-method tests that write through the
+    /// writer and then read the note back via [`methods_read::read`] (which takes
+    /// the pool directly). Test-only so the production pool stays encapsulated.
+    #[cfg(test)]
+    pub fn dpool_for_test(&self) -> &Pool<RoManager> {
+        &self.dpool
     }
 }
 
@@ -150,6 +210,18 @@ pub async fn dispatch(ctx: &Ctx, req: &RPCRequest) -> RPCResponse {
             ),
             Err(resp) => resp,
         },
+        "nark/write" => match write_params(req) {
+            Ok(params) => result_or_invalid(req, methods_write::write(ctx, params).await),
+            Err(resp) => resp,
+        },
+        "nark/link" => match link_params(req) {
+            Ok(params) => result_or_invalid(req, methods_write::link(ctx, params).await),
+            Err(resp) => resp,
+        },
+        "nark/delete" => match delete_params(req) {
+            Ok(params) => result_or_invalid(req, methods_write::delete(ctx, params).await),
+            Err(resp) => resp,
+        },
         _ => RPCResponse::error(req.id.clone(), METHOD_NOT_FOUND, "method not found", None),
     }
 }
@@ -195,6 +267,98 @@ fn orient_params(req: &RPCRequest) -> Result<OrientParams, RPCResponse> {
         limit: opt_limit(req, obj, ORIENT_DEFAULT_LIMIT)?,
         since: opt_string(req, obj, "since")?,
         before: opt_string(req, obj, "before")?,
+    })
+}
+
+/// Parse the `nark/write` `params` object into [`WriteParams`].
+///
+/// `note` is **required** — the full note markdown document (frontmatter + body)
+/// `vault.ingest` consumes, exactly what `nark write` reads from a file/stdin. A
+/// missing or non-string `note` is `-32602 invalid params`. `auto_link` is an
+/// optional boolean (default `false`), mirroring `nark write --auto-link`.
+/// `idempotency_key` is an optional string (Phase 6, slice 6.3): when present the
+/// single serializing writer applies the write at most once for that key and
+/// returns the cached result on a retry; absent -> the write always applies. A
+/// non-string `idempotency_key` is `-32602`. A missing `params`, or a `params`
+/// that is not an object, is an error (unlike the read methods, `write` has a
+/// required field, so an empty object is rejected too via the missing `note`).
+fn write_params(req: &RPCRequest) -> Result<WriteParams, RPCResponse> {
+    let obj = params_object(req)?;
+    let note = match opt_string(req, obj, "note")? {
+        Some(note) => note,
+        None => {
+            return Err(invalid(
+                req,
+                "invalid params: 'note' (the note markdown) is required",
+            ));
+        }
+    };
+    Ok(WriteParams {
+        note,
+        auto_link: opt_bool(req, obj, "auto_link")?,
+        idempotency_key: opt_string(req, obj, "idempotency_key")?,
+    })
+}
+
+/// Parse the `nark/link` `params` object into [`LinkParams`].
+///
+/// Mirrors `nark link <sources...> --target <id> [--rel <rel>]` (`cli/link.rs`):
+/// `sources` is a **required**, non-empty array of note id strings; `target` is a
+/// **required** note id string; `rel` is optional and defaults to `"references"`
+/// (the CLI's `--rel` default). `idempotency_key` is an optional string (slice
+/// 6.3). A missing/empty `sources`, a missing `target`, or a wrong-typed field is
+/// `-32602 invalid params`.
+fn link_params(req: &RPCRequest) -> Result<LinkParams, RPCResponse> {
+    let obj = params_object(req)?;
+    let sources = opt_string_array(req, obj, "sources")?;
+    if sources.is_empty() {
+        return Err(invalid(
+            req,
+            "invalid params: 'sources' (a non-empty array of note ids) is required",
+        ));
+    }
+    let target = match opt_string(req, obj, "target")? {
+        Some(target) => target,
+        None => {
+            return Err(invalid(
+                req,
+                "invalid params: 'target' (the target note id) is required",
+            ));
+        }
+    };
+    Ok(LinkParams {
+        sources,
+        target,
+        rel: opt_string(req, obj, "rel")?.unwrap_or_else(|| "references".to_string()),
+        idempotency_key: opt_string(req, obj, "idempotency_key")?,
+    })
+}
+
+/// Parse the `nark/delete` `params` object into [`DeleteParams`].
+///
+/// Mirrors `nark delete <ids...> [-f] [-rf]` (`cli/delete.rs`): `ids` is an array
+/// of note id strings (absent -> empty, exactly the clap positional default — an
+/// empty delete is a no-op deleting zero notes), `force` (`-f`) and `recursive`
+/// (`-r`) are optional booleans defaulting to `false`. The CLI's clap layer makes
+/// `recursive` require `force`; this enforces the same guard so `recursive` without
+/// `force` is `-32602 invalid params` rather than a silently-ignored flag.
+/// `idempotency_key` is an optional string (slice 6.3). A wrong-typed field is
+/// `-32602`.
+fn delete_params(req: &RPCRequest) -> Result<DeleteParams, RPCResponse> {
+    let obj = params_object(req)?;
+    let force = opt_bool(req, obj, "force")?;
+    let recursive = opt_bool(req, obj, "recursive")?;
+    if recursive && !force {
+        return Err(invalid(
+            req,
+            "invalid params: 'recursive' requires 'force' (the -rf purge mode)",
+        ));
+    }
+    Ok(DeleteParams {
+        ids: opt_string_array(req, obj, "ids")?,
+        force,
+        recursive,
+        idempotency_key: opt_string(req, obj, "idempotency_key")?,
     })
 }
 
@@ -638,6 +802,306 @@ tags:\n\
             md.starts_with("# Vault Briefing: vault"),
             "omitted query with a filter defaults to a whole-vault briefing, got: {md}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a [`Ctx`] over `dir` with a real writer (the daemon's write path)
+    /// plus the read-only pool — what the router needs to route `nark/write`.
+    async fn ctx_with_writer(dir: &std::path::Path) -> Ctx {
+        let pool = dpool::open_ro_pool(dir, 2).await.expect("open read pool");
+        let writer = std::sync::Arc::new(Writer::open(dir).expect("open writer"));
+        Ctx::with_writer(pool, dir.to_path_buf(), writer)
+    }
+
+    /// The router routes `nark/write` to the write method: the parsed `note`
+    /// markdown is ingested and the success result carries the note id + title.
+    #[tokio::test]
+    async fn write_routes_through_dispatch_and_creates_note() {
+        let dir = std::env::temp_dir().join(format!(
+            "nark-rpc-write-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp vault");
+        drop(crate::db::open_registry(&dir).expect("seed registry"));
+        let ctx = ctx_with_writer(&dir).await;
+
+        let resp = dispatch(
+            &ctx,
+            &request("w1", "nark/write", Some(json!({"note": NOTE}))),
+        )
+        .await;
+        let v = expect_result(resp);
+        assert!(v["id"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(v["title"], "Router Note");
+
+        // The committed note is then readable through the same daemon.
+        let id = v["id"].as_str().unwrap();
+        let read = dispatch(&ctx, &request("r1", "nark/read", Some(json!({"id": id})))).await;
+        let rv = expect_result(read);
+        assert_eq!(rv["body"], "Router body text.");
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two `nark/write` requests carrying the SAME `idempotency_key` route through
+    /// the writer's dedup: exactly one note/version is created and the second
+    /// response is the identical cached result (same id). A retried write over the
+    /// wire is idempotent.
+    #[tokio::test]
+    async fn write_same_idempotency_key_dedups_through_dispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "nark-rpc-write-idem-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp vault");
+        drop(crate::db::open_registry(&dir).expect("seed registry"));
+        let ctx = ctx_with_writer(&dir).await;
+
+        let params = json!({ "note": NOTE, "idempotency_key": "wire-key" });
+        let first =
+            expect_result(dispatch(&ctx, &request("i1", "nark/write", Some(params.clone()))).await);
+        let second =
+            expect_result(dispatch(&ctx, &request("i2", "nark/write", Some(params))).await);
+
+        assert_eq!(
+            first, second,
+            "the retried write returns the identical cached result"
+        );
+
+        // Exactly one note + one version exist despite two write requests.
+        let stats = expect_result(dispatch(&ctx, &request("s1", "nark/stats", None)).await);
+        assert_eq!(stats["total_notes"], 1, "same key => one note");
+        assert_eq!(stats["total_versions"], 1, "same key => one version");
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `nark/write` with a missing `note` is `-32602 invalid params` (the required
+    /// field guard), not a panic and not a write.
+    #[tokio::test]
+    async fn write_missing_note_is_invalid_params() {
+        let dir = std::env::temp_dir().join(format!(
+            "nark-rpc-write-missing-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp vault");
+        drop(crate::db::open_registry(&dir).expect("seed registry"));
+        let ctx = ctx_with_writer(&dir).await;
+
+        let resp = dispatch(&ctx, &request("w2", "nark/write", Some(json!({})))).await;
+        let err = expect_error(resp);
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a fresh write-capable vault dir for the link/delete router tests.
+    fn fresh_write_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nark-rpc-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp vault");
+        drop(crate::db::open_registry(&dir).expect("seed registry"));
+        dir
+    }
+
+    /// Write a note through the daemon and return its committed id.
+    async fn write_note(ctx: &Ctx, title: &str, body: &str) -> String {
+        let note = format!(
+            "---\n\
+title: {title}\n\
+author: tester\n\
+domain: engineering\n\
+intent: reference\n\
+kind: note\n\
+status: active\n\
+tags:\n\
+  - gamma\n\
+---\n\
+{body}\n"
+        );
+        let resp = dispatch(
+            ctx,
+            &request("seed", "nark/write", Some(json!({ "note": note }))),
+        )
+        .await;
+        expect_result(resp)["id"]
+            .as_str()
+            .expect("write returns id")
+            .to_string()
+    }
+
+    /// The router routes `nark/link`: a typed edge is created between two seeded
+    /// notes (verified via a follow-up `nark/peek` link-count read over the same
+    /// daemon), and the response mirrors the CLI's `{target, rel, linked, ...}`.
+    #[tokio::test]
+    async fn link_routes_through_dispatch_and_creates_edge() {
+        let dir = fresh_write_dir("link");
+        let ctx = ctx_with_writer(&dir).await;
+
+        let src = write_note(&ctx, "Src", "Source body.").await;
+        let dst = write_note(&ctx, "Dst", "Target body.").await;
+
+        let resp = dispatch(
+            &ctx,
+            &request(
+                "l1",
+                "nark/link",
+                Some(json!({ "sources": [src], "target": dst, "rel": "depends-on" })),
+            ),
+        )
+        .await;
+        let v = expect_result(resp);
+        assert_eq!(v["target"], dst);
+        assert_eq!(v["rel"], "depends-on");
+        assert_eq!(v["linked"], 1);
+
+        // The typed edge materialized (verified directly): src -> dst, depends-on.
+        let outgoing = {
+            let conn = crate::db::open_registry(&dir).expect("open registry");
+            let (out, _in) = crate::registry::edges::get_edges(&conn, &src).expect("get_edges");
+            drop(conn);
+            out
+        };
+        assert!(
+            outgoing
+                .iter()
+                .any(|e| e.note_id == dst && e.edge_type == "depends-on"),
+            "the depends-on edge from src to dst must exist"
+        );
+
+        // And it is visible through a read: the target gained incoming link(s).
+        let peek = expect_result(
+            dispatch(
+                &ctx,
+                &request("p1", "nark/peek", Some(json!({ "id": dst }))),
+            )
+            .await,
+        );
+        assert!(
+            peek["links_in"].as_i64().unwrap() >= 1,
+            "target has incoming link(s)"
+        );
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The router routes `nark/delete`: a soft delete (default) retracts the note —
+    /// a follow-up `nark/peek` shows `status: retracted` — and the response mirrors
+    /// the CLI's `{deleted, mode, notes}`.
+    #[tokio::test]
+    async fn delete_routes_through_dispatch_and_retracts() {
+        let dir = fresh_write_dir("delete");
+        let ctx = ctx_with_writer(&dir).await;
+
+        let id = write_note(&ctx, "Doomed", "Body.").await;
+
+        let resp = dispatch(
+            &ctx,
+            &request("d1", "nark/delete", Some(json!({ "ids": [id] }))),
+        )
+        .await;
+        let v = expect_result(resp);
+        assert_eq!(v["deleted"], 1);
+        assert_eq!(v["mode"], "retract");
+
+        let peek = expect_result(
+            dispatch(&ctx, &request("p2", "nark/peek", Some(json!({ "id": id })))).await,
+        );
+        assert_eq!(peek["status"], "retracted", "soft delete retracts the note");
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two `nark/delete` requests with the SAME `idempotency_key` dedup through the
+    /// writer: the second returns the identical cached result without re-applying
+    /// (which would otherwise error on the already-deleted note).
+    #[tokio::test]
+    async fn delete_same_idempotency_key_dedups_through_dispatch() {
+        let dir = fresh_write_dir("delete-idem");
+        let ctx = ctx_with_writer(&dir).await;
+
+        let id = write_note(&ctx, "Once", "Body.").await;
+        let params = json!({ "ids": [id], "force": true, "idempotency_key": "wire-del" });
+
+        let first = expect_result(
+            dispatch(&ctx, &request("d1", "nark/delete", Some(params.clone()))).await,
+        );
+        let second =
+            expect_result(dispatch(&ctx, &request("d2", "nark/delete", Some(params))).await);
+
+        assert_eq!(
+            first, second,
+            "a retried delete with the same key returns the identical cached result"
+        );
+        assert_eq!(first["mode"], "hard_delete");
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `nark/link` with missing `sources` / `target` is `-32602 invalid params`
+    /// (the required-field guards), not a panic.
+    #[tokio::test]
+    async fn link_missing_required_params_is_invalid_params() {
+        let dir = fresh_write_dir("link-bad");
+        let ctx = ctx_with_writer(&dir).await;
+
+        // Missing target.
+        let err = expect_error(
+            dispatch(
+                &ctx,
+                &request("l1", "nark/link", Some(json!({ "sources": ["abc"] }))),
+            )
+            .await,
+        );
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        // Missing / empty sources.
+        let err = expect_error(
+            dispatch(
+                &ctx,
+                &request("l2", "nark/link", Some(json!({ "target": "abc" }))),
+            )
+            .await,
+        );
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `nark/delete` with `recursive` but no `force` is `-32602` (mirrors clap's
+    /// `requires = "force"` guard) — `recursive` is never silently ignored.
+    #[tokio::test]
+    async fn delete_recursive_without_force_is_invalid_params() {
+        let dir = fresh_write_dir("delete-bad");
+        let ctx = ctx_with_writer(&dir).await;
+
+        let err = expect_error(
+            dispatch(
+                &ctx,
+                &request(
+                    "d1",
+                    "nark/delete",
+                    Some(json!({ "ids": ["abc"], "recursive": true })),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(err.code, INVALID_PARAMS);
+
+        drop(ctx);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -33,8 +33,16 @@ mod dpool;
 mod embed_permit;
 mod listener;
 mod methods_read;
+// Phase 6: the WRITE method implementations (`nark/write`, and later
+// `nark/link` / `nark/delete`) that submit their mutations to the single
+// serializing writer queue. Slice 6.2 lands `nark/write`.
+mod methods_write;
 mod peercred;
 mod rpc;
+// Phase 6: the single serializing, off-reactor writer queue the write methods
+// (`nark/write` / `nark/link` / `nark/delete`) run their mutations on. Slice 6.1
+// landed the queue primitive; slice 6.2 wires `nark/write` onto it.
+mod writer;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -139,13 +147,13 @@ mod tests {
 
     /// Create a fresh, unique temp vault directory with a migrated+seeded
     /// `registry.db` (the writer owns creation; serve only reads + owns the
-    /// lock). Matches the repo's `std::env::temp_dir()` + pid + uuid convention.
+    /// lock). The lock test below has `serve` bind `<dir>/run/nark.sock`, so the
+    /// dir must stay short enough to fit `sun_path` (104 bytes on macOS) under
+    /// the long real `$TMPDIR` — hence the shared short-path helper rather than
+    /// the usual long `nark-<module>-test-...` name. See
+    /// `client::test_support::short_socket_dir`.
     fn seeded_vault() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "nark-serve-wlock-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
+        let dir = crate::serve::client::test_support::short_socket_dir();
         std::fs::create_dir_all(&dir).expect("create temp vault");
         // Create + migrate + seed the registry via the plain (unlocked) writer
         // open, then drop it so no lock is held going into the test.
